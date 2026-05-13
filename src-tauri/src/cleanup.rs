@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -85,27 +85,15 @@ pub fn execute_cleanup_plan(
     scan_run_id: i64,
     candidate_ids: &[String],
 ) -> anyhow::Result<CleanupExecutionResult> {
-    let requested = candidate_ids
-        .iter()
-        .map(|value| value.as_str())
-        .collect::<std::collections::HashSet<_>>();
     let plan = build_cleanup_plan(db, scan_run_id, 500)?;
-    let candidates_by_id = plan
-        .candidates
-        .into_iter()
-        .map(|candidate| (candidate.id.clone(), candidate))
-        .collect::<HashMap<_, _>>();
+    let candidates = resolve_cleanup_candidates(&plan.candidates, candidate_ids)?;
 
     let mut actions = Vec::new();
     let mut recycled_count = 0;
     let mut failed_count = 0;
     let mut bytes_requested = 0;
 
-    for candidate_id in requested {
-        let Some(candidate) = candidates_by_id.get(candidate_id) else {
-            anyhow::bail!("cleanup candidate {candidate_id} is no longer available");
-        };
-
+    for candidate in candidates {
         bytes_requested += candidate.size;
         let created_at_ms = unix_millis();
         let action_id = db.record_cleanup_action(CleanupActionInsert {
@@ -155,6 +143,31 @@ pub fn execute_cleanup_plan(
         failed_count,
         bytes_requested,
     })
+}
+
+pub fn resolve_cleanup_candidates(
+    candidates: &[CleanupCandidate],
+    candidate_ids: &[String],
+) -> anyhow::Result<Vec<CleanupCandidate>> {
+    let candidates_by_id = candidates
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+
+    for candidate_id in candidate_ids {
+        if !seen.insert(candidate_id.as_str()) {
+            continue;
+        }
+
+        let Some(candidate) = candidates_by_id.get(candidate_id.as_str()) else {
+            anyhow::bail!("cleanup candidate {candidate_id} is no longer available");
+        };
+        resolved.push((*candidate).clone());
+    }
+
+    Ok(resolved)
 }
 
 pub fn restore_cleanup_action(
