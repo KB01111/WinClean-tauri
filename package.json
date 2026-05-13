@@ -11,7 +11,7 @@
     "test": "bun test",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
     "preview": "node node_modules/vite/bin/vite.js preview",
-    "release:check": "node node_modules/typescript/bin/tsc --noEmit && node node_modules/eslint/bin/eslint.js . && bun test && bun scripts/build-frontend.cjs && cargo test --manifest-path src-tauri/Cargo.toml && node node_modules/@tauri-apps/cli/tauri.js build --no-bundle",
+    "release:check": "bun run typecheck && bun run lint && bun run test && bun run build && cargo test --manifest-path src-tauri/Cargo.toml && node node_modules/@tauri-apps/cli/tauri.js build --no-bundle",
     "tauri": "node node_modules/@tauri-apps/cli/tauri.js"
   },
   "dependencies": {
