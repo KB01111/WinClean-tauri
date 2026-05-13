@@ -4,14 +4,71 @@ use std::{
 };
 
 use anyhow::Context;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::scan::{DirectoryRollup, IndexedEntry, ScanMode, ScanSummary};
 
+pub const CURRENT_SCHEMA_VERSION: &str = "202605130001_production_foundation";
+
 #[derive(Clone, Debug)]
 pub struct Database {
     path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanRunRecord {
+    pub id: i64,
+    pub root_path: String,
+    pub file_system: Option<String>,
+    pub scanner_mode: String,
+    pub attempted_mode: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub status: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub files_indexed: u64,
+    pub directories_indexed: u64,
+    pub bytes_indexed: u64,
+    pub access_denied_count: u64,
+    pub skipped_reparse_count: u64,
+    pub error_count: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryChild {
+    pub id: i64,
+    pub path: String,
+    pub parent_path: Option<String>,
+    pub name: String,
+    pub extension: Option<String>,
+    pub is_directory: bool,
+    pub size: u64,
+    pub total_size: u64,
+    pub file_count: u64,
+    pub directory_count: u64,
+    pub modified_at_ms: Option<i64>,
+    pub is_reparse_point: bool,
+    pub is_placeholder: bool,
+    pub is_system: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSearchResult {
+    pub id: i64,
+    pub path: String,
+    pub parent_path: Option<String>,
+    pub name: String,
+    pub extension: Option<String>,
+    pub size: u64,
+    pub modified_at_ms: Option<i64>,
+    pub is_reparse_point: bool,
+    pub is_placeholder: bool,
+    pub is_system: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -23,11 +80,74 @@ pub struct TopDirectory {
     pub directory_count: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionSummary {
+    pub extension: Option<String>,
+    pub file_count: u64,
+    pub total_size: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategorySummary {
+    pub category: String,
+    pub file_count: u64,
+    pub total_size: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CleanupFileRecord {
+    pub id: i64,
+    pub path: String,
+    pub name: String,
+    pub extension: Option<String>,
+    pub size: u64,
+    pub modified_at_ms: Option<i64>,
+    pub is_reparse_point: bool,
+    pub is_placeholder: bool,
+    pub is_system: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CleanupActionInsert {
+    pub action_type: String,
+    pub status: String,
+    pub target_path: String,
+    pub original_path: Option<String>,
+    pub destination_path: Option<String>,
+    pub scan_run_id: Option<i64>,
+    pub explanation: Option<String>,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub undo_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupActionRecord {
+    pub id: i64,
+    pub action_type: String,
+    pub status: String,
+    pub target_path: String,
+    pub original_path: Option<String>,
+    pub destination_path: Option<String>,
+    pub scan_run_id: Option<i64>,
+    pub explanation: Option<String>,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub undo_token: Option<String>,
+}
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
         })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn migrate(&self) -> anyhow::Result<()> {
@@ -36,6 +156,11 @@ impl Database {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at_ms INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS scan_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 root_path TEXT NOT NULL,
@@ -82,6 +207,8 @@ impl Database {
                 ON file_entries(scan_run_id, parent_path);
             CREATE INDEX IF NOT EXISTS idx_file_entries_run_extension
                 ON file_entries(scan_run_id, extension);
+            CREATE INDEX IF NOT EXISTS idx_file_entries_run_name
+                ON file_entries(scan_run_id, name);
 
             CREATE TABLE IF NOT EXISTS directory_rollups (
                 scan_run_id INTEGER NOT NULL,
@@ -110,9 +237,29 @@ impl Database {
                 undo_token TEXT,
                 FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id) ON DELETE SET NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_action_history_created
+                ON action_history(created_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_action_history_status
+                ON action_history(status);
             "#,
         )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+            params![CURRENT_SCHEMA_VERSION, unix_millis()],
+        )?;
         Ok(())
+    }
+
+    pub fn schema_version(&self) -> anyhow::Result<Option<String>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT version FROM schema_migrations ORDER BY applied_at_ms DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("read schema version")
     }
 
     pub fn table_names(&self) -> anyhow::Result<Vec<String>> {
@@ -290,6 +437,42 @@ impl Database {
         Ok(())
     }
 
+    pub fn list_scan_runs(&self, limit: u32) -> anyhow::Result<Vec<ScanRunRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, root_path, file_system, scanner_mode, attempted_mode, fallback_reason,
+                   status, started_at_ms, finished_at_ms, files_indexed, directories_indexed,
+                   bytes_indexed, access_denied_count, skipped_reparse_count, error_count,
+                   last_error
+            FROM scan_runs
+            ORDER BY started_at_ms DESC, id DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit.clamp(1, 200)], scan_run_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read scan runs")
+    }
+
+    pub fn scan_run(&self, run_id: i64) -> anyhow::Result<Option<ScanRunRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, root_path, file_system, scanner_mode, attempted_mode, fallback_reason,
+                   status, started_at_ms, finished_at_ms, files_indexed, directories_indexed,
+                   bytes_indexed, access_denied_count, skipped_reparse_count, error_count,
+                   last_error
+            FROM scan_runs
+            WHERE id = ?1
+            "#,
+            params![run_id],
+            scan_run_from_row,
+        )
+        .optional()
+        .context("read scan run")
+    }
+
     pub fn latest_completed_run_id(&self) -> anyhow::Result<Option<i64>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -297,6 +480,111 @@ impl Database {
         )?;
         let mut rows = stmt.query([])?;
         Ok(rows.next()?.map(|row| row.get::<_, i64>(0)).transpose()?)
+    }
+
+    pub fn directory_children(
+        &self,
+        run_id: i64,
+        parent_path: Option<&str>,
+        limit: u32,
+    ) -> anyhow::Result<Vec<DirectoryChild>> {
+        let parent_path = match parent_path {
+            Some(path) => path.to_string(),
+            None => self
+                .scan_run(run_id)?
+                .map(|run| run.root_path)
+                .context("scan run not found")?,
+        };
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT fe.id, fe.path, fe.parent_path, fe.name, fe.extension, fe.is_directory,
+                   fe.size, COALESCE(dr.total_size, fe.size), COALESCE(dr.file_count, 0),
+                   COALESCE(dr.directory_count, 0), fe.modified_at_ms,
+                   fe.is_reparse_point, fe.is_placeholder, fe.is_system
+            FROM file_entries fe
+            LEFT JOIN directory_rollups dr
+                ON dr.scan_run_id = fe.scan_run_id AND dr.path = fe.path
+            WHERE fe.scan_run_id = ?1 AND fe.parent_path = ?2
+            ORDER BY fe.is_directory DESC, COALESCE(dr.total_size, fe.size) DESC, fe.name ASC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = stmt.query_map(params![run_id, parent_path, limit.clamp(1, 500)], |row| {
+            Ok(DirectoryChild {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                parent_path: row.get(2)?,
+                name: row.get(3)?,
+                extension: row.get(4)?,
+                is_directory: row.get::<_, bool>(5)?,
+                size: row.get::<_, i64>(6)? as u64,
+                total_size: row.get::<_, i64>(7)? as u64,
+                file_count: row.get::<_, i64>(8)? as u64,
+                directory_count: row.get::<_, i64>(9)? as u64,
+                modified_at_ms: row.get(10)?,
+                is_reparse_point: row.get::<_, bool>(11)?,
+                is_placeholder: row.get::<_, bool>(12)?,
+                is_system: row.get::<_, bool>(13)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read directory children")
+    }
+
+    pub fn file_search(
+        &self,
+        run_id: i64,
+        query: Option<&str>,
+        extension: Option<&str>,
+        min_size: Option<u64>,
+        limit: u32,
+    ) -> anyhow::Result<Vec<FileSearchResult>> {
+        let query = format!("%{}%", query.unwrap_or_default());
+        let extension = extension
+            .map(|value| value.trim().trim_start_matches('.').to_lowercase())
+            .filter(|value| !value.is_empty());
+        let min_size = min_size.unwrap_or(0);
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, path, parent_path, name, extension, size, modified_at_ms,
+                   is_reparse_point, is_placeholder, is_system
+            FROM file_entries
+            WHERE scan_run_id = ?1
+              AND is_directory = 0
+              AND (?2 IS NULL OR LOWER(extension) = ?2)
+              AND size >= ?3
+              AND (?4 = '%%' OR name LIKE ?4 OR path LIKE ?4)
+            ORDER BY size DESC, path ASC
+            LIMIT ?5
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                run_id,
+                extension,
+                min_size as i64,
+                query,
+                limit.clamp(1, 1000)
+            ],
+            |row| {
+                Ok(FileSearchResult {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    parent_path: row.get(2)?,
+                    name: row.get(3)?,
+                    extension: row.get(4)?,
+                    size: row.get::<_, i64>(5)? as u64,
+                    modified_at_ms: row.get(6)?,
+                    is_reparse_point: row.get::<_, bool>(7)?,
+                    is_placeholder: row.get::<_, bool>(8)?,
+                    is_system: row.get::<_, bool>(9)?,
+                })
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("search files")
     }
 
     pub fn top_directories(&self, run_id: i64, limit: u32) -> anyhow::Result<Vec<TopDirectory>> {
@@ -322,6 +610,193 @@ impl Database {
             .context("read top directory rollups")
     }
 
+    pub fn extension_summary(
+        &self,
+        run_id: i64,
+        limit: u32,
+    ) -> anyhow::Result<Vec<ExtensionSummary>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT NULLIF(LOWER(COALESCE(extension, '')), '') AS ext,
+                   COUNT(*) AS file_count,
+                   COALESCE(SUM(size), 0) AS total_size
+            FROM file_entries
+            WHERE scan_run_id = ?1 AND is_directory = 0
+            GROUP BY ext
+            ORDER BY total_size DESC, file_count DESC, ext ASC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![run_id, limit.clamp(1, 200)], |row| {
+            Ok(ExtensionSummary {
+                extension: row.get(0)?,
+                file_count: row.get::<_, i64>(1)? as u64,
+                total_size: row.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read extension summary")
+    }
+
+    pub fn category_summary(&self, run_id: i64) -> anyhow::Result<Vec<CategorySummary>> {
+        let extensions = self.extension_summary(run_id, 500)?;
+        let mut categories: HashMap<String, CategorySummary> = HashMap::new();
+        for extension in extensions {
+            let category = category_for_extension(extension.extension.as_deref()).to_string();
+            let entry = categories
+                .entry(category.clone())
+                .or_insert(CategorySummary {
+                    category,
+                    file_count: 0,
+                    total_size: 0,
+                });
+            entry.file_count += extension.file_count;
+            entry.total_size += extension.total_size;
+        }
+        let mut rows = categories.into_values().collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .total_size
+                .cmp(&left.total_size)
+                .then_with(|| left.category.cmp(&right.category))
+        });
+        Ok(rows)
+    }
+
+    pub fn cleanup_file_records(
+        &self,
+        run_id: i64,
+        limit: u32,
+    ) -> anyhow::Result<Vec<CleanupFileRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, path, name, extension, size, modified_at_ms,
+                   is_reparse_point, is_placeholder, is_system
+            FROM file_entries
+            WHERE scan_run_id = ?1
+              AND is_directory = 0
+              AND size > 0
+            ORDER BY size DESC, path ASC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![run_id, limit.clamp(1, 5000)], |row| {
+            Ok(CleanupFileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                extension: row.get(3)?,
+                size: row.get::<_, i64>(4)? as u64,
+                modified_at_ms: row.get(5)?,
+                is_reparse_point: row.get::<_, bool>(6)?,
+                is_placeholder: row.get::<_, bool>(7)?,
+                is_system: row.get::<_, bool>(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read cleanup candidate files")
+    }
+
+    pub fn record_cleanup_action(&self, action: CleanupActionInsert) -> anyhow::Result<i64> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO action_history (
+                action_type,
+                status,
+                target_path,
+                original_path,
+                destination_path,
+                scan_run_id,
+                explanation,
+                created_at_ms,
+                completed_at_ms,
+                undo_token
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                action.action_type,
+                action.status,
+                action.target_path,
+                action.original_path,
+                action.destination_path,
+                action.scan_run_id,
+                action.explanation,
+                action.created_at_ms,
+                action.completed_at_ms,
+                action.undo_token
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn update_cleanup_action(
+        &self,
+        id: i64,
+        status: &str,
+        completed_at_ms: Option<i64>,
+        explanation: Option<&str>,
+        undo_token: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE action_history
+            SET status = ?2,
+                completed_at_ms = ?3,
+                explanation = COALESCE(?4, explanation),
+                undo_token = COALESCE(?5, undo_token)
+            WHERE id = ?1
+            "#,
+            params![id, status, completed_at_ms, explanation, undo_token],
+        )?;
+        Ok(())
+    }
+
+    pub fn cleanup_history(&self, limit: u32) -> anyhow::Result<Vec<CleanupActionRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, action_type, status, target_path, original_path, destination_path,
+                   scan_run_id, explanation, created_at_ms, completed_at_ms, undo_token
+            FROM action_history
+            ORDER BY created_at_ms DESC, id DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit.clamp(1, 500)], cleanup_action_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read cleanup history")
+    }
+
+    pub fn cleanup_action(&self, id: i64) -> anyhow::Result<Option<CleanupActionRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, action_type, status, target_path, original_path, destination_path,
+                   scan_run_id, explanation, created_at_ms, completed_at_ms, undo_token
+            FROM action_history
+            WHERE id = ?1
+            "#,
+            params![id],
+            cleanup_action_from_row,
+        )
+        .optional()
+        .context("read cleanup action")
+    }
+
+    pub fn pending_action_count(&self) -> anyhow::Result<u64> {
+        let conn = self.connect()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM action_history WHERE status IN ('planned', 'running', 'restore_requested')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
     fn connect(&self) -> anyhow::Result<Connection> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
@@ -331,4 +806,64 @@ impl Database {
         Connection::open(&self.path)
             .with_context(|| format!("open sqlite database {}", self.path.display()))
     }
+}
+
+fn scan_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRunRecord> {
+    Ok(ScanRunRecord {
+        id: row.get(0)?,
+        root_path: row.get(1)?,
+        file_system: row.get(2)?,
+        scanner_mode: row.get(3)?,
+        attempted_mode: row.get(4)?,
+        fallback_reason: row.get(5)?,
+        status: row.get(6)?,
+        started_at_ms: row.get(7)?,
+        finished_at_ms: row.get(8)?,
+        files_indexed: row.get::<_, i64>(9)? as u64,
+        directories_indexed: row.get::<_, i64>(10)? as u64,
+        bytes_indexed: row.get::<_, i64>(11)? as u64,
+        access_denied_count: row.get::<_, i64>(12)? as u64,
+        skipped_reparse_count: row.get::<_, i64>(13)? as u64,
+        error_count: row.get::<_, i64>(14)? as u64,
+        last_error: row.get(15)?,
+    })
+}
+
+fn cleanup_action_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CleanupActionRecord> {
+    Ok(CleanupActionRecord {
+        id: row.get(0)?,
+        action_type: row.get(1)?,
+        status: row.get(2)?,
+        target_path: row.get(3)?,
+        original_path: row.get(4)?,
+        destination_path: row.get(5)?,
+        scan_run_id: row.get(6)?,
+        explanation: row.get(7)?,
+        created_at_ms: row.get(8)?,
+        completed_at_ms: row.get(9)?,
+        undo_token: row.get(10)?,
+    })
+}
+
+fn category_for_extension(extension: Option<&str>) -> &'static str {
+    match extension.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "tif" | "tiff" => "Images",
+        "mp4" | "mov" | "mkv" | "avi" | "wmv" | "webm" => "Videos",
+        "mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg" => "Audio",
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "rtf" | "csv" => {
+            "Documents"
+        }
+        "zip" | "7z" | "rar" | "tar" | "gz" | "iso" => "Archives",
+        "exe" | "msi" | "dll" | "sys" | "com" => "Applications",
+        "tmp" | "temp" | "log" | "bak" | "old" | "dmp" => "Cleanup candidates",
+        "" => "No extension",
+        _ => "Other",
+    }
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
