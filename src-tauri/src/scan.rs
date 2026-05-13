@@ -237,113 +237,146 @@ pub fn run_recursive_scan(
 
     update_progress(&options.progress, &summary, ScanState::Running, None);
 
-    let mut stack = vec![root.clone()];
-    let mut pending_entries = Vec::with_capacity(BATCH_SIZE);
-    let mut rollups: HashMap<PathBuf, DirectoryRollup> = HashMap::new();
+    let scan_result = (|| -> anyhow::Result<()> {
+        let mut stack = vec![root.clone()];
+        let mut pending_entries = Vec::with_capacity(BATCH_SIZE);
+        let mut rollups: HashMap<PathBuf, DirectoryRollup> = HashMap::new();
 
-    while let Some(dir) = stack.pop() {
-        if is_canceled(options.cancel.as_deref()) {
-            summary.canceled = true;
-            break;
-        }
-
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) => {
-                record_io_error(&mut summary, &error);
-                update_progress(&options.progress, &summary, ScanState::Running, None);
-                continue;
-            }
-        };
-
-        for entry_result in entries {
+        while let Some(dir) = stack.pop() {
             if is_canceled(options.cancel.as_deref()) {
                 summary.canceled = true;
                 break;
             }
 
-            let entry = match entry_result {
-                Ok(entry) => entry,
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
                 Err(error) => {
                     record_io_error(&mut summary, &error);
+                    update_progress(&options.progress, &summary, ScanState::Running, None);
                     continue;
                 }
             };
 
-            let path = entry.path();
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    record_io_error(&mut summary, &error);
-                    continue;
+            for entry_result in entries {
+                if is_canceled(options.cancel.as_deref()) {
+                    summary.canceled = true;
+                    break;
                 }
-            };
 
-            let attributes = file_attributes(&metadata);
-            let classification = classify_file_attributes(attributes);
-            let is_directory = metadata.is_dir();
-            let is_file = metadata.is_file();
-            let size = if is_file { metadata.len() } else { 0 };
+                let entry = match entry_result {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        record_io_error(&mut summary, &error);
+                        continue;
+                    }
+                };
 
-            if is_file {
-                summary.files_indexed += 1;
-                summary.bytes_indexed += size;
-                add_file_to_rollups(&mut rollups, &root, &path, size);
-            } else if is_directory {
-                summary.directories_indexed += 1;
-                add_directory_to_rollups(&mut rollups, &root, &path);
-            }
+                let path = entry.path();
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        record_io_error(&mut summary, &error);
+                        continue;
+                    }
+                };
 
-            if is_directory && classification.is_reparse_point {
-                summary.skipped_reparse_count += 1;
-            } else if is_directory {
-                stack.push(path.clone());
-            }
+                let attributes = file_attributes(&metadata);
+                let classification = classify_file_attributes(attributes);
+                let is_directory = metadata.is_dir();
+                let is_file = metadata.is_file();
+                let size = if is_file { metadata.len() } else { 0 };
 
-            pending_entries.push(indexed_entry(
-                &path,
-                is_directory,
-                size,
-                attributes,
-                &classification,
-                &metadata,
-            ));
+                if is_file {
+                    summary.files_indexed += 1;
+                    summary.bytes_indexed += size;
+                    add_file_to_rollups(&mut rollups, &root, &path, size);
+                } else if is_directory {
+                    summary.directories_indexed += 1;
+                    add_directory_to_rollups(&mut rollups, &root, &path);
+                }
 
-            if pending_entries.len() >= BATCH_SIZE {
-                db.insert_file_entries(run_id, &pending_entries)?;
-                pending_entries.clear();
-                update_progress(&options.progress, &summary, ScanState::Running, None);
+                if is_directory && classification.is_reparse_point {
+                    summary.skipped_reparse_count += 1;
+                } else if is_directory {
+                    stack.push(path.clone());
+                }
+
+                pending_entries.push(indexed_entry(
+                    &path,
+                    is_directory,
+                    size,
+                    attributes,
+                    &classification,
+                    &metadata,
+                ));
+
+                if pending_entries.len() >= BATCH_SIZE {
+                    db.insert_file_entries(run_id, &pending_entries)?;
+                    pending_entries.clear();
+                    update_progress(&options.progress, &summary, ScanState::Running, None);
+                }
             }
         }
-    }
 
-    if !pending_entries.is_empty() {
-        db.insert_file_entries(run_id, &pending_entries)?;
-    }
+        if !pending_entries.is_empty() {
+            db.insert_file_entries(run_id, &pending_entries)?;
+        }
 
-    summary.finished_at_ms = unix_millis(SystemTime::now());
-    db.replace_directory_rollups(run_id, &rollups)?;
-    db.finish_scan_run(
-        &summary,
-        if summary.canceled {
-            "canceled"
-        } else {
-            "completed"
-        },
-        None,
-    )?;
-    update_progress(
-        &options.progress,
-        &summary,
-        if summary.canceled {
-            ScanState::Canceled
-        } else {
-            ScanState::Completed
-        },
-        None,
-    );
+        summary.finished_at_ms = unix_millis(SystemTime::now());
+        db.replace_directory_rollups(run_id, &rollups)?;
+        db.finish_scan_run(
+            &summary,
+            if summary.canceled {
+                "canceled"
+            } else {
+                "completed"
+            },
+            None,
+        )?;
+        update_progress(
+            &options.progress,
+            &summary,
+            if summary.canceled {
+                ScanState::Canceled
+            } else {
+                ScanState::Completed
+            },
+            None,
+        );
+        Ok(())
+    })();
+
+    if let Err(error) = scan_result {
+        let message = error.to_string();
+        if let Err(finalize_error) =
+            finalize_failed_scan_run(db, &mut summary, options.progress.as_ref(), &message)
+        {
+            anyhow::bail!(
+                "scan failed with {message}; additionally failed to persist failed scan state: {finalize_error}"
+            );
+        }
+        return Err(error);
+    }
 
     Ok(summary)
+}
+
+pub fn finalize_failed_scan_run(
+    db: &Database,
+    summary: &mut ScanSummary,
+    progress: Option<&Arc<Mutex<ScanProgress>>>,
+    last_error: &str,
+) -> anyhow::Result<()> {
+    summary.finished_at_ms = unix_millis(SystemTime::now());
+    db.finish_scan_run(summary, "failed", Some(last_error))?;
+    let progress = progress.cloned();
+    update_progress(
+        &progress,
+        summary,
+        ScanState::Failed,
+        Some(last_error.to_string()),
+    );
+    Ok(())
 }
 
 fn indexed_entry(

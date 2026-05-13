@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -803,8 +804,11 @@ impl Database {
                 .with_context(|| format!("create database directory {}", parent.display()))?;
         }
 
-        Connection::open(&self.path)
-            .with_context(|| format!("open sqlite database {}", self.path.display()))
+        let conn = Connection::open(&self.path)
+            .with_context(|| format!("open sqlite database {}", self.path.display()))?;
+        conn.busy_timeout(Duration::from_millis(1_500))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(conn)
     }
 }
 
