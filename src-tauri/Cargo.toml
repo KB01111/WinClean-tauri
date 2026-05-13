@@ -31,8 +31,9 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]
 tempfile = "3"
-

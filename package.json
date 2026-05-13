@@ -1,15 +1,17 @@
 {
   "name": "winclean",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "bun scripts/dev-frontend.cjs",
     "build": "bun scripts/build-frontend.cjs",
     "lint": "node node_modules/eslint/bin/eslint.js .",
     "format": "prettier --write \"**/*.{ts,tsx}\"",
+    "test": "bun test",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
     "preview": "node node_modules/vite/bin/vite.js preview",
+    "release:check": "node node_modules/typescript/bin/tsc --noEmit && node node_modules/eslint/bin/eslint.js . && bun test && bun scripts/build-frontend.cjs && cargo test --manifest-path src-tauri/Cargo.toml && node node_modules/@tauri-apps/cli/tauri.js build --no-bundle",
     "tauri": "node node_modules/@tauri-apps/cli/tauri.js"
   },
   "dependencies": {
