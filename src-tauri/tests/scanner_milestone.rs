@@ -3,11 +3,11 @@ use std::fs;
 use winclean_lib::db::Database;
 use winclean_lib::reports::write_scan_report;
 use winclean_lib::scan::{
-    balanced_worker_count, choose_scan_plan, classify_file_attributes, run_recursive_scan,
-    FileAttributeFlags, ScanMode, ScanRunOptions, ScanState,
+    balanced_worker_count, choose_scan_plan, classify_file_attributes, finalize_failed_scan_run,
+    run_recursive_scan, FileAttributeFlags, ScanMode, ScanRunOptions, ScanState, ScanSummary,
 };
 use winclean_lib::{
-    cleanup::{build_cleanup_plan, cleanup_candidate_id},
+    cleanup::{build_cleanup_plan, cleanup_candidate_id, resolve_cleanup_candidates},
     db::CleanupActionInsert,
 };
 
@@ -173,6 +173,64 @@ fn missing_scan_root_is_persisted_as_failed() {
 }
 
 #[test]
+fn failed_scan_finalization_persists_error_state_and_counters() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let run_id = db
+        .create_scan_run(
+            root.to_string_lossy().as_ref(),
+            Some("NTFS"),
+            ScanMode::Recursive,
+            Some(ScanMode::NtfsUsn),
+            Some("USN fallback"),
+            100,
+        )
+        .expect("create scan run");
+    let mut summary = ScanSummary {
+        run_id,
+        root_path: root.to_string_lossy().to_string(),
+        mode: ScanMode::Recursive,
+        attempted_mode: Some(ScanMode::NtfsUsn),
+        fallback_reason: Some("USN fallback".to_string()),
+        started_at_ms: 100,
+        finished_at_ms: 100,
+        files_indexed: 7,
+        directories_indexed: 3,
+        bytes_indexed: 4096,
+        access_denied_count: 1,
+        skipped_reparse_count: 2,
+        error_count: 4,
+        canceled: false,
+    };
+
+    finalize_failed_scan_run(&db, &mut summary, None, "simulated sqlite write failure")
+        .expect("finalize failed scan");
+
+    let run = db
+        .scan_run(run_id)
+        .expect("read scan run")
+        .expect("scan run exists");
+    assert_eq!(run.status, "failed");
+    assert!(run.finished_at_ms.expect("finished at") >= 100);
+    assert_eq!(run.files_indexed, 7);
+    assert_eq!(run.directories_indexed, 3);
+    assert_eq!(run.bytes_indexed, 4096);
+    assert_eq!(run.access_denied_count, 1);
+    assert_eq!(run.skipped_reparse_count, 2);
+    assert_eq!(run.error_count, 4);
+    assert_eq!(
+        run.last_error.as_deref(),
+        Some("simulated sqlite write failure")
+    );
+}
+
+#[test]
 fn scan_history_and_directory_queries_expose_persisted_scan_data() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("fixture");
@@ -253,6 +311,75 @@ fn cleanup_plan_only_includes_conservative_file_candidates() {
         cleanup_candidate_id(summary.run_id, plan.candidates[0].entry_id),
         plan.candidates[0].id
     );
+}
+
+#[test]
+fn cleanup_candidate_resolution_dedupes_and_rejects_stale_ids_before_cleanup() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    fs::write(root.join("cache.tmp"), vec![1_u8; 20]).expect("tmp file");
+    fs::write(root.join("debug.log"), vec![1_u8; 30]).expect("log file");
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let plan = build_cleanup_plan(&db, summary.run_id, 50).expect("cleanup plan");
+    let tmp_id = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path.ends_with("cache.tmp"))
+        .expect("tmp candidate")
+        .id
+        .clone();
+    let log_id = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path.ends_with("debug.log"))
+        .expect("log candidate")
+        .id
+        .clone();
+
+    let resolved =
+        resolve_cleanup_candidates(&plan.candidates, &[tmp_id.clone(), tmp_id.clone(), log_id])
+            .expect("resolve candidates");
+    assert_eq!(resolved.len(), 2);
+    assert_eq!(resolved[0].id, tmp_id);
+
+    let error = resolve_cleanup_candidates(
+        &plan.candidates,
+        &[tmp_id, "scan-999:entry-999".to_string()],
+    )
+    .expect_err("stale candidate id should fail validation");
+    assert!(error.to_string().contains("scan-999:entry-999"));
+}
+
+#[test]
+fn database_connections_enforce_foreign_keys_after_migration() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let error = db
+        .record_cleanup_action(CleanupActionInsert {
+            action_type: "recycle_bin".to_string(),
+            status: "running".to_string(),
+            target_path: "C:\\Temp\\cache.tmp".to_string(),
+            original_path: Some("C:\\Temp\\cache.tmp".to_string()),
+            destination_path: Some("Windows Recycle Bin".to_string()),
+            scan_run_id: Some(999_999),
+            explanation: Some("Temporary file".to_string()),
+            created_at_ms: 10,
+            completed_at_ms: None,
+            undo_token: None,
+        })
+        .expect_err("foreign key violation should reject unknown scan run");
+
+    let message = error.to_string().to_ascii_lowercase();
+    assert!(message.contains("foreign key") || message.contains("constraint"));
 }
 
 #[test]

@@ -304,15 +304,17 @@ pub fn run_recursive_scan(
                 .and_then(|_| db.finish_scan_run(&summary, status, None))
             {
                 let last_error = error.to_string();
-                let _ = db.finish_scan_run(&summary, "failed", Some(&last_error));
-                update_progress(
-                    &options.progress,
-                    &summary,
-                    ScanState::Failed,
-                    Some(last_error),
+                if let Err(finalize_error) = finalize_failed_scan_run_with_details(
+                    db,
+                    &mut summary,
+                    options.progress.as_ref(),
+                    &last_error,
                     Some(worker_count),
-                    Some("failed"),
-                );
+                ) {
+                    anyhow::bail!(
+                        "scan failed with {last_error}; additionally failed to persist failed scan state: {finalize_error}"
+                    );
+                }
                 return Err(error);
             }
             update_progress(
@@ -335,16 +337,17 @@ pub fn run_recursive_scan(
         }
         Err(error) => {
             let last_error = error.to_string();
-            summary.finished_at_ms = unix_millis(SystemTime::now());
-            db.finish_scan_run(&summary, "failed", Some(&last_error))?;
-            update_progress(
-                &options.progress,
-                &summary,
-                ScanState::Failed,
-                Some(last_error),
+            if let Err(finalize_error) = finalize_failed_scan_run_with_details(
+                db,
+                &mut summary,
+                options.progress.as_ref(),
+                &last_error,
                 Some(worker_count),
-                Some("failed"),
-            );
+            ) {
+                anyhow::bail!(
+                    "scan failed with {last_error}; additionally failed to persist failed scan state: {finalize_error}"
+                );
+            }
             Err(error)
         }
     }
@@ -510,6 +513,36 @@ fn collect_parallel_scan(
     }
 
     Ok(rollups)
+}
+
+pub fn finalize_failed_scan_run(
+    db: &Database,
+    summary: &mut ScanSummary,
+    progress: Option<&Arc<Mutex<ScanProgress>>>,
+    last_error: &str,
+) -> anyhow::Result<()> {
+    finalize_failed_scan_run_with_details(db, summary, progress, last_error, None)
+}
+
+fn finalize_failed_scan_run_with_details(
+    db: &Database,
+    summary: &mut ScanSummary,
+    progress: Option<&Arc<Mutex<ScanProgress>>>,
+    last_error: &str,
+    worker_count: Option<usize>,
+) -> anyhow::Result<()> {
+    summary.finished_at_ms = unix_millis(SystemTime::now());
+    db.finish_scan_run(summary, "failed", Some(last_error))?;
+    let progress = progress.cloned();
+    update_progress(
+        &progress,
+        summary,
+        ScanState::Failed,
+        Some(last_error.to_string()),
+        worker_count,
+        Some("failed"),
+    );
+    Ok(())
 }
 
 fn scan_worker(

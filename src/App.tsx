@@ -30,6 +30,7 @@ import {
   formatPercentUsed,
   statusText,
 } from "@/lib/format"
+import { selectDashboardRun } from "@/lib/scan-selection"
 import { shouldRefreshRunDataForProgress } from "@/lib/scan-refresh"
 
 type View = "overview" | "explorer" | "cleanup" | "history" | "settings"
@@ -222,6 +223,7 @@ function App() {
   const [loadingVolumes, setLoadingVolumes] = useState(true)
   const [loadingData, setLoadingData] = useState(false)
   const dashboardRefreshInFlight = useRef(false)
+  const initialLoadStarted = useRef(false)
 
   const selectedVolume = useMemo(
     () => volumes.find((volume) => volume.rootPath === selectedRoot),
@@ -313,11 +315,17 @@ function App() {
       setScanRuns(runs)
       setCleanupHistory(historyRows)
       setHealth(nextHealth)
-      const nextRunId =
-        selectedRunId ?? nextProgress.runId ?? runs[0]?.id ?? null
+      const selection = selectDashboardRun({
+        runs,
+        selectedRunId,
+        progressState: nextProgress.state,
+        progressRunId: nextProgress.runId ?? null,
+        progressRootPath: nextProgress.rootPath ?? null,
+        currentDirectory,
+      })
+      const nextRunId = selection.runId
+      const nextDirectory = selection.directory
       setSelectedRunId(nextRunId)
-      const nextRun = runs.find((run) => run.id === nextRunId)
-      const nextDirectory = currentDirectory ?? nextRun?.rootPath ?? null
       setCurrentDirectory(nextDirectory)
       if (shouldRefreshRunDataForProgress(nextProgress)) {
         await refreshRunData(nextRunId, nextDirectory)
@@ -345,6 +353,10 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (initialLoadStarted.current) {
+      return
+    }
+    initialLoadStarted.current = true
     void refreshVolumes()
     void refreshDashboard()
   }, [refreshDashboard, refreshVolumes])
@@ -386,12 +398,17 @@ function App() {
     setDirectoryChildren([])
     setFiles([])
     setCleanupPlan(null)
+    setSelectedCleanupIds(new Set())
+    setSelectedRunId(null)
+    setCurrentDirectory(selectedVolume.rootPath)
     try {
       const nextProgress = await invoke<ScanProgress>("start_scan", {
         rootPath: selectedVolume.rootPath,
         fileSystem: selectedVolume.fileSystem ?? null,
       })
       setProgress(nextProgress)
+      setSelectedRunId(nextProgress.runId ?? null)
+      setCurrentDirectory(nextProgress.rootPath ?? selectedVolume.rootPath)
       setView("overview")
     } catch (error) {
       setMessage(formatError(error))
