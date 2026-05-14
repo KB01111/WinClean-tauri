@@ -3,7 +3,8 @@ use std::fs;
 use winclean_lib::db::Database;
 use winclean_lib::reports::write_scan_report;
 use winclean_lib::scan::{
-    choose_scan_plan, classify_file_attributes, run_recursive_scan, FileAttributeFlags, ScanMode,
+    balanced_worker_count, choose_scan_plan, classify_file_attributes, run_recursive_scan,
+    FileAttributeFlags, ScanMode, ScanRunOptions, ScanState,
 };
 use winclean_lib::{
     cleanup::{build_cleanup_plan, cleanup_candidate_id},
@@ -55,6 +56,14 @@ fn file_attribute_classification_marks_reparse_and_offline_files() {
 }
 
 #[test]
+fn balanced_worker_count_keeps_one_logical_core_free_and_caps_pool() {
+    assert_eq!(balanced_worker_count(0), 1);
+    assert_eq!(balanced_worker_count(1), 1);
+    assert_eq!(balanced_worker_count(4), 3);
+    assert_eq!(balanced_worker_count(64), 8);
+}
+
+#[test]
 fn recursive_scan_indexes_files_and_rolls_sizes_up_to_parent_directories() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("fixture");
@@ -83,6 +92,84 @@ fn recursive_scan_indexes_files_and_rolls_sizes_up_to_parent_directories() {
     assert!(top
         .iter()
         .any(|entry| entry.path.ends_with("large") && entry.total_size == 90));
+}
+
+#[test]
+fn recursive_scan_reports_multicore_worker_count_in_progress() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    fs::write(root.join("small.txt"), vec![1_u8; 10]).expect("small file");
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
+
+    let summary = run_recursive_scan(
+        &db,
+        root.as_path(),
+        Some(ScanRunOptions {
+            file_system: None,
+            attempted_mode: None,
+            fallback_reason: None,
+            cancel: None,
+            progress: Some(std::sync::Arc::clone(&progress)),
+        }),
+    )
+    .expect("scan");
+
+    assert_eq!(summary.files_indexed, 1);
+    let progress = progress.lock().expect("progress lock");
+    assert_eq!(progress.state, ScanState::Completed);
+    assert_eq!(
+        progress.worker_count,
+        Some(balanced_worker_count(
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+        ))
+    );
+    assert_eq!(progress.phase.as_deref(), Some("complete"));
+}
+
+#[test]
+fn missing_scan_root_is_persisted_as_failed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let missing_root = temp.path().join("missing");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
+
+    let error = run_recursive_scan(
+        &db,
+        missing_root.as_path(),
+        Some(ScanRunOptions {
+            file_system: None,
+            attempted_mode: None,
+            fallback_reason: None,
+            cancel: None,
+            progress: Some(std::sync::Arc::clone(&progress)),
+        }),
+    )
+    .expect_err("missing root should fail");
+
+    assert!(error.to_string().contains("scan root is not readable"));
+    let runs = db.list_scan_runs(10).expect("scan runs");
+    assert_eq!(runs.first().map(|run| run.status.as_str()), Some("failed"));
+    assert!(runs
+        .first()
+        .and_then(|run| run.last_error.as_deref())
+        .unwrap_or_default()
+        .contains("scan root is not readable"));
+    let progress = progress.lock().expect("progress lock");
+    assert_eq!(progress.state, ScanState::Failed);
+    assert!(progress
+        .last_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("scan root is not readable"));
 }
 
 #[test]

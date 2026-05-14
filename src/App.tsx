@@ -19,7 +19,7 @@ import {
   Square,
   Trash2,
 } from "lucide-react"
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { invoke } from "@tauri-apps/api/core"
 
 import { Button } from "@/components/ui/button"
@@ -30,6 +30,7 @@ import {
   formatPercentUsed,
   statusText,
 } from "@/lib/format"
+import { shouldRefreshRunDataForProgress } from "@/lib/scan-refresh"
 
 type View = "overview" | "explorer" | "cleanup" | "history" | "settings"
 type ScanMode = "ntfsUsn" | "recursive"
@@ -59,6 +60,8 @@ type ScanProgress = {
   skippedReparseCount: number
   errorCount: number
   lastError?: string | null
+  workerCount?: number | null
+  phase?: string | null
 }
 
 type ScanRunRecord = {
@@ -218,6 +221,7 @@ function App() {
   const [message, setMessage] = useState<string | null>(null)
   const [loadingVolumes, setLoadingVolumes] = useState(true)
   const [loadingData, setLoadingData] = useState(false)
+  const dashboardRefreshInFlight = useRef(false)
 
   const selectedVolume = useMemo(
     () => volumes.find((volume) => volume.rootPath === selectedRoot),
@@ -293,6 +297,10 @@ function App() {
   )
 
   const refreshDashboard = useCallback(async () => {
+    if (dashboardRefreshInFlight.current) {
+      return
+    }
+    dashboardRefreshInFlight.current = true
     setLoadingData(true)
     try {
       const [nextProgress, runs, historyRows, nextHealth] = await Promise.all([
@@ -311,11 +319,14 @@ function App() {
       const nextRun = runs.find((run) => run.id === nextRunId)
       const nextDirectory = currentDirectory ?? nextRun?.rootPath ?? null
       setCurrentDirectory(nextDirectory)
-      await refreshRunData(nextRunId, nextDirectory)
+      if (shouldRefreshRunDataForProgress(nextProgress)) {
+        await refreshRunData(nextRunId, nextDirectory)
+      }
       setMessage(null)
     } catch (error) {
       setMessage(formatError(error))
     } finally {
+      dashboardRefreshInFlight.current = false
       setLoadingData(false)
     }
   }, [currentDirectory, refreshRunData, selectedRunId])
@@ -349,14 +360,21 @@ function App() {
   }, [isScanning, refreshDashboard])
 
   useEffect(() => {
-    if (!activeRun) {
+    if (!activeRun || isScanning) {
       return
     }
     const timeout = window.setTimeout(() => {
       void refreshRunData(activeRun.id, currentDirectory ?? activeRun.rootPath)
     }, 200)
     return () => window.clearTimeout(timeout)
-  }, [activeRun, currentDirectory, extensionFilter, fileQuery, refreshRunData])
+  }, [
+    activeRun,
+    currentDirectory,
+    extensionFilter,
+    fileQuery,
+    isScanning,
+    refreshRunData,
+  ])
 
   async function startScan() {
     if (!selectedVolume) {
@@ -565,7 +583,12 @@ function App() {
               <h2 className="text-2xl font-semibold tracking-normal">
                 {viewTitle(view)}
               </h2>
-              <p className="text-sm text-[#667066]">{statusText(progress)}</p>
+              <p className="text-sm text-[#667066]">
+                {statusText(progress)}
+                {progress.workerCount && progress.phase
+                  ? ` · ${progress.phase} on ${formatNumber(progress.workerCount)} workers`
+                  : ""}
+              </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Button

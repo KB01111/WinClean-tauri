@@ -106,6 +106,8 @@ pub fn start_scan(
             skipped_reparse_count: 0,
             error_count: 0,
             last_error: None,
+            worker_count: None,
+            phase: Some("starting".to_string()),
         };
     }
 
