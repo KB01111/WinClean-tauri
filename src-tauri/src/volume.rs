@@ -16,6 +16,40 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
     platform_volumes()
 }
 
+pub fn resolve_local_scan_root(
+    root_path: &str,
+    volumes: &[VolumeInfo],
+) -> Result<VolumeInfo, String> {
+    let requested = normalize_volume_root(root_path);
+    let Some(volume) = volumes
+        .iter()
+        .find(|volume| normalize_volume_root(&volume.root_path) == requested)
+    else {
+        return Err("Select a local volume root from the available drives.".to_string());
+    };
+
+    if !volume.is_ready {
+        return Err(format!("{} is not ready for scanning.", volume.root_path));
+    }
+
+    if !matches!(volume.drive_type.as_str(), "fixed" | "removable") {
+        return Err(format!(
+            "{} is not a supported local fixed or removable drive.",
+            volume.root_path
+        ));
+    }
+
+    Ok(volume.clone())
+}
+
+fn normalize_volume_root(path: &str) -> String {
+    let mut normalized = path.trim().replace('/', "\\").to_ascii_lowercase();
+    if normalized.len() == 2 && normalized.ends_with(':') {
+        normalized.push('\\');
+    }
+    normalized
+}
+
 #[cfg(windows)]
 fn platform_volumes() -> Vec<VolumeInfo> {
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};

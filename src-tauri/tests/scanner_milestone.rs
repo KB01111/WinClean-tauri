@@ -1,14 +1,22 @@
 use std::fs;
 
+use std::collections::HashMap;
+
 use winclean_lib::db::Database;
 use winclean_lib::reports::write_scan_report;
 use winclean_lib::scan::{
     balanced_worker_count, choose_scan_plan, classify_file_attributes, finalize_failed_scan_run,
-    run_recursive_scan, FileAttributeFlags, ScanMode, ScanRunOptions, ScanState, ScanSummary,
+    run_recursive_scan, should_skip_directory_for_scan, DirectoryRollup, FileAttributeFlags,
+    IndexedEntry, ScanMode, ScanRunOptions, ScanState, ScanSummary,
 };
 use winclean_lib::{
-    cleanup::{build_cleanup_plan, cleanup_candidate_id, resolve_cleanup_candidates},
+    cleanup::{
+        build_cleanup_plan, cleanup_candidate_id, resolve_cleanup_candidates,
+        validate_cleanup_target, CleanupCandidate, CleanupRisk,
+    },
+    commands::begin_scan_progress,
     db::CleanupActionInsert,
+    volume::{resolve_local_scan_root, VolumeInfo},
 };
 
 #[test]
@@ -61,6 +69,64 @@ fn balanced_worker_count_keeps_one_logical_core_free_and_caps_pool() {
     assert_eq!(balanced_worker_count(1), 1);
     assert_eq!(balanced_worker_count(4), 3);
     assert_eq!(balanced_worker_count(64), 8);
+}
+
+#[test]
+fn local_scan_root_policy_accepts_ready_fixed_and_removable_roots_only() {
+    let volumes = vec![
+        volume("C:\\", "fixed", true, Some("NTFS")),
+        volume("E:\\", "removable", true, Some("exFAT")),
+        volume("Z:\\", "remote", true, Some("NTFS")),
+        volume("D:\\", "fixed", false, Some("NTFS")),
+    ];
+
+    assert_eq!(
+        resolve_local_scan_root("c:/", &volumes)
+            .expect("fixed root")
+            .root_path,
+        "C:\\"
+    );
+    assert_eq!(
+        resolve_local_scan_root("E:\\", &volumes)
+            .expect("removable root")
+            .root_path,
+        "E:\\"
+    );
+    assert!(resolve_local_scan_root("Z:\\", &volumes)
+        .expect_err("remote root should be rejected")
+        .contains("local"));
+    assert!(resolve_local_scan_root("D:\\", &volumes)
+        .expect_err("unready root should be rejected")
+        .contains("ready"));
+    assert!(resolve_local_scan_root("C:\\Users", &volumes)
+        .expect_err("arbitrary path should be rejected")
+        .contains("local volume root"));
+}
+
+#[test]
+fn begin_scan_progress_atomically_rejects_existing_running_scan() {
+    let progress = std::sync::Mutex::new(Default::default());
+    let plan = choose_scan_plan("C:\\", Some("NTFS"));
+
+    begin_scan_progress(&progress, "C:\\", &plan).expect("first scan starts");
+    let error =
+        begin_scan_progress(&progress, "C:\\", &plan).expect_err("second scan should be rejected");
+
+    assert!(error.contains("already running"));
+}
+
+#[test]
+fn scan_directory_policy_skips_reparse_placeholder_and_symlink_directories() {
+    assert!(should_skip_directory_for_scan(
+        FileAttributeFlags::REPARSE_POINT.bits,
+        false
+    ));
+    assert!(should_skip_directory_for_scan(
+        FileAttributeFlags::OFFLINE.bits,
+        false
+    ));
+    assert!(should_skip_directory_for_scan(0, true));
+    assert!(!should_skip_directory_for_scan(0, false));
 }
 
 #[test]
@@ -357,6 +423,99 @@ fn cleanup_candidate_resolution_dedupes_and_rejects_stale_ids_before_cleanup() {
 }
 
 #[test]
+fn cleanup_plan_filters_candidates_in_sql_before_size_limit() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run("C:\\", Some("NTFS"), ScanMode::Recursive, None, None, 100)
+        .expect("create scan run");
+
+    let mut entries = (0..5000)
+        .map(|index| IndexedEntry {
+            path: format!("C:\\Data\\photo-{index}.jpg"),
+            parent_path: Some("C:\\Data".to_string()),
+            name: format!("photo-{index}.jpg"),
+            extension: Some("jpg".to_string()),
+            is_directory: false,
+            size: 10_000,
+            modified_at_ms: None,
+            created_at_ms: None,
+            accessed_at_ms: None,
+            attributes: 0,
+            is_reparse_point: false,
+            is_placeholder: false,
+            is_system: false,
+        })
+        .collect::<Vec<_>>();
+    entries.push(IndexedEntry {
+        path: "C:\\Data\\cache.tmp".to_string(),
+        parent_path: Some("C:\\Data".to_string()),
+        name: "cache.tmp".to_string(),
+        extension: Some("tmp".to_string()),
+        is_directory: false,
+        size: 1,
+        modified_at_ms: None,
+        created_at_ms: None,
+        accessed_at_ms: None,
+        attributes: 0,
+        is_reparse_point: false,
+        is_placeholder: false,
+        is_system: false,
+    });
+    db.insert_file_entries(run_id, &entries)
+        .expect("insert file entries");
+
+    let plan = build_cleanup_plan(&db, run_id, 10).expect("cleanup plan");
+
+    assert!(plan
+        .candidates
+        .iter()
+        .any(|candidate| candidate.path.ends_with("cache.tmp")));
+}
+
+#[test]
+fn top_directories_clamps_oversized_limits() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run("C:\\", Some("NTFS"), ScanMode::Recursive, None, None, 100)
+        .expect("create scan run");
+    let rollups = (0..150)
+        .map(|index| {
+            (
+                std::path::PathBuf::from(format!("C:\\Data\\dir-{index}")),
+                DirectoryRollup {
+                    total_size: index,
+                    file_count: 1,
+                    directory_count: 0,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    db.replace_directory_rollups(run_id, &rollups)
+        .expect("insert rollups");
+
+    let rows = db
+        .top_directories(run_id, u32::MAX)
+        .expect("top directories");
+
+    assert_eq!(rows.len(), 100);
+}
+
+#[test]
+fn cleanup_target_revalidation_rejects_protected_original_paths() {
+    let candidate = cleanup_candidate_for_path("C:\\Windows\\Temp\\cache.tmp");
+
+    let error = validate_cleanup_target(&candidate).expect_err("protected path rejected");
+
+    assert!(error.to_string().contains("protected"));
+}
+
+#[test]
 fn database_connections_enforce_foreign_keys_after_migration() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("index.sqlite3");
@@ -434,4 +593,36 @@ fn scan_report_export_writes_local_json_artifact() {
     assert!(body.contains("\"scanRun\""));
     assert!(body.contains("\"topDirectories\""));
     assert!(body.contains("\"cleanupPreview\""));
+}
+
+fn volume(
+    root_path: &str,
+    drive_type: &str,
+    is_ready: bool,
+    file_system: Option<&str>,
+) -> VolumeInfo {
+    VolumeInfo {
+        name: root_path.to_string(),
+        root_path: root_path.to_string(),
+        file_system: file_system.map(str::to_string),
+        drive_type: drive_type.to_string(),
+        is_ready,
+        available_space: Some(1),
+        total_space: Some(2),
+    }
+}
+
+fn cleanup_candidate_for_path(path: &str) -> CleanupCandidate {
+    CleanupCandidate {
+        id: "scan-1:entry-1".to_string(),
+        entry_id: 1,
+        scan_run_id: 1,
+        path: path.to_string(),
+        name: "cache.tmp".to_string(),
+        size: 1,
+        reason: "Temporary file extension".to_string(),
+        risk_level: CleanupRisk::Low,
+        action_kind: "recycle_bin".to_string(),
+        modified_at_ms: None,
+    }
 }

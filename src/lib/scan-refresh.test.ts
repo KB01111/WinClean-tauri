@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import {
+  shouldRefreshDashboardCollectionsForProgress,
   runDataRefreshKey,
   shouldRefreshRunDataForProgress,
 } from "./scan-refresh"
@@ -14,6 +15,15 @@ describe("scan refresh policy", () => {
     expect(shouldRefreshRunDataForProgress({ state: "completed" })).toBe(true)
     expect(shouldRefreshRunDataForProgress({ state: "failed" })).toBe(true)
     expect(shouldRefreshRunDataForProgress({ state: "canceled" })).toBe(true)
+  })
+
+  test("keeps dashboard collection refreshes off the scan polling path", () => {
+    expect(
+      shouldRefreshDashboardCollectionsForProgress({ state: "running" })
+    ).toBe(false)
+    expect(
+      shouldRefreshDashboardCollectionsForProgress({ state: "completed" })
+    ).toBe(true)
   })
 
   test("uses stable run-data keys to suppress duplicate completion refreshes", () => {

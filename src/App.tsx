@@ -33,6 +33,7 @@ import {
 import { selectDashboardRun } from "@/lib/scan-selection"
 import {
   runDataRefreshKey,
+  shouldRefreshDashboardCollectionsForProgress,
   shouldRefreshRunDataForProgress,
 } from "@/lib/scan-refresh"
 
@@ -226,6 +227,7 @@ function App() {
   const [loadingVolumes, setLoadingVolumes] = useState(true)
   const [loadingData, setLoadingData] = useState(false)
   const dashboardRefreshInFlight = useRef(false)
+  const scanStatusRefreshInFlight = useRef(false)
   const initialLoadStarted = useRef(false)
   const lastRunDataRefreshKey = useRef<string | null>(null)
 
@@ -348,6 +350,24 @@ function App() {
     }
   }, [currentDirectory, refreshRunData, selectedRunId])
 
+  const refreshScanStatus = useCallback(async () => {
+    if (scanStatusRefreshInFlight.current) {
+      return
+    }
+    scanStatusRefreshInFlight.current = true
+    try {
+      const nextProgress = await invoke<ScanProgress>("scan_status")
+      setProgress(nextProgress)
+      if (shouldRefreshDashboardCollectionsForProgress(nextProgress)) {
+        await refreshDashboard()
+      }
+    } catch (error) {
+      setMessage(formatError(error))
+    } finally {
+      scanStatusRefreshInFlight.current = false
+    }
+  }, [refreshDashboard])
+
   const refreshVolumes = useCallback(async () => {
     setLoadingVolumes(true)
     try {
@@ -375,10 +395,10 @@ function App() {
       return
     }
     const timer = window.setInterval(() => {
-      void refreshDashboard()
+      void refreshScanStatus()
     }, 900)
     return () => window.clearInterval(timer)
-  }, [isScanning, refreshDashboard])
+  }, [isScanning, refreshScanStatus])
 
   useEffect(() => {
     if (!activeRun || isScanning) {

@@ -8,6 +8,12 @@ export function shouldRefreshRunDataForProgress(
   return progress.state !== "running"
 }
 
+export function shouldRefreshDashboardCollectionsForProgress(
+  progress: ScanRefreshProgress
+) {
+  return progress.state !== "running"
+}
+
 export function runDataRefreshKey(
   runId: number | null | undefined,
   parentPath: string | null | undefined
