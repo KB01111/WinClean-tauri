@@ -18,6 +18,10 @@ describe("scan refresh policy", () => {
 
   test("uses stable run-data keys to suppress duplicate completion refreshes", () => {
     expect(runDataRefreshKey(42, "C:\\Users")).toBe("42:C:\\Users")
+    expect(runDataRefreshKey(42, null)).toBe("42:")
+    expect(runDataRefreshKey(42, null)).not.toBe(
+      runDataRefreshKey(42, "C:\\")
+    )
     expect(runDataRefreshKey(null, null)).toBe("none:")
   })
 })

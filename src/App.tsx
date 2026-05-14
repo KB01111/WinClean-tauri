@@ -384,10 +384,7 @@ function App() {
     if (!activeRun || isScanning) {
       return
     }
-    const key = runDataRefreshKey(
-      activeRun.id,
-      currentDirectory ?? activeRun.rootPath
-    )
+    const key = runDataRefreshKey(activeRun.id, currentDirectory)
     if (lastRunDataRefreshKey.current === key) {
       lastRunDataRefreshKey.current = null
       return
