@@ -36,6 +36,7 @@ import {
   shouldRefreshDashboardCollectionsForProgress,
   shouldRefreshRunDataForProgress,
 } from "@/lib/scan-refresh"
+import { selectDefaultScanRoot } from "@/lib/volume-selection"
 
 type View = "overview" | "explorer" | "cleanup" | "history" | "settings"
 type ScanMode = "ntfsUsn" | "recursive"
@@ -237,7 +238,9 @@ function App() {
   )
   const activeRun = useMemo(
     () =>
-      scanRuns.find((run) => run.id === selectedRunId) ?? scanRuns[0] ?? null,
+      scanRuns.find((run) => run.id === selectedRunId) ??
+      scanRuns.find((run) => run.status === "completed") ??
+      null,
     [scanRuns, selectedRunId]
   )
   const isScanning = progress.state === "running"
@@ -373,7 +376,7 @@ function App() {
     try {
       const nextVolumes = await invoke<VolumeInfo[]>("list_volumes")
       setVolumes(nextVolumes)
-      setSelectedRoot((current) => current || nextVolumes[0]?.rootPath || "")
+      setSelectedRoot((current) => selectDefaultScanRoot(nextVolumes, current))
     } catch (error) {
       setMessage(formatError(error))
     } finally {

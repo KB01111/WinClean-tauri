@@ -28,10 +28,6 @@ pub fn resolve_local_scan_root(
         return Err("Select a local volume root from the available drives.".to_string());
     };
 
-    if !volume.is_ready {
-        return Err(format!("{} is not ready for scanning.", volume.root_path));
-    }
-
     if !matches!(volume.drive_type.as_str(), "fixed" | "removable") {
         return Err(format!(
             "{} is not a supported local fixed or removable drive.",
@@ -39,7 +35,15 @@ pub fn resolve_local_scan_root(
         ));
     }
 
+    if !volume.is_ready {
+        return Err(format!("{} is not ready for scanning.", volume.root_path));
+    }
+
     Ok(volume.clone())
+}
+
+pub fn should_probe_volume_details(drive_type_code: u32) -> bool {
+    matches!(drive_type_code, 2 | 3)
 }
 
 fn normalize_volume_root(path: &str) -> String {
@@ -66,8 +70,18 @@ fn platform_volumes() -> Vec<VolumeInfo> {
         let root_path = format!("{letter}:\\");
         let wide = wide_null(&root_path);
         let drive_type_code = unsafe { GetDriveTypeW(wide.as_ptr()) };
-        let (file_system, is_ready) = volume_file_system(wide.as_ptr());
-        let (available_space, total_space) = disk_space(wide.as_ptr());
+        let (file_system, is_ready, available_space, total_space) =
+            if should_probe_volume_details(drive_type_code) {
+                let (file_system, is_ready) = volume_file_system(wide.as_ptr());
+                let (available_space, total_space) = if is_ready {
+                    disk_space(wide.as_ptr())
+                } else {
+                    (None, None)
+                };
+                (file_system, is_ready, available_space, total_space)
+            } else {
+                (None, false, None, None)
+            };
 
         volumes.push(VolumeInfo {
             name: root_path.clone(),

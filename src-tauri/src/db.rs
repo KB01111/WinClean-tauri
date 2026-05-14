@@ -312,6 +312,21 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    pub fn finalize_interrupted_scan_runs(&self) -> anyhow::Result<usize> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE scan_runs
+            SET status = 'failed',
+                finished_at_ms = COALESCE(finished_at_ms, ?1),
+                last_error = COALESCE(last_error, 'Scan was interrupted before the app closed.')
+            WHERE status = 'running'
+            "#,
+            params![unix_millis()],
+        )
+        .context("finalize interrupted scan runs")
+    }
+
     pub fn finish_scan_run(
         &self,
         summary: &ScanSummary,

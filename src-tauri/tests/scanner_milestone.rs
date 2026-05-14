@@ -16,7 +16,7 @@ use winclean_lib::{
     },
     commands::begin_scan_progress,
     db::CleanupActionInsert,
-    volume::{resolve_local_scan_root, VolumeInfo},
+    volume::{resolve_local_scan_root, should_probe_volume_details, VolumeInfo},
 };
 
 #[test]
@@ -101,6 +101,18 @@ fn local_scan_root_policy_accepts_ready_fixed_and_removable_roots_only() {
     assert!(resolve_local_scan_root("C:\\Users", &volumes)
         .expect_err("arbitrary path should be rejected")
         .contains("local volume root"));
+}
+
+#[test]
+fn volume_metadata_probe_policy_skips_unsupported_drive_types() {
+    assert!(should_probe_volume_details(2));
+    assert!(should_probe_volume_details(3));
+
+    assert!(!should_probe_volume_details(0));
+    assert!(!should_probe_volume_details(1));
+    assert!(!should_probe_volume_details(4));
+    assert!(!should_probe_volume_details(5));
+    assert!(!should_probe_volume_details(6));
 }
 
 #[test]
@@ -236,6 +248,31 @@ fn missing_scan_root_is_persisted_as_failed() {
         .as_deref()
         .unwrap_or_default()
         .contains("scan root is not readable"));
+}
+
+#[test]
+fn startup_finalizes_interrupted_running_scan_runs() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let run_id = db
+        .create_scan_run("C:\\", Some("NTFS"), ScanMode::Recursive, None, None, 100)
+        .expect("create running scan");
+
+    assert_eq!(db.finalize_interrupted_scan_runs().expect("finalize"), 1);
+
+    let run = db
+        .scan_run(run_id)
+        .expect("read scan run")
+        .expect("scan run exists");
+    assert_eq!(run.status, "failed");
+    assert!(run.finished_at_ms.expect("finished timestamp") >= 100);
+    assert_eq!(
+        run.last_error.as_deref(),
+        Some("Scan was interrupted before the app closed.")
+    );
 }
 
 #[test]

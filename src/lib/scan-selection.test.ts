@@ -46,4 +46,17 @@ describe("dashboard run selection", () => {
       })
     ).toEqual({ runId: 1, directory: "C:\\" })
   })
+
+  test("does not auto-select interrupted or failed runs", () => {
+    expect(
+      selectDashboardRun({
+        runs: [
+          { id: 3, rootPath: "C:\\", status: "running" },
+          { id: 2, rootPath: "D:\\", status: "failed" },
+        ],
+        selectedRunId: null,
+        progressState: "idle",
+      })
+    ).toEqual({ runId: null, directory: null })
+  })
 })

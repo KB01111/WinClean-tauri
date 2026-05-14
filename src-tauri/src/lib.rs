@@ -15,6 +15,7 @@ pub fn run() {
             std::fs::create_dir_all(&app_data_dir)?;
             let database = db::Database::open(app_data_dir.join("winclean.sqlite3"))?;
             database.migrate()?;
+            database.finalize_interrupted_scan_runs()?;
             app.manage(commands::AppState::new(database, app_data_dir));
             Ok(())
         })
