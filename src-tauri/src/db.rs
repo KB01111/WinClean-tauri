@@ -206,10 +206,15 @@ impl Database {
                 ON file_entries(scan_run_id, path);
             CREATE INDEX IF NOT EXISTS idx_file_entries_run_parent
                 ON file_entries(scan_run_id, parent_path);
+            DROP INDEX IF EXISTS idx_file_entries_run_parent_size;
+            CREATE INDEX IF NOT EXISTS idx_file_entries_run_parent_lookup
+                ON file_entries(scan_run_id, parent_path, is_directory, name);
             CREATE INDEX IF NOT EXISTS idx_file_entries_run_extension
                 ON file_entries(scan_run_id, extension);
             CREATE INDEX IF NOT EXISTS idx_file_entries_run_name
                 ON file_entries(scan_run_id, name);
+            CREATE INDEX IF NOT EXISTS idx_file_entries_run_file_size
+                ON file_entries(scan_run_id, is_directory, size DESC);
 
             CREATE TABLE IF NOT EXISTS directory_rollups (
                 scan_run_id INTEGER NOT NULL,
@@ -806,8 +811,11 @@ impl Database {
 
         let conn = Connection::open(&self.path)
             .with_context(|| format!("open sqlite database {}", self.path.display()))?;
-        conn.busy_timeout(Duration::from_millis(1_500))?;
+        conn.busy_timeout(Duration::from_secs(10))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         Ok(conn)
     }
 }

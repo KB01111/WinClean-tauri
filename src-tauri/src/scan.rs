@@ -1,19 +1,26 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
 
-const BATCH_SIZE: usize = 512;
+const BATCH_SIZE: usize = 2_048;
+const SCAN_EVENT_BATCH_SIZE: usize = 256;
+const EVENT_QUEUE_MULTIPLIER: usize = 16;
+const PROGRESS_UPDATE_INTERVAL_MS: u64 = 200;
+const MAX_BALANCED_WORKERS: usize = 8;
+const DIR_QUEUE_MULTIPLIER: usize = 64;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,7 +66,7 @@ pub struct FileAttributeClassification {
     pub is_system: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ScanState {
     Idle,
@@ -85,6 +92,8 @@ pub struct ScanProgress {
     pub skipped_reparse_count: u64,
     pub error_count: u64,
     pub last_error: Option<String>,
+    pub worker_count: Option<usize>,
+    pub phase: Option<String>,
 }
 
 impl Default for ScanProgress {
@@ -103,6 +112,8 @@ impl Default for ScanProgress {
             skipped_reparse_count: 0,
             error_count: 0,
             last_error: None,
+            worker_count: None,
+            phase: None,
         }
     }
 }
@@ -159,6 +170,41 @@ pub struct DirectoryRollup {
     pub directory_count: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ScannedEntry {
+    path: PathBuf,
+    indexed: IndexedEntry,
+    is_file: bool,
+    is_directory: bool,
+    size: u64,
+}
+
+#[derive(Debug)]
+enum ScanEvent {
+    DirectoryEntries {
+        entries: Vec<ScannedEntry>,
+        child_dirs: Vec<PathBuf>,
+        access_denied_count: u64,
+        error_count: u64,
+        skipped_reparse_count: u64,
+    },
+    DirectoryFinished {
+        dir: PathBuf,
+    },
+    DirectoryReadError {
+        dir: PathBuf,
+        kind: io::ErrorKind,
+        message: String,
+    },
+}
+
+pub fn balanced_worker_count(logical_cores: usize) -> usize {
+    logical_cores
+        .saturating_sub(1)
+        .max(1)
+        .min(MAX_BALANCED_WORKERS)
+}
+
 pub fn classify_file_attributes(attributes: u32) -> FileAttributeClassification {
     let is_reparse_point = attributes & FileAttributeFlags::REPARSE_POINT.bits != 0;
     let is_offline = attributes & FileAttributeFlags::OFFLINE.bits != 0;
@@ -208,6 +254,11 @@ pub fn run_recursive_scan(
 
     let root = root.to_path_buf();
     let root_path = root.to_string_lossy().to_string();
+    let worker_count = balanced_worker_count(
+        thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1),
+    );
     let started_at_ms = unix_millis(SystemTime::now());
     let run_id = db.create_scan_run(
         &root_path,
@@ -235,130 +286,316 @@ pub fn run_recursive_scan(
         canceled: false,
     };
 
-    update_progress(&options.progress, &summary, ScanState::Running, None);
+    update_progress(
+        &options.progress,
+        &summary,
+        ScanState::Running,
+        None,
+        Some(worker_count),
+        Some("scanning"),
+    );
 
-    let scan_result = (|| -> anyhow::Result<()> {
-        let mut stack = vec![root.clone()];
-        let mut pending_entries = Vec::with_capacity(BATCH_SIZE);
-        let mut rollups: HashMap<PathBuf, DirectoryRollup> = HashMap::new();
-
-        while let Some(dir) = stack.pop() {
-            if is_canceled(options.cancel.as_deref()) {
-                summary.canceled = true;
-                break;
-            }
-
-            let entries = match fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(error) => {
-                    record_io_error(&mut summary, &error);
-                    update_progress(&options.progress, &summary, ScanState::Running, None);
-                    continue;
-                }
-            };
-
-            for entry_result in entries {
-                if is_canceled(options.cancel.as_deref()) {
-                    summary.canceled = true;
-                    break;
-                }
-
-                let entry = match entry_result {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        record_io_error(&mut summary, &error);
-                        continue;
-                    }
-                };
-
-                let path = entry.path();
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(error) => {
-                        record_io_error(&mut summary, &error);
-                        continue;
-                    }
-                };
-
-                let attributes = file_attributes(&metadata);
-                let classification = classify_file_attributes(attributes);
-                let is_directory = metadata.is_dir();
-                let is_file = metadata.is_file();
-                let size = if is_file { metadata.len() } else { 0 };
-
-                if is_file {
-                    summary.files_indexed += 1;
-                    summary.bytes_indexed += size;
-                    add_file_to_rollups(&mut rollups, &root, &path, size);
-                } else if is_directory {
-                    summary.directories_indexed += 1;
-                    add_directory_to_rollups(&mut rollups, &root, &path);
-                }
-
-                if is_directory && classification.is_reparse_point {
-                    summary.skipped_reparse_count += 1;
-                } else if is_directory {
-                    stack.push(path.clone());
-                }
-
-                pending_entries.push(indexed_entry(
-                    &path,
-                    is_directory,
-                    size,
-                    attributes,
-                    &classification,
-                    &metadata,
-                ));
-
-                if pending_entries.len() >= BATCH_SIZE {
-                    db.insert_file_entries(run_id, &pending_entries)?;
-                    pending_entries.clear();
-                    update_progress(&options.progress, &summary, ScanState::Running, None);
-                }
-            }
-        }
-
-        if !pending_entries.is_empty() {
-            db.insert_file_entries(run_id, &pending_entries)?;
-        }
-
-        summary.finished_at_ms = unix_millis(SystemTime::now());
-        db.replace_directory_rollups(run_id, &rollups)?;
-        db.finish_scan_run(
-            &summary,
-            if summary.canceled {
+    match collect_parallel_scan(db, run_id, &root, &options, worker_count, &mut summary) {
+        Ok(rollups) => {
+            summary.finished_at_ms = unix_millis(SystemTime::now());
+            let status = if summary.canceled {
                 "canceled"
             } else {
                 "completed"
-            },
-            None,
-        )?;
-        update_progress(
-            &options.progress,
-            &summary,
-            if summary.canceled {
-                ScanState::Canceled
-            } else {
-                ScanState::Completed
-            },
-            None,
-        );
-        Ok(())
-    })();
-
-    if let Err(error) = scan_result {
-        let message = error.to_string();
-        if let Err(finalize_error) =
-            finalize_failed_scan_run(db, &mut summary, options.progress.as_ref(), &message)
-        {
-            anyhow::bail!(
-                "scan failed with {message}; additionally failed to persist failed scan state: {finalize_error}"
+            };
+            if let Err(error) = db
+                .replace_directory_rollups(run_id, &rollups)
+                .and_then(|_| db.finish_scan_run(&summary, status, None))
+            {
+                let last_error = error.to_string();
+                if let Err(finalize_error) = finalize_failed_scan_run_with_details(
+                    db,
+                    &mut summary,
+                    options.progress.as_ref(),
+                    &last_error,
+                    Some(worker_count),
+                ) {
+                    anyhow::bail!(
+                        "scan failed with {last_error}; additionally failed to persist failed scan state: {finalize_error}"
+                    );
+                }
+                return Err(error);
+            }
+            update_progress(
+                &options.progress,
+                &summary,
+                if summary.canceled {
+                    ScanState::Canceled
+                } else {
+                    ScanState::Completed
+                },
+                None,
+                Some(worker_count),
+                Some(if summary.canceled {
+                    "canceled"
+                } else {
+                    "complete"
+                }),
             );
+            Ok(summary)
         }
+        Err(error) => {
+            let last_error = error.to_string();
+            if let Err(finalize_error) = finalize_failed_scan_run_with_details(
+                db,
+                &mut summary,
+                options.progress.as_ref(),
+                &last_error,
+                Some(worker_count),
+            ) {
+                anyhow::bail!(
+                    "scan failed with {last_error}; additionally failed to persist failed scan state: {finalize_error}"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn collect_parallel_scan(
+    db: &Database,
+    run_id: i64,
+    root: &Path,
+    options: &ScanRunOptions,
+    worker_count: usize,
+    summary: &mut ScanSummary,
+) -> anyhow::Result<HashMap<PathBuf, DirectoryRollup>> {
+    let queue_capacity = worker_count.max(1) * DIR_QUEUE_MULTIPLIER;
+    let event_capacity = worker_count.max(1) * EVENT_QUEUE_MULTIPLIER;
+    let (dir_sender, dir_receiver) = bounded::<PathBuf>(queue_capacity);
+    let (event_sender, event_receiver) = bounded::<ScanEvent>(event_capacity);
+    let cancel = options
+        .cancel
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let mut handles = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let dir_receiver = dir_receiver.clone();
+        let event_sender = event_sender.clone();
+        let cancel = Arc::clone(&cancel);
+        handles.push(thread::spawn(move || {
+            scan_worker(dir_receiver, event_sender, cancel);
+        }));
+    }
+    drop(event_sender);
+    drop(dir_receiver);
+
+    let mut dir_sender = Some(dir_sender);
+    let mut pending_dirs = VecDeque::from([root.to_path_buf()]);
+    let mut active_dirs = 0usize;
+    let mut pending_entries = Vec::with_capacity(BATCH_SIZE);
+    let mut rollups: HashMap<PathBuf, DirectoryRollup> = HashMap::new();
+    let mut scan_error: Option<anyhow::Error> = None;
+    let mut last_progress_update = Instant::now();
+
+    while active_dirs > 0 || !pending_dirs.is_empty() {
+        pump_pending_dirs(
+            &mut dir_sender,
+            &mut pending_dirs,
+            &mut active_dirs,
+            &mut scan_error,
+            &cancel,
+        );
+
+        if active_dirs == 0 {
+            continue;
+        }
+
+        let event = match event_receiver.recv() {
+            Ok(event) => event,
+            Err(error) => {
+                scan_error = Some(anyhow::anyhow!(
+                    "scanner workers stopped unexpectedly: {error}"
+                ));
+                cancel.store(true, Ordering::Relaxed);
+                dir_sender.take();
+                pending_dirs.clear();
+                break;
+            }
+        };
+
+        if is_canceled(Some(cancel.as_ref())) {
+            summary.canceled = true;
+            dir_sender.take();
+            pending_dirs.clear();
+        }
+
+        match event {
+            ScanEvent::DirectoryReadError { dir, kind, message } => {
+                active_dirs = active_dirs.saturating_sub(1);
+                record_io_error_kind(summary, kind);
+                if dir == root && scan_error.is_none() {
+                    scan_error = Some(anyhow::anyhow!("scan root is not readable: {message}"));
+                    cancel.store(true, Ordering::Relaxed);
+                    dir_sender.take();
+                    pending_dirs.clear();
+                }
+            }
+            ScanEvent::DirectoryFinished { dir: _dir } => {
+                active_dirs = active_dirs.saturating_sub(1);
+            }
+            ScanEvent::DirectoryEntries {
+                entries,
+                child_dirs,
+                access_denied_count,
+                error_count,
+                skipped_reparse_count,
+            } => {
+                summary.access_denied_count += access_denied_count;
+                summary.error_count += error_count;
+                summary.skipped_reparse_count += skipped_reparse_count;
+
+                if scan_error.is_none() {
+                    for scanned in entries {
+                        if scanned.is_file {
+                            summary.files_indexed += 1;
+                            summary.bytes_indexed += scanned.size;
+                            add_file_to_rollups(&mut rollups, root, &scanned.path, scanned.size);
+                        } else if scanned.is_directory {
+                            summary.directories_indexed += 1;
+                            add_directory_to_rollups(&mut rollups, root, &scanned.path);
+                        }
+
+                        pending_entries.push(scanned.indexed);
+                        if pending_entries.len() >= BATCH_SIZE {
+                            if let Err(error) = db.insert_file_entries(run_id, &pending_entries) {
+                                scan_error = Some(error);
+                                cancel.store(true, Ordering::Relaxed);
+                                dir_sender.take();
+                                pending_dirs.clear();
+                                break;
+                            }
+                            pending_entries.clear();
+                            maybe_update_progress(
+                                &options.progress,
+                                summary,
+                                ScanState::Running,
+                                None,
+                                Some(worker_count),
+                                Some("indexing"),
+                                &mut last_progress_update,
+                            );
+                        }
+                    }
+                }
+
+                if !summary.canceled && scan_error.is_none() {
+                    for child_dir in child_dirs {
+                        pending_dirs.push_back(child_dir);
+                    }
+                    pump_pending_dirs(
+                        &mut dir_sender,
+                        &mut pending_dirs,
+                        &mut active_dirs,
+                        &mut scan_error,
+                        &cancel,
+                    );
+                }
+            }
+        }
+
+        maybe_update_progress(
+            &options.progress,
+            summary,
+            ScanState::Running,
+            None,
+            Some(worker_count),
+            Some(if summary.canceled {
+                "canceling"
+            } else {
+                "scanning"
+            }),
+            &mut last_progress_update,
+        );
+    }
+
+    drop(dir_sender);
+    for handle in handles {
+        if handle.join().is_err() && scan_error.is_none() {
+            scan_error = Some(anyhow::anyhow!("scanner worker panicked"));
+        }
+    }
+
+    if let Some(error) = scan_error {
         return Err(error);
     }
 
-    Ok(summary)
+    if !pending_entries.is_empty() {
+        db.insert_file_entries(run_id, &pending_entries)?;
+        update_progress(
+            &options.progress,
+            summary,
+            ScanState::Running,
+            None,
+            Some(worker_count),
+            Some("indexing"),
+        );
+    }
+
+    Ok(rollups)
+}
+
+fn pump_pending_dirs(
+    dir_sender: &mut Option<Sender<PathBuf>>,
+    pending_dirs: &mut VecDeque<PathBuf>,
+    active_dirs: &mut usize,
+    scan_error: &mut Option<anyhow::Error>,
+    cancel: &Arc<AtomicBool>,
+) {
+    if scan_error.is_some() || is_canceled(Some(cancel.as_ref())) {
+        dir_sender.take();
+        pending_dirs.clear();
+        return;
+    }
+
+    let Some(sender) = dir_sender.clone() else {
+        pending_dirs.clear();
+        return;
+    };
+
+    while let Some(dir) = pending_dirs.pop_front() {
+        match sender.try_send(dir) {
+            Ok(()) => {
+                *active_dirs += 1;
+            }
+            Err(TrySendError::Full(dir)) => {
+                pending_dirs.push_front(dir);
+                break;
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                *scan_error = Some(anyhow::anyhow!(
+                    "scanner workers stopped while queuing directories"
+                ));
+                cancel.store(true, Ordering::Relaxed);
+                dir_sender.take();
+                pending_dirs.clear();
+                break;
+            }
+        }
+    }
+}
+
+fn maybe_update_progress(
+    progress: &Option<Arc<Mutex<ScanProgress>>>,
+    summary: &ScanSummary,
+    state: ScanState,
+    last_error: Option<String>,
+    worker_count: Option<usize>,
+    phase: Option<&str>,
+    last_progress_update: &mut Instant,
+) {
+    if last_progress_update.elapsed() < Duration::from_millis(PROGRESS_UPDATE_INTERVAL_MS) {
+        return;
+    }
+
+    update_progress(progress, summary, state, last_error, worker_count, phase);
+    *last_progress_update = Instant::now();
 }
 
 pub fn finalize_failed_scan_run(
@@ -366,6 +603,16 @@ pub fn finalize_failed_scan_run(
     summary: &mut ScanSummary,
     progress: Option<&Arc<Mutex<ScanProgress>>>,
     last_error: &str,
+) -> anyhow::Result<()> {
+    finalize_failed_scan_run_with_details(db, summary, progress, last_error, None)
+}
+
+fn finalize_failed_scan_run_with_details(
+    db: &Database,
+    summary: &mut ScanSummary,
+    progress: Option<&Arc<Mutex<ScanProgress>>>,
+    last_error: &str,
+    worker_count: Option<usize>,
 ) -> anyhow::Result<()> {
     summary.finished_at_ms = unix_millis(SystemTime::now());
     db.finish_scan_run(summary, "failed", Some(last_error))?;
@@ -375,8 +622,164 @@ pub fn finalize_failed_scan_run(
         summary,
         ScanState::Failed,
         Some(last_error.to_string()),
+        worker_count,
+        Some("failed"),
     );
     Ok(())
+}
+
+fn scan_worker(
+    dir_receiver: Receiver<PathBuf>,
+    event_sender: Sender<ScanEvent>,
+    cancel: Arc<AtomicBool>,
+) {
+    while let Ok(dir) = dir_receiver.recv() {
+        if !scan_directory(&dir, &cancel, &event_sender) {
+            return;
+        }
+    }
+}
+
+fn scan_directory(dir: &Path, cancel: &AtomicBool, event_sender: &Sender<ScanEvent>) -> bool {
+    if is_canceled(Some(cancel)) {
+        return event_sender
+            .send(ScanEvent::DirectoryFinished {
+                dir: dir.to_path_buf(),
+            })
+            .is_ok();
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return event_sender
+                .send(ScanEvent::DirectoryReadError {
+                    dir: dir.to_path_buf(),
+                    kind: error.kind(),
+                    message: error.to_string(),
+                })
+                .is_ok()
+        }
+    };
+
+    let mut scanned_entries = Vec::with_capacity(SCAN_EVENT_BATCH_SIZE);
+    let mut child_dirs = Vec::new();
+    let mut access_denied_count = 0;
+    let mut error_count = 0;
+    let mut skipped_reparse_count = 0;
+
+    for entry_result in entries {
+        if is_canceled(Some(cancel)) {
+            break;
+        }
+
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_io_error_counts(&mut access_denied_count, &mut error_count, error.kind());
+                continue;
+            }
+        };
+
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                record_io_error_counts(&mut access_denied_count, &mut error_count, error.kind());
+                continue;
+            }
+        };
+
+        let attributes = file_attributes(&metadata);
+        let classification = classify_file_attributes(attributes);
+        let is_directory = metadata.is_dir();
+        let is_file = metadata.is_file();
+        let size = if is_file { metadata.len() } else { 0 };
+
+        if is_directory && classification.is_reparse_point {
+            skipped_reparse_count += 1;
+        } else if is_directory {
+            child_dirs.push(path.clone());
+        }
+
+        scanned_entries.push(ScannedEntry {
+            indexed: indexed_entry(
+                &path,
+                is_directory,
+                size,
+                attributes,
+                &classification,
+                &metadata,
+            ),
+            path,
+            is_file,
+            is_directory,
+            size,
+        });
+
+        if scanned_entries.len() >= SCAN_EVENT_BATCH_SIZE
+            && !flush_scan_batch(
+                event_sender,
+                &mut scanned_entries,
+                &mut child_dirs,
+                &mut access_denied_count,
+                &mut error_count,
+                &mut skipped_reparse_count,
+            )
+        {
+            return false;
+        }
+    }
+
+    if !flush_scan_batch(
+        event_sender,
+        &mut scanned_entries,
+        &mut child_dirs,
+        &mut access_denied_count,
+        &mut error_count,
+        &mut skipped_reparse_count,
+    ) {
+        return false;
+    }
+
+    event_sender
+        .send(ScanEvent::DirectoryFinished {
+            dir: dir.to_path_buf(),
+        })
+        .is_ok()
+}
+
+fn flush_scan_batch(
+    event_sender: &Sender<ScanEvent>,
+    scanned_entries: &mut Vec<ScannedEntry>,
+    child_dirs: &mut Vec<PathBuf>,
+    access_denied_count: &mut u64,
+    error_count: &mut u64,
+    skipped_reparse_count: &mut u64,
+) -> bool {
+    if scanned_entries.is_empty()
+        && child_dirs.is_empty()
+        && *access_denied_count == 0
+        && *error_count == 0
+        && *skipped_reparse_count == 0
+    {
+        return true;
+    }
+
+    let entries = std::mem::replace(scanned_entries, Vec::with_capacity(SCAN_EVENT_BATCH_SIZE));
+    let child_dirs = std::mem::take(child_dirs);
+    let event = ScanEvent::DirectoryEntries {
+        entries,
+        child_dirs,
+        access_denied_count: *access_denied_count,
+        error_count: *error_count,
+        skipped_reparse_count: *skipped_reparse_count,
+    };
+    *access_denied_count = 0;
+    *error_count = 0;
+    *skipped_reparse_count = 0;
+
+    event_sender.send(event).is_ok()
 }
 
 fn indexed_entry(
@@ -456,11 +859,23 @@ fn add_directory_to_rollups(
     }
 }
 
-fn record_io_error(summary: &mut ScanSummary, error: &io::Error) {
-    if error.kind() == io::ErrorKind::PermissionDenied {
+fn record_io_error_kind(summary: &mut ScanSummary, kind: io::ErrorKind) {
+    if kind == io::ErrorKind::PermissionDenied {
         summary.access_denied_count += 1;
     } else {
         summary.error_count += 1;
+    }
+}
+
+fn record_io_error_counts(
+    access_denied_count: &mut u64,
+    error_count: &mut u64,
+    kind: io::ErrorKind,
+) {
+    if kind == io::ErrorKind::PermissionDenied {
+        *access_denied_count += 1;
+    } else {
+        *error_count += 1;
     }
 }
 
@@ -469,6 +884,8 @@ fn update_progress(
     summary: &ScanSummary,
     state: ScanState,
     last_error: Option<String>,
+    worker_count: Option<usize>,
+    phase: Option<&str>,
 ) {
     let Some(progress) = progress else {
         return;
@@ -489,6 +906,8 @@ fn update_progress(
             skipped_reparse_count: summary.skipped_reparse_count,
             error_count: summary.error_count,
             last_error,
+            worker_count,
+            phase: phase.map(str::to_string),
         };
     }
 }
