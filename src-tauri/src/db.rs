@@ -206,8 +206,9 @@ impl Database {
                 ON file_entries(scan_run_id, path);
             CREATE INDEX IF NOT EXISTS idx_file_entries_run_parent
                 ON file_entries(scan_run_id, parent_path);
-            CREATE INDEX IF NOT EXISTS idx_file_entries_run_parent_size
-                ON file_entries(scan_run_id, parent_path, is_directory, size DESC);
+            DROP INDEX IF EXISTS idx_file_entries_run_parent_size;
+            CREATE INDEX IF NOT EXISTS idx_file_entries_run_parent_lookup
+                ON file_entries(scan_run_id, parent_path, is_directory, name);
             CREATE INDEX IF NOT EXISTS idx_file_entries_run_extension
                 ON file_entries(scan_run_id, extension);
             CREATE INDEX IF NOT EXISTS idx_file_entries_run_name

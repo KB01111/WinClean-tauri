@@ -129,6 +129,7 @@ pub fn start_scan(
             if let Ok(mut progress) = progress.lock() {
                 progress.state = ScanState::Failed;
                 progress.last_error = Some(error.to_string());
+                progress.phase = Some("failed".to_string());
             }
         }
     });

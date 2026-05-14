@@ -31,7 +31,10 @@ import {
   statusText,
 } from "@/lib/format"
 import { selectDashboardRun } from "@/lib/scan-selection"
-import { shouldRefreshRunDataForProgress } from "@/lib/scan-refresh"
+import {
+  runDataRefreshKey,
+  shouldRefreshRunDataForProgress,
+} from "@/lib/scan-refresh"
 
 type View = "overview" | "explorer" | "cleanup" | "history" | "settings"
 type ScanMode = "ntfsUsn" | "recursive"
@@ -224,6 +227,7 @@ function App() {
   const [loadingData, setLoadingData] = useState(false)
   const dashboardRefreshInFlight = useRef(false)
   const initialLoadStarted = useRef(false)
+  const lastRunDataRefreshKey = useRef<string | null>(null)
 
   const selectedVolume = useMemo(
     () => volumes.find((volume) => volume.rootPath === selectedRoot),
@@ -328,10 +332,15 @@ function App() {
       setSelectedRunId(nextRunId)
       setCurrentDirectory(nextDirectory)
       if (shouldRefreshRunDataForProgress(nextProgress)) {
+        lastRunDataRefreshKey.current = runDataRefreshKey(
+          nextRunId,
+          nextDirectory
+        )
         await refreshRunData(nextRunId, nextDirectory)
       }
       setMessage(null)
     } catch (error) {
+      lastRunDataRefreshKey.current = null
       setMessage(formatError(error))
     } finally {
       dashboardRefreshInFlight.current = false
@@ -373,6 +382,14 @@ function App() {
 
   useEffect(() => {
     if (!activeRun || isScanning) {
+      return
+    }
+    const key = runDataRefreshKey(
+      activeRun.id,
+      currentDirectory ?? activeRun.rootPath
+    )
+    if (lastRunDataRefreshKey.current === key) {
+      lastRunDataRefreshKey.current = null
       return
     }
     const timeout = window.setTimeout(() => {
