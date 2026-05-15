@@ -340,6 +340,9 @@ pub fn start_offload(
     }
 
     let drive = GoogleDriveClient::configured().map_err(to_command_error)?;
+    if !drive_status().connected {
+        return Err("Connect Google Drive before starting an offload.".to_string());
+    }
     let recycler = WindowsRecycleBin;
     let initial = create_offload_job(&state.db, run_id, &candidates).map_err(to_command_error)?;
     let cancel = Arc::new(AtomicBool::new(false));
