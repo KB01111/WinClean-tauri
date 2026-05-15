@@ -391,8 +391,7 @@ impl DriveUploader for GoogleDriveClient {
             .size
             .as_deref()
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(candidate.size);
-        if uploaded_size != candidate.size {
+            .ok_or_else(|| anyhow::anyhow!("Google Drive did not return file size for verification"))?;
             anyhow::bail!(
                 "Google Drive upload size mismatch: expected {} bytes, got {} bytes",
                 candidate.size,
