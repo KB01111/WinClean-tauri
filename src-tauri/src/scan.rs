@@ -219,7 +219,7 @@ pub fn classify_file_attributes(attributes: u32) -> FileAttributeClassification 
 
 pub fn should_skip_directory_for_scan(attributes: u32, is_symlink: bool) -> bool {
     let classification = classify_file_attributes(attributes);
-    classification.is_reparse_point || classification.is_placeholder || is_symlink
+    classification.is_placeholder || is_symlink
 }
 
 pub fn choose_scan_plan(_root_path: &str, file_system: Option<&str>) -> ScanPlan {
