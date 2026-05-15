@@ -683,14 +683,11 @@ function App() {
     }
   }
 
-  async function startSelectedOffload() {
-    if (!recommendationPlan || selectedCleanupIds.size === 0) {
-      return
-    }
-    try {
       const job = await invoke<OffloadJobStatus>("start_offload", {
         runId: recommendationPlan.scanRunId,
-        candidateIds: Array.from(selectedCleanupIds),
+        candidateIds: visibleRecommendations
+          .filter((c) => selectedCleanupIds.has(c.id))
+          .map((c) => c.id),
       })
       setActiveOffloadJob(job)
       setMessage(`Offload batch ${job.id} queued for Google Drive.`)
