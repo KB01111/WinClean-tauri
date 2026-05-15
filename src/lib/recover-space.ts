@@ -41,6 +41,27 @@ export function filterRecommendations<T extends RecoverCandidate>(
   return candidates.filter((candidate) => candidate.kind === mode)
 }
 
+export function getVisibleRecoverCandidates<T extends RecoverCandidate>(
+  candidates: readonly T[],
+  mode: RecoverMode,
+  executableCleanIds: ReadonlySet<string>
+): T[] {
+  const visible = filterRecommendations(candidates, mode)
+  if (mode !== "clean") {
+    return visible
+  }
+  return visible.filter((candidate) => executableCleanIds.has(candidate.id))
+}
+
+export function selectedVisibleCandidateIds<T extends RecoverCandidate>(
+  candidates: readonly T[],
+  selectedIds: ReadonlySet<string>
+): string[] {
+  return candidates
+    .filter((candidate) => selectedIds.has(candidate.id))
+    .map((candidate) => candidate.id)
+}
+
 export function getOffloadActionState({
   selectedCount,
   driveStatus,
@@ -87,7 +108,10 @@ export function getOffloadProgress(input: OffloadProgressInput): {
 } {
   const percent =
     input.totalBytes > 0
-      ? Math.min(100, Math.round((input.uploadedBytes / input.totalBytes) * 100))
+      ? Math.min(
+          100,
+          Math.round((input.uploadedBytes / input.totalBytes) * 100)
+        )
       : input.totalItems > 0
         ? Math.min(
             100,

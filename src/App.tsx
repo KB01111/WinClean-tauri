@@ -38,9 +38,10 @@ import {
   shouldRefreshRunDataForProgress,
 } from "@/lib/scan-refresh"
 import {
-  filterRecommendations,
+  getVisibleRecoverCandidates,
   getOffloadActionState,
   getOffloadProgress,
+  selectedVisibleCandidateIds,
   type RecoverMode,
 } from "@/lib/recover-space"
 import { selectDefaultScanRoot } from "@/lib/volume-selection"
@@ -330,12 +331,21 @@ function App() {
     [scanRuns, selectedRunId]
   )
   const isScanning = progress.state === "running"
+  const executableCleanIds = useMemo(
+    () =>
+      new Set(cleanupPlan?.candidates.map((candidate) => candidate.id) ?? []),
+    [cleanupPlan]
+  )
   const visibleRecommendations = useMemo(() => {
     if (!recommendationPlan) {
       return []
     }
-    return filterRecommendations(recommendationPlan.candidates, recoverMode)
-  }, [recommendationPlan, recoverMode])
+    return getVisibleRecoverCandidates(
+      recommendationPlan.candidates,
+      recoverMode,
+      executableCleanIds
+    )
+  }, [executableCleanIds, recommendationPlan, recoverMode])
   const selectedRecommendationBytes = useMemo(() => {
     if (!recommendationPlan) {
       return 0
@@ -352,7 +362,8 @@ function App() {
     [selectedCleanupIds, visibleRecommendations]
   )
   const offloadRunning =
-    activeOffloadJob?.status === "queued" || activeOffloadJob?.status === "running"
+    activeOffloadJob?.status === "queued" ||
+    activeOffloadJob?.status === "running"
   const offloadActionState = getOffloadActionState({
     selectedCount: selectedVisibleCount,
     driveStatus,
@@ -387,38 +398,38 @@ function App() {
         plan,
         recommendations,
       ] = await Promise.all([
-          invoke<TopDirectory[]>("top_directories", {
-            runId: resolvedRunId,
-            limit: 25,
-          }),
-          invoke<DirectoryChild[]>("directory_children", {
-            runId: resolvedRunId,
-            parentPath: parentPath ?? null,
-            limit: 250,
-          }),
-          invoke<FileSearchResult[]>("file_search", {
-            runId: resolvedRunId,
-            query: fileQuery || null,
-            extension: extensionFilter || null,
-            minSize,
-            limit: 100,
-          }),
-          invoke<ExtensionSummary[]>("extension_summary", {
-            runId: resolvedRunId,
-            limit: 20,
-          }),
-          invoke<CategorySummary[]>("category_summary", {
-            runId: resolvedRunId,
-          }),
-          invoke<CleanupPlan | null>("cleanup_plan", {
-            runId: resolvedRunId,
-            limit: 100,
-          }),
-          invoke<RecommendationPlan | null>("recommendations", {
-            runId: resolvedRunId,
-            filters: null,
-          }),
-        ])
+        invoke<TopDirectory[]>("top_directories", {
+          runId: resolvedRunId,
+          limit: 25,
+        }),
+        invoke<DirectoryChild[]>("directory_children", {
+          runId: resolvedRunId,
+          parentPath: parentPath ?? null,
+          limit: 250,
+        }),
+        invoke<FileSearchResult[]>("file_search", {
+          runId: resolvedRunId,
+          query: fileQuery || null,
+          extension: extensionFilter || null,
+          minSize,
+          limit: 100,
+        }),
+        invoke<ExtensionSummary[]>("extension_summary", {
+          runId: resolvedRunId,
+          limit: 20,
+        }),
+        invoke<CategorySummary[]>("category_summary", {
+          runId: resolvedRunId,
+        }),
+        invoke<CleanupPlan | null>("cleanup_plan", {
+          runId: resolvedRunId,
+          limit: 100,
+        }),
+        invoke<RecommendationPlan | null>("recommendations", {
+          runId: resolvedRunId,
+          filters: null,
+        }),
+      ])
       setTopDirectories(top)
       setDirectoryChildren(children)
       setFiles(foundFiles)
@@ -634,7 +645,11 @@ function App() {
 
   async function executeSelectedCleanup() {
     const runId = recommendationPlan?.scanRunId ?? cleanupPlan?.scanRunId
-    if (!runId || selectedCleanupIds.size === 0) {
+    const candidateIds = selectedVisibleCandidateIds(
+      visibleRecommendations,
+      selectedCleanupIds
+    )
+    if (!runId || candidateIds.length === 0) {
       return
     }
     try {
@@ -645,7 +660,7 @@ function App() {
         bytesRequested: number
       }>("execute_cleanup", {
         runId,
-        candidateIds: Array.from(selectedCleanupIds),
+        candidateIds,
       })
       setMessage(
         `Cleanup sent ${result.recycledCount} item(s) to Recycle Bin; ${result.skippedCount} skipped; ${result.failedCount} failed.`
@@ -664,7 +679,7 @@ function App() {
       setMessage(
         status.connected
           ? "Google Drive connected."
-          : status.error ?? "Google Drive is not connected."
+          : (status.error ?? "Google Drive is not connected.")
       )
       await refreshDashboard()
     } catch (error) {
@@ -683,11 +698,21 @@ function App() {
     }
   }
 
+  async function startSelectedOffload() {
+    if (!recommendationPlan) {
+      return
+    }
+    const candidateIds = selectedVisibleCandidateIds(
+      visibleRecommendations,
+      selectedCleanupIds
+    )
+    if (candidateIds.length === 0) {
+      return
+    }
+    try {
       const job = await invoke<OffloadJobStatus>("start_offload", {
         runId: recommendationPlan.scanRunId,
-        candidateIds: visibleRecommendations
-          .filter((c) => selectedCleanupIds.has(c.id))
-          .map((c) => c.id),
+        candidateIds,
       })
       setActiveOffloadJob(job)
       setMessage(`Offload batch ${job.id} queued for Google Drive.`)
@@ -1043,11 +1068,13 @@ function OverviewView({
           <DataTable
             headers={["File", "Size", "Modified"]}
             empty="No file data yet"
-            rows={topFiles.slice(0, 10).map((file) => [
-              file.path,
-              formatBytes(file.size),
-              formatDateTime(file.modifiedAtMs),
-            ])}
+            rows={topFiles
+              .slice(0, 10)
+              .map((file) => [
+                file.path,
+                formatBytes(file.size),
+                formatDateTime(file.modifiedAtMs),
+              ])}
           />
         </Panel>
       </div>
@@ -1546,7 +1573,10 @@ function SettingsView({
                 : "none",
             ],
             ["Pending actions", formatNumber(health?.pendingActionCount ?? 0)],
-            ["Pending offloads", formatNumber(health?.pendingOffloadCount ?? 0)],
+            [
+              "Pending offloads",
+              formatNumber(health?.pendingOffloadCount ?? 0),
+            ],
             ["Database", health?.databasePath ?? "unknown"],
           ]}
         />
@@ -1577,7 +1607,7 @@ function NavButton({
           : "text-[#4d574e] hover:bg-[#eef2eb]",
       ].join(" ")}
     >
-      <Icon className="size-4" aria-hidden="true" />
+      <Icon className="size-4" aria-hidden={true} />
       {label}
     </button>
   )
@@ -1721,7 +1751,7 @@ function Posture({
   return (
     <div className="rounded-md border border-[#e3e7df] bg-[#fbfcf8] p-3">
       <div className="mb-2 flex items-center gap-2 font-medium">
-        <Icon className="size-4 text-[#2d6654]" aria-hidden="true" />
+        <Icon className="size-4 text-[#2d6654]" aria-hidden={true} />
         {title}
       </div>
       <p className="text-sm text-[#667066]">{text}</p>

@@ -1,10 +1,14 @@
 use std::{
     fs::File,
-    io::{Read, Write},
-    net::TcpListener,
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    net::{TcpListener, TcpStream},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -30,6 +34,9 @@ const DRIVE_UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
 const ROOT_FOLDER_NAME: &str = "WinClean Offloads";
 const CREDENTIAL_SERVICE: &str = "WinClean Google Drive";
 const REFRESH_TOKEN_USER: &str = "refresh_token";
+const DRIVE_UPLOAD_TIMEOUT_SECS: u64 = 30 * 60;
+const AUTH_CALLBACK_TIMEOUT_SECS: u64 = 120;
+const AUTH_REQUEST_LINE_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +220,22 @@ pub fn process_offload_job_with_client(
     db.update_offload_job(job_id, "running", Some(&folder.id), None, None, None)?;
 
     let items = db.offload_items(job_id)?;
+    if items.len() != candidates.len() {
+        let message = format!(
+            "offload job items mismatch: expected {}, found {}",
+            candidates.len(),
+            items.len()
+        );
+        db.update_offload_job(
+            job_id,
+            "failed",
+            None,
+            None,
+            Some(unix_millis()),
+            Some(&message),
+        )?;
+        anyhow::bail!(message);
+    }
     for (item, candidate) in items.into_iter().zip(candidates.into_iter()) {
         if cancel.load(Ordering::Relaxed) {
             db.update_offload_job(job_id, "canceled", None, None, Some(unix_millis()), None)?;
@@ -241,6 +264,7 @@ pub fn offload_status(db: &Database, job_id: i64) -> anyhow::Result<OffloadJobSt
 pub struct GoogleDriveClient {
     client: Client,
     client_id: String,
+    cached_token: Mutex<Option<String>>,
 }
 
 impl GoogleDriveClient {
@@ -249,16 +273,26 @@ impl GoogleDriveClient {
             .ok_or_else(|| anyhow::anyhow!("Set WINCLEAN_GOOGLE_CLIENT_ID before uploading"))?;
         Ok(Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(120))
+                .timeout(Duration::from_secs(DRIVE_UPLOAD_TIMEOUT_SECS))
                 .build()?,
             client_id,
+            cached_token: Mutex::new(None),
         })
     }
 
     fn access_token(&self) -> anyhow::Result<String> {
+        let mut cached_token = self
+            .cached_token
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Google Drive token cache lock is poisoned"))?;
+        if let Some(token) = cached_token.as_ref() {
+            return Ok(token.clone());
+        }
         let refresh_token =
             refresh_token().ok_or_else(|| anyhow::anyhow!("Connect Google Drive first"))?;
-        refresh_access_token(&self.client, &self.client_id, &refresh_token)
+        let token = refresh_access_token(&self.client, &self.client_id, &refresh_token)?;
+        *cached_token = Some(token.clone());
+        Ok(token)
     }
 
     fn find_folder(
@@ -391,7 +425,10 @@ impl DriveUploader for GoogleDriveClient {
             .size
             .as_deref()
             .and_then(|value| value.parse::<u64>().ok())
-            .ok_or_else(|| anyhow::anyhow!("Google Drive did not return file size for verification"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Google Drive did not return file size for verification")
+            })?;
+        if uploaded_size != candidate.size {
             anyhow::bail!(
                 "Google Drive upload size mismatch: expected {} bytes, got {} bytes",
                 candidate.size,
@@ -425,7 +462,7 @@ fn process_item(
     if let Err(error) =
         validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms)
     {
-        return mark_item_failed(db, item.id, "skipped", candidate.size, &error.to_string());
+        return mark_item_failed(db, item.id, "skipped", 0, &error.to_string());
     }
 
     db.update_offload_item(item.id, "uploading", None, None, 0, None, None, None, None)?;
@@ -556,15 +593,10 @@ fn auth_url(client_id: &str, redirect_uri: &str, challenge: &str, state: &str) -
 }
 
 fn wait_for_auth_code(listener: TcpListener, expected_state: &str) -> anyhow::Result<String> {
-    listener.set_nonblocking(false)?;
-    let (mut stream, _) = listener.accept()?;
-    let mut buffer = [0_u8; 8192];
-    let read = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    let first_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("OAuth callback request was empty"))?;
+    listener.set_nonblocking(true)?;
+    let (mut stream, _) = accept_auth_callback(&listener)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let first_line = read_http_request_line(&mut stream)?;
     let path = first_line
         .split_whitespace()
         .nth(1)
@@ -596,6 +628,54 @@ fn wait_for_auth_code(listener: TcpListener, expected_state: &str) -> anyhow::Re
         "Google Drive is connected. You can return to WinClean.",
     )?;
     Ok(code)
+}
+
+fn accept_auth_callback(
+    listener: &TcpListener,
+) -> anyhow::Result<(TcpStream, std::net::SocketAddr)> {
+    let deadline = Instant::now() + Duration::from_secs(AUTH_CALLBACK_TIMEOUT_SECS);
+    loop {
+        match listener.accept() {
+            Ok(connection) => return Ok(connection),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("Timed out waiting for Google Drive sign-in callback");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn read_http_request_line(stream: &mut TcpStream) -> anyhow::Result<String> {
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            anyhow::bail!("OAuth callback request was empty");
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline
+            .map(|position| position + 1)
+            .unwrap_or(available.len());
+        if line.len() + take > AUTH_REQUEST_LINE_LIMIT {
+            anyhow::bail!("OAuth callback request line was too large");
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            break;
+        }
+    }
+    let first_line = String::from_utf8(line)
+        .map_err(|_| anyhow::anyhow!("OAuth callback request line was not valid UTF-8"))?;
+    let first_line = first_line.trim_end_matches(['\r', '\n']).to_string();
+    if first_line.is_empty() {
+        anyhow::bail!("OAuth callback request was empty");
+    }
+    Ok(first_line)
 }
 
 fn respond_to_browser(stream: &mut std::net::TcpStream, message: &str) -> anyhow::Result<()> {

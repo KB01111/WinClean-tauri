@@ -10,7 +10,8 @@ use std::collections::HashMap;
 
 use winclean_lib::db::Database;
 use winclean_lib::offload::{
-    run_offload_job_with_client, DriveFolder, DriveUploadResult, DriveUploader, FileRecycler,
+    create_offload_job, process_offload_job_with_client, run_offload_job_with_client, DriveFolder,
+    DriveUploadResult, DriveUploader, FileRecycler,
 };
 use winclean_lib::recommendations::{
     build_recommendations, RecommendationFilters, RecommendationKind, RecommendedAction,
@@ -569,6 +570,89 @@ fn offload_job_uploads_verifies_then_recycles_with_fake_drive_client() {
         recycler.recycled.lock().expect("recycler lock").as_slice(),
         &[file_path.to_string_lossy().to_string()]
     );
+}
+
+#[test]
+fn offload_job_rejects_item_count_mismatches_before_uploading() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let file_path = root.join("movie.mp4");
+    write_sparse_file(&file_path, 120 * 1024 * 1024);
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let candidate = recommendations
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.path.ends_with("movie.mp4"))
+        .expect("movie offload candidate");
+    let status = create_offload_job(&db, summary.run_id, std::slice::from_ref(&candidate))
+        .expect("offload job");
+    let drive = FakeDrive::default();
+    let recycler = FakeRecycler::default();
+    let cancel = AtomicBool::new(false);
+
+    let error =
+        process_offload_job_with_client(&db, status.id, Vec::new(), &drive, &recycler, &cancel)
+            .expect_err("item mismatch should fail");
+
+    assert!(error.to_string().contains("offload job items mismatch"));
+    assert_eq!(drive.upload_count.load(Ordering::Relaxed), 0);
+    assert!(recycler.recycled.lock().expect("recycler lock").is_empty());
+}
+
+#[test]
+fn offload_job_skips_changed_files_without_counting_uploaded_bytes() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let file_path = root.join("movie.mp4");
+    write_sparse_file(&file_path, 120 * 1024 * 1024);
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let candidate = recommendations
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.path.ends_with("movie.mp4"))
+        .expect("movie offload candidate");
+    fs::write(&file_path, b"changed after scan").expect("change offload candidate");
+
+    let drive = FakeDrive::default();
+    let recycler = FakeRecycler::default();
+    let cancel = AtomicBool::new(false);
+
+    let status = run_offload_job_with_client(
+        &db,
+        summary.run_id,
+        vec![candidate],
+        &drive,
+        &recycler,
+        &cancel,
+    )
+    .expect("offload job");
+
+    assert_eq!(status.status, "completed_with_errors");
+    assert_eq!(status.completed_items, 0);
+    assert_eq!(status.failed_items, 1);
+    assert_eq!(status.uploaded_bytes, 0);
+    assert_eq!(status.items[0].status, "skipped");
+    assert_eq!(status.items[0].uploaded_bytes, 0);
+    assert_eq!(drive.upload_count.load(Ordering::Relaxed), 0);
+    assert!(recycler.recycled.lock().expect("recycler lock").is_empty());
 }
 
 #[test]
