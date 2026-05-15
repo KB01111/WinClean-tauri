@@ -280,6 +280,12 @@ fn duplicate_keys(records: &[CleanupFileRecord]) -> HashSet<(String, u64)> {
         if record.size < DUPLICATE_REVIEW_BYTES {
             continue;
         }
+        if record.is_reparse_point || record.is_placeholder || record.is_system {
+            continue;
+        }
+        if is_protected_path(&record.path) {
+            continue;
+        }
         *counts
             .entry((record.name.to_ascii_lowercase(), record.size))
             .or_default() += 1;
