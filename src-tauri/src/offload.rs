@@ -269,7 +269,7 @@ impl GoogleDriveClient {
     ) -> anyhow::Result<Option<DriveFolder>> {
         let mut q = format!(
             "name = '{}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-            name.replace('\'', "\\'")
+            name.replace('\\', "\\\\").replace('\'', "\\'")
         );
         if let Some(parent_id) = parent_id {
             q.push_str(&format!(
