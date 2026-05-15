@@ -656,23 +656,6 @@ fn scan_directory(dir: &Path, cancel: &AtomicBool, event_sender: &Sender<ScanEve
             .is_ok();
     }
 
-    if should_skip_live_directory(dir) {
-        return event_sender
-            .send(ScanEvent::DirectoryEntries {
-                entries: Vec::new(),
-                child_dirs: Vec::new(),
-                access_denied_count: 0,
-                error_count: 0,
-                skipped_reparse_count: 1,
-            })
-            .and_then(|_| {
-                event_sender.send(ScanEvent::DirectoryFinished {
-                    dir: dir.to_path_buf(),
-                })
-            })
-            .is_ok();
-    }
-
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
@@ -789,17 +772,6 @@ fn reject_reparse_scan_root(root: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-fn should_skip_live_directory(dir: &Path) -> bool {
-    fs::symlink_metadata(dir)
-        .map(|metadata| {
-            should_skip_directory_for_scan(
-                file_attributes(&metadata),
-                metadata.file_type().is_symlink(),
-            )
-        })
-        .unwrap_or(false)
 }
 
 fn flush_scan_batch(

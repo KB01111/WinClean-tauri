@@ -27,4 +27,16 @@ describe("volume selection", () => {
       )
     ).toBe("E:\\")
   })
+
+  test("falls back when the current target is not supported", () => {
+    expect(
+      selectDefaultScanRoot(
+        [
+          { rootPath: "Z:\\", driveType: "remote", isReady: true },
+          { rootPath: "C:\\", driveType: "fixed", isReady: true },
+        ],
+        "Z:\\"
+      )
+    ).toBe("C:\\")
+  })
 })

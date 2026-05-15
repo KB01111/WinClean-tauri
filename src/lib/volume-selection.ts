@@ -15,7 +15,13 @@ export function selectDefaultScanRoot(
   volumes: ScanVolumeLike[],
   currentRoot: string
 ) {
-  if (currentRoot && volumes.some((volume) => volume.rootPath === currentRoot && isSupportedScanVolume(volume))) {
+  if (
+    currentRoot &&
+    volumes.some(
+      (volume) =>
+        volume.rootPath === currentRoot && isSupportedScanVolume(volume)
+    )
+  ) {
     return currentRoot
   }
 
