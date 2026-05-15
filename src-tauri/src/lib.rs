@@ -10,12 +10,12 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
             let database = db::Database::open(app_data_dir.join("winclean.sqlite3"))?;
             database.migrate()?;
+            database.finalize_interrupted_scan_runs()?;
             app.manage(commands::AppState::new(database, app_data_dir));
             Ok(())
         })

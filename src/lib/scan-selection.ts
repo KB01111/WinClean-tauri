@@ -8,6 +8,7 @@ export type DashboardScanState =
 export type DashboardRunLike = {
   id: number
   rootPath: string
+  status?: string
 }
 
 export type DashboardRunSelectionInput<Run extends DashboardRunLike> = {
@@ -51,7 +52,8 @@ export function selectDashboardRun<Run extends DashboardRunLike>({
     }
   }
 
-  const latestRun = runs[0] ?? null
+  const latestRun =
+    runs.find((run) => run.status == null || run.status === "completed") ?? null
   return {
     runId: latestRun?.id ?? null,
     directory: latestRun?.rootPath ?? null,

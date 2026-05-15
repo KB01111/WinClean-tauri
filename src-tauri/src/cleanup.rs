@@ -5,7 +5,10 @@ use std::{
 
 use serde::Serialize;
 
-use crate::db::{CleanupActionInsert, CleanupActionRecord, CleanupFileRecord, Database};
+use crate::{
+    db::{CleanupActionInsert, CleanupActionRecord, CleanupFileRecord, Database},
+    scan::classify_file_attributes,
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,7 +112,7 @@ pub fn execute_cleanup_plan(
             undo_token: None,
         })?;
 
-        match move_to_recycle_bin(Path::new(&candidate.path)) {
+        match validate_cleanup_target(&candidate).and_then(|path| move_to_recycle_bin(&path)) {
             Ok(()) => {
                 recycled_count += 1;
                 db.update_cleanup_action(
@@ -192,6 +195,57 @@ pub fn restore_cleanup_action(
 
     db.cleanup_action(action_id)?
         .ok_or_else(|| anyhow::anyhow!("cleanup action {action_id} was not found after update"))
+}
+
+pub fn validate_cleanup_target(candidate: &CleanupCandidate) -> anyhow::Result<PathBuf> {
+    if is_protected_path(&candidate.path) {
+        anyhow::bail!("cleanup target is protected: {}", candidate.path);
+    }
+
+    let original = Path::new(&candidate.path);
+    let metadata = std::fs::symlink_metadata(original)
+        .map_err(|error| anyhow::anyhow!("cannot inspect {}: {error}", original.display()))?;
+    reject_live_cleanup_metadata(original, &metadata)?;
+
+    let canonical = std::fs::canonicalize(original)
+        .map_err(|error| anyhow::anyhow!("cannot recycle {}: {error}", original.display()))?;
+    let canonical_display = canonical.to_string_lossy();
+    if is_protected_path(&canonical_display) {
+        anyhow::bail!("cleanup target resolves to a protected path: {canonical_display}");
+    }
+
+    let canonical_metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot inspect resolved target {}: {error}",
+            canonical.display()
+        )
+    })?;
+    reject_live_cleanup_metadata(&canonical, &canonical_metadata)?;
+
+    Ok(canonical)
+}
+
+fn reject_live_cleanup_metadata(path: &Path, metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "cleanup only recycles files in this version: {}",
+            path.display()
+        );
+    }
+
+    let classification = classify_file_attributes(file_attributes(metadata));
+    if classification.is_reparse_point
+        || classification.is_placeholder
+        || classification.is_system
+        || metadata.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "cleanup target is not eligible because it is protected, system, or reparse-backed: {}",
+            path.display()
+        );
+    }
+
+    Ok(())
 }
 
 fn cleanup_candidate(scan_run_id: i64, record: CleanupFileRecord) -> Option<CleanupCandidate> {
@@ -310,4 +364,16 @@ fn unix_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn file_attributes(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes()
+}
+
+#[cfg(not(windows))]
+fn file_attributes(_metadata: &std::fs::Metadata) -> u32 {
+    0
 }
