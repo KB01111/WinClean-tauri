@@ -24,6 +24,12 @@ describe("scan refresh policy", () => {
     expect(
       shouldRefreshDashboardCollectionsForProgress({ state: "completed" })
     ).toBe(true)
+    expect(
+      shouldRefreshDashboardCollectionsForProgress({ state: "failed" })
+    ).toBe(true)
+    expect(
+      shouldRefreshDashboardCollectionsForProgress({ state: "canceled" })
+    ).toBe(true)
   })
 
   test("uses stable run-data keys to suppress duplicate completion refreshes", () => {
