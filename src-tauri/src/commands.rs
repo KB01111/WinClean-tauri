@@ -27,7 +27,7 @@ use crate::{
         GoogleDriveStatus, OffloadJobStatus, WindowsRecycleBin,
     },
     recommendations::{
-        build_recommendations, resolve_recommendation_candidates, RecommendationFilters,
+        build_recommendations, resolve_offload_recommendation_candidates, RecommendationFilters,
         RecommendationPlan,
     },
     reports::{write_diagnostics_report, write_scan_report, ExportArtifact},
@@ -330,14 +330,8 @@ pub fn start_offload(
     }
     let plan = build_recommendations(&state.db, run_id, RecommendationFilters::default())
         .map_err(to_command_error)?;
-    let candidates = resolve_recommendation_candidates(&plan.candidates, &candidate_ids)
+    let candidates = resolve_offload_recommendation_candidates(&plan.candidates, &candidate_ids)
         .map_err(to_command_error)?;
-    if candidates
-        .iter()
-        .any(|candidate| !candidate.eligible_for_offload)
-    {
-        return Err("Only offload-eligible candidates can be sent to Google Drive.".to_string());
-    }
 
     let drive = GoogleDriveClient::configured().map_err(to_command_error)?;
     if !drive_status().connected {

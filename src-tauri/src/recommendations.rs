@@ -154,6 +154,21 @@ pub fn resolve_recommendation_candidates(
     Ok(resolved)
 }
 
+pub fn resolve_offload_recommendation_candidates(
+    candidates: &[RecommendationCandidate],
+    candidate_ids: &[String],
+) -> anyhow::Result<Vec<RecommendationCandidate>> {
+    let resolved = resolve_recommendation_candidates(candidates, candidate_ids)?;
+    if resolved.iter().any(|candidate| {
+        candidate.kind != RecommendationKind::Offload
+            || candidate.recommended_action != RecommendedAction::GoogleDriveOffload
+            || !candidate.eligible_for_offload
+    }) {
+        anyhow::bail!("Only Google Drive offload candidates can be sent to Google Drive");
+    }
+    Ok(resolved)
+}
+
 fn recommendation_candidate(
     scan_run_id: i64,
     record: CleanupFileRecord,

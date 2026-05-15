@@ -37,6 +37,7 @@ const REFRESH_TOKEN_USER: &str = "refresh_token";
 const DRIVE_UPLOAD_TIMEOUT_SECS: u64 = 30 * 60;
 const AUTH_CALLBACK_TIMEOUT_SECS: u64 = 120;
 const AUTH_REQUEST_LINE_LIMIT: usize = 8 * 1024;
+const TOKEN_EXPIRY_SKEW_SECS: u64 = 60;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -264,7 +265,36 @@ pub fn offload_status(db: &Database, job_id: i64) -> anyhow::Result<OffloadJobSt
 pub struct GoogleDriveClient {
     client: Client,
     client_id: String,
-    cached_token: Mutex<Option<String>>,
+    cached_token: Mutex<Option<CachedAccessToken>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedAccessToken {
+    value: String,
+    expires_at: Instant,
+}
+
+impl CachedAccessToken {
+    fn new(value: String, expires_in: Option<u64>, now: Instant) -> Self {
+        let usable_seconds = expires_in
+            .unwrap_or(0)
+            .saturating_sub(TOKEN_EXPIRY_SKEW_SECS);
+        Self {
+            value,
+            expires_at: now + Duration::from_secs(usable_seconds),
+        }
+    }
+
+    fn is_usable_at(&self, now: Instant) -> bool {
+        now < self.expires_at
+    }
+}
+
+fn usable_cached_token(cache: &Option<CachedAccessToken>, now: Instant) -> Option<String> {
+    cache
+        .as_ref()
+        .filter(|token| token.is_usable_at(now))
+        .map(|token| token.value.clone())
 }
 
 impl GoogleDriveClient {
@@ -281,18 +311,25 @@ impl GoogleDriveClient {
     }
 
     fn access_token(&self) -> anyhow::Result<String> {
-        let mut cached_token = self
-            .cached_token
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Google Drive token cache lock is poisoned"))?;
-        if let Some(token) = cached_token.as_ref() {
-            return Ok(token.clone());
+        {
+            let cached_token = self
+                .cached_token
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Google Drive token cache lock is poisoned"))?;
+            if let Some(token) = usable_cached_token(&cached_token, Instant::now()) {
+                return Ok(token);
+            }
         }
         let refresh_token =
             refresh_token().ok_or_else(|| anyhow::anyhow!("Connect Google Drive first"))?;
         let token = refresh_access_token(&self.client, &self.client_id, &refresh_token)?;
-        *cached_token = Some(token.clone());
-        Ok(token)
+        let token_value = token.value.clone();
+        let mut cached_token = self
+            .cached_token
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Google Drive token cache lock is poisoned"))?;
+        *cached_token = Some(token);
+        Ok(token_value)
     }
 
     fn find_folder(
@@ -714,7 +751,7 @@ fn refresh_access_token(
     client: &Client,
     client_id: &str,
     refresh_token: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<CachedAccessToken> {
     let token = client
         .post(TOKEN_URL)
         .form(&[
@@ -725,7 +762,11 @@ fn refresh_access_token(
         .send()?
         .error_for_status()?
         .json::<TokenResponse>()?;
-    Ok(token.access_token)
+    Ok(CachedAccessToken::new(
+        token.access_token,
+        token.expires_in,
+        Instant::now(),
+    ))
 }
 
 fn random_url_token(byte_count: usize) -> anyhow::Result<String> {
@@ -798,6 +839,7 @@ fn unix_millis() -> i64 {
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
+    expires_in: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -813,4 +855,25 @@ struct DriveFile {
     size: Option<String>,
     md5_checksum: Option<String>,
     web_view_link: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_access_token_is_reused_only_before_expiry_window() {
+        let now = Instant::now();
+        let fresh = CachedAccessToken::new("fresh-token".to_string(), Some(3600), now);
+        assert_eq!(
+            usable_cached_token(&Some(fresh), now + Duration::from_secs(60)).as_deref(),
+            Some("fresh-token")
+        );
+
+        let near_expiry = CachedAccessToken::new("near-expiry-token".to_string(), Some(30), now);
+        assert!(usable_cached_token(&Some(near_expiry), now).is_none());
+
+        let unknown_expiry = CachedAccessToken::new("unknown-expiry-token".to_string(), None, now);
+        assert!(usable_cached_token(&Some(unknown_expiry), now).is_none());
+    }
 }

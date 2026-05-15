@@ -14,7 +14,8 @@ use winclean_lib::offload::{
     DriveUploadResult, DriveUploader, FileRecycler,
 };
 use winclean_lib::recommendations::{
-    build_recommendations, RecommendationFilters, RecommendationKind, RecommendedAction,
+    build_recommendations, resolve_offload_recommendation_candidates, RecommendationFilters,
+    RecommendationKind, RecommendedAction,
 };
 use winclean_lib::reports::write_scan_report;
 use winclean_lib::scan::{
@@ -570,6 +571,43 @@ fn offload_job_uploads_verifies_then_recycles_with_fake_drive_client() {
         recycler.recycled.lock().expect("recycler lock").as_slice(),
         &[file_path.to_string_lossy().to_string()]
     );
+}
+
+#[test]
+fn offload_candidate_resolution_rejects_review_candidates_even_when_eligible() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    let duplicates_a = root.join("A");
+    let duplicates_b = root.join("B");
+    fs::create_dir_all(&duplicates_a).expect("duplicates a");
+    fs::create_dir_all(&duplicates_b).expect("duplicates b");
+    write_sparse_file(&duplicates_a.join("same.bin"), 15 * 1024 * 1024);
+    write_sparse_file(&duplicates_b.join("same.bin"), 15 * 1024 * 1024);
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let review_candidate = recommendations
+        .candidates
+        .iter()
+        .find(|candidate| candidate.kind == RecommendationKind::Review)
+        .expect("review candidate");
+    assert!(review_candidate.eligible_for_offload);
+
+    let error = resolve_offload_recommendation_candidates(
+        &recommendations.candidates,
+        std::slice::from_ref(&review_candidate.id),
+    )
+    .expect_err("review candidates must not be executable offload candidates");
+
+    assert!(error
+        .to_string()
+        .contains("Only Google Drive offload candidates"));
 }
 
 #[test]
