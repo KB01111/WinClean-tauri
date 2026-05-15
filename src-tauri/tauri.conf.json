@@ -30,7 +30,7 @@
     "targets": ["nsis", "msi"],
     "publisher": "WinClean",
     "shortDescription": "Windows-first disk analyzer and safe cleanup tool",
-    "longDescription": "WinClean scans local Windows disks, indexes directory sizes locally, and moves selected cleanup candidates to the Windows Recycle Bin.",
+    "longDescription": "WinClean scans local Windows disks, indexes directory sizes locally, moves selected cleanup candidates to the Windows Recycle Bin, and can offload selected large files to Google Drive before recycling local originals.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

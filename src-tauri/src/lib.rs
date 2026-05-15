@@ -1,6 +1,8 @@
 pub mod cleanup;
 pub mod commands;
 pub mod db;
+pub mod offload;
+pub mod recommendations;
 pub mod reports;
 pub mod scan;
 pub mod volume;
@@ -33,6 +35,13 @@ pub fn run() {
             commands::execute_cleanup,
             commands::cleanup_history,
             commands::restore_cleanup_action,
+            commands::recommendations,
+            commands::google_drive_status,
+            commands::begin_google_drive_auth,
+            commands::disconnect_google_drive,
+            commands::start_offload,
+            commands::offload_status,
+            commands::cancel_offload,
             commands::export_report,
             commands::export_diagnostics,
             commands::app_health,

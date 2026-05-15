@@ -1,8 +1,22 @@
-use std::fs;
+use std::{
+    fs::{self, File},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+};
 
 use std::collections::HashMap;
 
 use winclean_lib::db::Database;
+use winclean_lib::offload::{
+    create_offload_job, process_offload_job_with_client, run_offload_job_with_client, DriveFolder,
+    DriveUploadResult, DriveUploader, FileRecycler,
+};
+use winclean_lib::recommendations::{
+    build_recommendations, resolve_offload_recommendation_candidates, RecommendationFilters,
+    RecommendationKind, RecommendedAction,
+};
 use winclean_lib::reports::write_scan_report;
 use winclean_lib::scan::{
     balanced_worker_count, choose_scan_plan, classify_file_attributes, finalize_failed_scan_run,
@@ -32,6 +46,8 @@ fn migration_creates_expected_tables() {
     assert!(tables.contains(&"file_entries".to_string()));
     assert!(tables.contains(&"directory_rollups".to_string()));
     assert!(tables.contains(&"action_history".to_string()));
+    assert!(tables.contains(&"offload_jobs".to_string()));
+    assert!(tables.contains(&"offload_items".to_string()));
     assert!(tables.contains(&"schema_migrations".to_string()));
     assert_eq!(
         db.schema_version().expect("schema version").as_deref(),
@@ -417,6 +433,309 @@ fn cleanup_plan_only_includes_conservative_file_candidates() {
 }
 
 #[test]
+fn recommendations_split_safe_cleanup_from_review_and_offload_candidates() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    let downloads = root.join("Users").join("kevin").join("Downloads");
+    let duplicates_a = root.join("A");
+    let duplicates_b = root.join("B");
+    fs::create_dir_all(&downloads).expect("downloads dir");
+    fs::create_dir_all(&duplicates_a).expect("duplicates a");
+    fs::create_dir_all(&duplicates_b).expect("duplicates b");
+    fs::write(root.join("cache.tmp"), vec![1_u8; 20]).expect("tmp file");
+    write_sparse_file(&downloads.join("setup.msi"), 75 * 1024 * 1024);
+    write_sparse_file(&root.join("movie.mp4"), 120 * 1024 * 1024);
+    write_sparse_file(&duplicates_a.join("same.bin"), 15 * 1024 * 1024);
+    write_sparse_file(&duplicates_b.join("same.bin"), 15 * 1024 * 1024);
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+
+    let tmp = recommendations
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path.ends_with("cache.tmp"))
+        .expect("tmp candidate");
+    assert_eq!(tmp.kind, RecommendationKind::Clean);
+    assert_eq!(tmp.recommended_action, RecommendedAction::RecycleBin);
+    assert!(!tmp.eligible_for_offload);
+
+    let installer = recommendations
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path.ends_with("setup.msi"))
+        .expect("installer candidate");
+    assert_eq!(installer.kind, RecommendationKind::Offload);
+    assert_eq!(
+        installer.recommended_action,
+        RecommendedAction::GoogleDriveOffload
+    );
+    assert!(installer.eligible_for_offload);
+
+    let possible_duplicates = recommendations
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.reason.contains("Possible duplicate"))
+        .collect::<Vec<_>>();
+    assert_eq!(possible_duplicates.len(), 2);
+    assert!(possible_duplicates
+        .iter()
+        .all(|candidate| candidate.kind == RecommendationKind::Review));
+}
+
+#[test]
+fn cleanup_revalidates_changed_files_before_recycling() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let candidate_path = root.join("cache.tmp");
+    fs::write(&candidate_path, vec![1_u8; 20]).expect("tmp file");
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let plan = build_cleanup_plan(&db, summary.run_id, 50).expect("cleanup plan");
+    let candidate = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path.ends_with("cache.tmp"))
+        .expect("tmp candidate");
+
+    fs::write(&candidate_path, vec![2_u8; 40]).expect("change tmp file");
+    let result = winclean_lib::cleanup::execute_cleanup_plan(
+        &db,
+        summary.run_id,
+        std::slice::from_ref(&candidate.id),
+    )
+    .expect("cleanup execution");
+
+    assert_eq!(result.recycled_count, 0);
+    assert_eq!(result.skipped_count, 1);
+    assert!(candidate_path.exists());
+}
+
+#[test]
+fn offload_job_uploads_verifies_then_recycles_with_fake_drive_client() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let file_path = root.join("movie.mp4");
+    write_sparse_file(&file_path, 120 * 1024 * 1024);
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let candidate = recommendations
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.path.ends_with("movie.mp4"))
+        .expect("movie offload candidate");
+    let drive = FakeDrive::default();
+    let recycler = FakeRecycler::default();
+    let cancel = AtomicBool::new(false);
+
+    let status = run_offload_job_with_client(
+        &db,
+        summary.run_id,
+        vec![candidate],
+        &drive,
+        &recycler,
+        &cancel,
+    )
+    .expect("offload job");
+
+    assert_eq!(status.status, "completed");
+    assert_eq!(status.total_items, 1);
+    assert_eq!(status.completed_items, 1);
+    assert_eq!(status.failed_items, 0);
+    assert_eq!(status.items[0].status, "completed");
+    assert_eq!(
+        status.items[0].drive_file_id.as_deref(),
+        Some("drive-file-1")
+    );
+    assert_eq!(status.items[0].recycle_status.as_deref(), Some("recycled"));
+    assert_eq!(
+        recycler.recycled.lock().expect("recycler lock").as_slice(),
+        &[file_path.to_string_lossy().to_string()]
+    );
+}
+
+#[test]
+fn offload_candidate_resolution_rejects_review_candidates_even_when_eligible() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    let duplicates_a = root.join("A");
+    let duplicates_b = root.join("B");
+    fs::create_dir_all(&duplicates_a).expect("duplicates a");
+    fs::create_dir_all(&duplicates_b).expect("duplicates b");
+    write_sparse_file(&duplicates_a.join("same.bin"), 15 * 1024 * 1024);
+    write_sparse_file(&duplicates_b.join("same.bin"), 15 * 1024 * 1024);
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let review_candidate = recommendations
+        .candidates
+        .iter()
+        .find(|candidate| candidate.kind == RecommendationKind::Review)
+        .expect("review candidate");
+    assert!(review_candidate.eligible_for_offload);
+
+    let error = resolve_offload_recommendation_candidates(
+        &recommendations.candidates,
+        std::slice::from_ref(&review_candidate.id),
+    )
+    .expect_err("review candidates must not be executable offload candidates");
+
+    assert!(error
+        .to_string()
+        .contains("Only Google Drive offload candidates"));
+}
+
+#[test]
+fn offload_job_rejects_item_count_mismatches_before_uploading() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let file_path = root.join("movie.mp4");
+    write_sparse_file(&file_path, 120 * 1024 * 1024);
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let candidate = recommendations
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.path.ends_with("movie.mp4"))
+        .expect("movie offload candidate");
+    let status = create_offload_job(&db, summary.run_id, std::slice::from_ref(&candidate))
+        .expect("offload job");
+    let drive = FakeDrive::default();
+    let recycler = FakeRecycler::default();
+    let cancel = AtomicBool::new(false);
+
+    let error =
+        process_offload_job_with_client(&db, status.id, Vec::new(), &drive, &recycler, &cancel)
+            .expect_err("item mismatch should fail");
+
+    assert!(error.to_string().contains("offload job items mismatch"));
+    assert_eq!(drive.upload_count.load(Ordering::Relaxed), 0);
+    assert!(recycler.recycled.lock().expect("recycler lock").is_empty());
+}
+
+#[test]
+fn offload_job_skips_changed_files_without_counting_uploaded_bytes() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let file_path = root.join("movie.mp4");
+    write_sparse_file(&file_path, 120 * 1024 * 1024);
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let candidate = recommendations
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.path.ends_with("movie.mp4"))
+        .expect("movie offload candidate");
+    fs::write(&file_path, b"changed after scan").expect("change offload candidate");
+
+    let drive = FakeDrive::default();
+    let recycler = FakeRecycler::default();
+    let cancel = AtomicBool::new(false);
+
+    let status = run_offload_job_with_client(
+        &db,
+        summary.run_id,
+        vec![candidate],
+        &drive,
+        &recycler,
+        &cancel,
+    )
+    .expect("offload job");
+
+    assert_eq!(status.status, "completed_with_errors");
+    assert_eq!(status.completed_items, 0);
+    assert_eq!(status.failed_items, 1);
+    assert_eq!(status.uploaded_bytes, 0);
+    assert_eq!(status.items[0].status, "skipped");
+    assert_eq!(status.items[0].uploaded_bytes, 0);
+    assert_eq!(drive.upload_count.load(Ordering::Relaxed), 0);
+    assert!(recycler.recycled.lock().expect("recycler lock").is_empty());
+}
+
+#[test]
+fn offload_job_can_be_cancelled_before_side_effects() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let file_path = root.join("movie.mp4");
+    write_sparse_file(&file_path, 120 * 1024 * 1024);
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let candidate = recommendations
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.path.ends_with("movie.mp4"))
+        .expect("movie offload candidate");
+    let drive = FakeDrive::default();
+    let recycler = FakeRecycler::default();
+    let cancel = AtomicBool::new(true);
+
+    let status = run_offload_job_with_client(
+        &db,
+        summary.run_id,
+        vec![candidate],
+        &drive,
+        &recycler,
+        &cancel,
+    )
+    .expect("offload job");
+
+    assert_eq!(status.status, "canceled");
+    assert_eq!(status.completed_items, 0);
+    assert_eq!(status.failed_items, 0);
+    assert_eq!(drive.upload_count.load(Ordering::Relaxed), 0);
+    assert!(recycler.recycled.lock().expect("recycler lock").is_empty());
+}
+
+#[test]
 fn cleanup_candidate_resolution_dedupes_and_rejects_stale_ids_before_cleanup() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("fixture");
@@ -630,6 +949,54 @@ fn scan_report_export_writes_local_json_artifact() {
     assert!(body.contains("\"scanRun\""));
     assert!(body.contains("\"topDirectories\""));
     assert!(body.contains("\"cleanupPreview\""));
+}
+
+fn write_sparse_file(path: &std::path::Path, size: u64) {
+    let file = File::create(path).expect("create sparse file");
+    file.set_len(size).expect("set sparse file length");
+}
+
+#[derive(Default)]
+struct FakeDrive {
+    upload_count: std::sync::atomic::AtomicUsize,
+}
+
+impl DriveUploader for FakeDrive {
+    fn ensure_batch_folder(&self, _batch_name: &str) -> anyhow::Result<DriveFolder> {
+        Ok(DriveFolder {
+            id: "drive-folder-1".to_string(),
+            name: "WinClean Offloads/test".to_string(),
+        })
+    }
+
+    fn upload_file(
+        &self,
+        _folder_id: &str,
+        candidate: &winclean_lib::recommendations::RecommendationCandidate,
+    ) -> anyhow::Result<DriveUploadResult> {
+        self.upload_count.fetch_add(1, Ordering::Relaxed);
+        Ok(DriveUploadResult {
+            file_id: "drive-file-1".to_string(),
+            web_url: Some("https://drive.google.com/file/d/drive-file-1/view".to_string()),
+            size: candidate.size,
+            md5_checksum: None,
+        })
+    }
+}
+
+#[derive(Default)]
+struct FakeRecycler {
+    recycled: Mutex<Vec<String>>,
+}
+
+impl FileRecycler for FakeRecycler {
+    fn recycle_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.recycled
+            .lock()
+            .expect("recycler lock")
+            .push(path.to_string_lossy().to_string());
+        Ok(())
+    }
 }
 
 fn volume(

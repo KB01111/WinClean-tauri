@@ -9,8 +9,12 @@ Windows-first disk analyzer and safe cleanup desktop app built with Tauri v2, Re
 - Avoids following reparse points, symlinks, and junctions during recursive traversal.
 - Exposes scan history, directory browsing, file search, extension summaries, category summaries, and JSON report export.
 - Plans conservative cleanup candidates from scan data and moves selected files to the Windows Recycle Bin.
+- Separates Recover Space recommendations into Clean, Offload, and Review modes so large files can be uploaded to Google Drive only after explicit selection.
+- Supports direct Google Drive offload with verified upload before local originals are moved to the Windows Recycle Bin.
 - Keeps diagnostics local by default and exports a local support bundle only when the user chooses it.
 - Records NTFS USN intent as a post-V1 acceleration path; V1 correctness is based on recursive scanning.
+
+Google Drive offload requires a desktop OAuth client id supplied as `WINCLEAN_GOOGLE_CLIENT_ID`. No client secret is embedded in the app.
 
 ## Development
 
