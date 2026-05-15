@@ -31,7 +31,7 @@ pub struct CleanupCandidate {
     pub modified_at_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CleanupRisk {
     Low,
@@ -44,6 +44,7 @@ pub struct CleanupExecutionResult {
     pub actions: Vec<CleanupActionRecord>,
     pub recycled_count: u64,
     pub failed_count: u64,
+    pub skipped_count: u64,
     pub bytes_requested: u64,
 }
 
@@ -91,6 +92,7 @@ pub fn execute_cleanup_plan(
     let mut actions = Vec::new();
     let mut recycled_count = 0;
     let mut failed_count = 0;
+    let mut skipped_count = 0;
     let mut bytes_requested = 0;
 
     for candidate in candidates {
@@ -109,7 +111,25 @@ pub fn execute_cleanup_plan(
             undo_token: None,
         })?;
 
-        match move_to_recycle_bin(Path::new(&candidate.path)) {
+        match validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms) {
+            Ok(()) => {}
+            Err(error) => {
+                skipped_count += 1;
+                db.update_cleanup_action(
+                    action_id,
+                    "skipped",
+                    Some(unix_millis()),
+                    Some(&error.to_string()),
+                    None,
+                )?;
+                if let Some(action) = db.cleanup_action(action_id)? {
+                    actions.push(action);
+                }
+                continue;
+            }
+        }
+
+        match recycle_file(Path::new(&candidate.path)) {
             Ok(()) => {
                 recycled_count += 1;
                 db.update_cleanup_action(
@@ -141,6 +161,7 @@ pub fn execute_cleanup_plan(
         actions,
         recycled_count,
         failed_count,
+        skipped_count,
         bytes_requested,
     })
 }
@@ -218,7 +239,7 @@ fn cleanup_candidate(scan_run_id: i64, record: CleanupFileRecord) -> Option<Clea
     })
 }
 
-fn cleanup_reason(record: &CleanupFileRecord) -> Option<(String, CleanupRisk)> {
+pub fn cleanup_reason(record: &CleanupFileRecord) -> Option<(String, CleanupRisk)> {
     let extension = record
         .extension
         .as_deref()
@@ -236,7 +257,7 @@ fn cleanup_reason(record: &CleanupFileRecord) -> Option<(String, CleanupRisk)> {
     }
 }
 
-fn is_protected_path(path: &str) -> bool {
+pub fn is_protected_path(path: &str) -> bool {
     let normalized = normalize_for_rules(path);
     let root_like = normalized.ends_with(":\\")
         || normalized.matches('\\').count() <= 1
@@ -252,6 +273,43 @@ fn is_protected_path(path: &str) -> bool {
 
 fn normalize_for_rules(path: &str) -> String {
     path.replace('/', "\\").to_ascii_lowercase()
+}
+
+pub fn validate_file_for_action(
+    path: &str,
+    expected_size: u64,
+    expected_modified_at_ms: Option<i64>,
+) -> anyhow::Result<()> {
+    if is_protected_path(path) {
+        anyhow::bail!("protected path is not eligible for automated actions");
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| anyhow::anyhow!("file is no longer available: {error}"))?;
+    if !metadata.is_file() {
+        anyhow::bail!("only files are eligible for this action");
+    }
+    if metadata.len() != expected_size {
+        anyhow::bail!(
+            "file changed since scan: expected {} bytes, found {} bytes",
+            expected_size,
+            metadata.len()
+        );
+    }
+    if let (Some(expected), Ok(modified)) = (expected_modified_at_ms, metadata.modified()) {
+        let actual = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
+        if (actual - expected).abs() > 1_000 {
+            anyhow::bail!("file timestamp changed since scan");
+        }
+    }
+    Ok(())
+}
+
+pub fn recycle_file(path: &Path) -> anyhow::Result<()> {
+    move_to_recycle_bin(path)
 }
 
 #[cfg(windows)]

@@ -140,6 +140,65 @@ pub struct CleanupActionRecord {
     pub undo_token: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct OffloadJobInsert {
+    pub scan_run_id: i64,
+    pub status: String,
+    pub destination_label: String,
+    pub total_items: u64,
+    pub total_bytes: u64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct OffloadItemInsert {
+    pub job_id: i64,
+    pub entry_id: i64,
+    pub candidate_id: String,
+    pub source_path: String,
+    pub size: u64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OffloadJobRecord {
+    pub id: i64,
+    pub scan_run_id: i64,
+    pub status: String,
+    pub destination_label: String,
+    pub drive_folder_id: Option<String>,
+    pub total_items: u64,
+    pub completed_items: u64,
+    pub failed_items: u64,
+    pub total_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OffloadItemRecord {
+    pub id: i64,
+    pub job_id: i64,
+    pub entry_id: i64,
+    pub candidate_id: String,
+    pub source_path: String,
+    pub size: u64,
+    pub status: String,
+    pub drive_file_id: Option<String>,
+    pub drive_web_url: Option<String>,
+    pub uploaded_bytes: u64,
+    pub md5_checksum: Option<String>,
+    pub error: Option<String>,
+    pub recycle_status: Option<String>,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Ok(Self {
@@ -248,6 +307,52 @@ impl Database {
                 ON action_history(created_at_ms DESC);
             CREATE INDEX IF NOT EXISTS idx_action_history_status
                 ON action_history(status);
+
+            CREATE TABLE IF NOT EXISTS offload_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_run_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                destination_label TEXT NOT NULL,
+                drive_folder_id TEXT,
+                total_items INTEGER NOT NULL,
+                completed_items INTEGER NOT NULL DEFAULT 0,
+                failed_items INTEGER NOT NULL DEFAULT 0,
+                total_bytes INTEGER NOT NULL,
+                uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL,
+                started_at_ms INTEGER,
+                completed_at_ms INTEGER,
+                last_error TEXT,
+                FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_offload_jobs_created
+                ON offload_jobs(created_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_offload_jobs_status
+                ON offload_jobs(status);
+
+            CREATE TABLE IF NOT EXISTS offload_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                entry_id INTEGER NOT NULL,
+                candidate_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                drive_file_id TEXT,
+                drive_web_url TEXT,
+                uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+                md5_checksum TEXT,
+                error TEXT,
+                recycle_status TEXT,
+                created_at_ms INTEGER NOT NULL,
+                completed_at_ms INTEGER,
+                FOREIGN KEY (job_id) REFERENCES offload_jobs(id) ON DELETE CASCADE,
+                UNIQUE(job_id, candidate_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_offload_items_job
+                ON offload_items(job_id, status);
             "#,
         )?;
         conn.execute(
@@ -705,6 +810,41 @@ impl Database {
             .context("read cleanup candidate files")
     }
 
+    pub fn recommendation_file_records(
+        &self,
+        run_id: i64,
+        limit: u32,
+    ) -> anyhow::Result<Vec<CleanupFileRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, path, name, extension, size, modified_at_ms,
+                   is_reparse_point, is_placeholder, is_system
+            FROM file_entries
+            WHERE scan_run_id = ?1
+              AND is_directory = 0
+              AND size > 0
+            ORDER BY size DESC, path ASC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![run_id, limit.clamp(1, 20_000)], |row| {
+            Ok(CleanupFileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                extension: row.get(3)?,
+                size: row.get::<_, i64>(4)? as u64,
+                modified_at_ms: row.get(5)?,
+                is_reparse_point: row.get::<_, bool>(6)?,
+                is_placeholder: row.get::<_, bool>(7)?,
+                is_system: row.get::<_, bool>(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read recommendation files")
+    }
+
     pub fn record_cleanup_action(&self, action: CleanupActionInsert) -> anyhow::Result<i64> {
         let conn = self.connect()?;
         conn.execute(
@@ -793,6 +933,203 @@ impl Database {
         .context("read cleanup action")
     }
 
+    pub fn create_offload_job(&self, job: OffloadJobInsert) -> anyhow::Result<i64> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO offload_jobs (
+                scan_run_id,
+                status,
+                destination_label,
+                total_items,
+                total_bytes,
+                created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                job.scan_run_id,
+                job.status,
+                job.destination_label,
+                job.total_items as i64,
+                job.total_bytes as i64,
+                job.created_at_ms
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn insert_offload_item(&self, item: OffloadItemInsert) -> anyhow::Result<i64> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO offload_items (
+                job_id,
+                entry_id,
+                candidate_id,
+                source_path,
+                size,
+                status,
+                created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)
+            "#,
+            params![
+                item.job_id,
+                item.entry_id,
+                item.candidate_id,
+                item.source_path,
+                item.size as i64,
+                item.created_at_ms
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn update_offload_job(
+        &self,
+        job_id: i64,
+        status: &str,
+        drive_folder_id: Option<&str>,
+        started_at_ms: Option<i64>,
+        completed_at_ms: Option<i64>,
+        last_error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE offload_jobs
+            SET status = ?2,
+                drive_folder_id = COALESCE(?3, drive_folder_id),
+                started_at_ms = COALESCE(?4, started_at_ms),
+                completed_at_ms = ?5,
+                last_error = ?6
+            WHERE id = ?1
+            "#,
+            params![
+                job_id,
+                status,
+                drive_folder_id,
+                started_at_ms,
+                completed_at_ms,
+                last_error
+            ],
+        )?;
+        self.recalculate_offload_job(job_id)
+    }
+
+    pub fn update_offload_item(
+        &self,
+        item_id: i64,
+        status: &str,
+        drive_file_id: Option<&str>,
+        drive_web_url: Option<&str>,
+        uploaded_bytes: u64,
+        md5_checksum: Option<&str>,
+        error: Option<&str>,
+        recycle_status: Option<&str>,
+        completed_at_ms: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE offload_items
+            SET status = ?2,
+                drive_file_id = COALESCE(?3, drive_file_id),
+                drive_web_url = COALESCE(?4, drive_web_url),
+                uploaded_bytes = ?5,
+                md5_checksum = COALESCE(?6, md5_checksum),
+                error = ?7,
+                recycle_status = COALESCE(?8, recycle_status),
+                completed_at_ms = ?9
+            WHERE id = ?1
+            "#,
+            params![
+                item_id,
+                status,
+                drive_file_id,
+                drive_web_url,
+                uploaded_bytes as i64,
+                md5_checksum,
+                error,
+                recycle_status,
+                completed_at_ms
+            ],
+        )?;
+        let job_id = conn.query_row(
+            "SELECT job_id FROM offload_items WHERE id = ?1",
+            params![item_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.recalculate_offload_job(job_id)
+    }
+
+    pub fn offload_job(&self, job_id: i64) -> anyhow::Result<Option<OffloadJobRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, scan_run_id, status, destination_label, drive_folder_id,
+                   total_items, completed_items, failed_items, total_bytes,
+                   uploaded_bytes, created_at_ms, started_at_ms, completed_at_ms, last_error
+            FROM offload_jobs
+            WHERE id = ?1
+            "#,
+            params![job_id],
+            offload_job_from_row,
+        )
+        .optional()
+        .context("read offload job")
+    }
+
+    pub fn offload_items(&self, job_id: i64) -> anyhow::Result<Vec<OffloadItemRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, job_id, entry_id, candidate_id, source_path, size, status,
+                   drive_file_id, drive_web_url, uploaded_bytes, md5_checksum,
+                   error, recycle_status, created_at_ms, completed_at_ms
+            FROM offload_items
+            WHERE job_id = ?1
+            ORDER BY id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![job_id], offload_item_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read offload items")
+    }
+
+    pub fn pending_offload_count(&self) -> anyhow::Result<u64> {
+        let conn = self.connect()?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM offload_jobs WHERE status IN ('queued', 'running')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    fn recalculate_offload_job(&self, job_id: i64) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE offload_jobs
+            SET completed_items = (
+                    SELECT COUNT(*) FROM offload_items
+                    WHERE job_id = ?1 AND status = 'completed'
+                ),
+                failed_items = (
+                    SELECT COUNT(*) FROM offload_items
+                    WHERE job_id = ?1 AND status IN ('failed', 'skipped')
+                ),
+                uploaded_bytes = (
+                    SELECT COALESCE(SUM(uploaded_bytes), 0) FROM offload_items
+                    WHERE job_id = ?1
+                )
+            WHERE id = ?1
+            "#,
+            params![job_id],
+        )?;
+        Ok(())
+    }
+
     pub fn pending_action_count(&self) -> anyhow::Result<u64> {
         let conn = self.connect()?;
         let count = conn.query_row(
@@ -854,6 +1191,45 @@ fn cleanup_action_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CleanupA
         created_at_ms: row.get(8)?,
         completed_at_ms: row.get(9)?,
         undo_token: row.get(10)?,
+    })
+}
+
+fn offload_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OffloadJobRecord> {
+    Ok(OffloadJobRecord {
+        id: row.get(0)?,
+        scan_run_id: row.get(1)?,
+        status: row.get(2)?,
+        destination_label: row.get(3)?,
+        drive_folder_id: row.get(4)?,
+        total_items: row.get::<_, i64>(5)? as u64,
+        completed_items: row.get::<_, i64>(6)? as u64,
+        failed_items: row.get::<_, i64>(7)? as u64,
+        total_bytes: row.get::<_, i64>(8)? as u64,
+        uploaded_bytes: row.get::<_, i64>(9)? as u64,
+        created_at_ms: row.get(10)?,
+        started_at_ms: row.get(11)?,
+        completed_at_ms: row.get(12)?,
+        last_error: row.get(13)?,
+    })
+}
+
+fn offload_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OffloadItemRecord> {
+    Ok(OffloadItemRecord {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        entry_id: row.get(2)?,
+        candidate_id: row.get(3)?,
+        source_path: row.get(4)?,
+        size: row.get::<_, i64>(5)? as u64,
+        status: row.get(6)?,
+        drive_file_id: row.get(7)?,
+        drive_web_url: row.get(8)?,
+        uploaded_bytes: row.get::<_, i64>(9)? as u64,
+        md5_checksum: row.get(10)?,
+        error: row.get(11)?,
+        recycle_status: row.get(12)?,
+        created_at_ms: row.get(13)?,
+        completed_at_ms: row.get(14)?,
     })
 }
 

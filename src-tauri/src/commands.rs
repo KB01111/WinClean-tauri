@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -19,6 +20,16 @@ use crate::{
         CategorySummary, CleanupActionRecord, Database, DirectoryChild, ExtensionSummary,
         FileSearchResult, ScanRunRecord, TopDirectory,
     },
+    offload::{
+        begin_google_drive_auth as begin_drive_auth, create_offload_job,
+        disconnect_google_drive as disconnect_drive, google_drive_status as drive_status,
+        offload_status as read_offload_status, process_offload_job_with_client, GoogleDriveClient,
+        GoogleDriveStatus, OffloadJobStatus, WindowsRecycleBin,
+    },
+    recommendations::{
+        build_recommendations, resolve_recommendation_candidates, RecommendationFilters,
+        RecommendationPlan,
+    },
     reports::{write_diagnostics_report, write_scan_report, ExportArtifact},
     scan::{choose_scan_plan, run_recursive_scan, ScanProgress, ScanRunOptions, ScanState},
     volume::VolumeInfo,
@@ -29,6 +40,7 @@ pub struct AppState {
     app_data_dir: PathBuf,
     progress: Arc<Mutex<ScanProgress>>,
     cancel: Arc<AtomicBool>,
+    offload_cancels: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -40,8 +52,11 @@ pub struct AppHealth {
     pub latest_completed_run_id: Option<i64>,
     pub active_scan_state: ScanState,
     pub pending_action_count: u64,
+    pub pending_offload_count: u64,
     pub local_diagnostics_only: bool,
     pub recycle_bin_cleanup: bool,
+    pub google_drive_configured: bool,
+    pub google_drive_connected: bool,
 }
 
 impl AppState {
@@ -51,6 +66,7 @@ impl AppState {
             app_data_dir,
             progress: Arc::new(Mutex::new(ScanProgress::default())),
             cancel: Arc::new(AtomicBool::new(false)),
+            offload_cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -242,6 +258,21 @@ pub fn category_summary(
 }
 
 #[tauri::command]
+pub fn recommendations(
+    state: State<'_, AppState>,
+    run_id: Option<i64>,
+    filters: Option<RecommendationFilters>,
+) -> Result<Option<RecommendationPlan>, String> {
+    let run_id = resolve_run_id(&state.db, run_id)?;
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    build_recommendations(&state.db, run_id, filters.unwrap_or_default())
+        .map(Some)
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
 pub fn cleanup_plan(
     state: State<'_, AppState>,
     run_id: Option<i64>,
@@ -266,6 +297,82 @@ pub fn execute_cleanup(
         return Err("Select at least one cleanup candidate.".to_string());
     }
     execute_cleanup_plan(&state.db, run_id, &candidate_ids).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn google_drive_status() -> Result<GoogleDriveStatus, String> {
+    Ok(drive_status())
+}
+
+#[tauri::command]
+pub fn begin_google_drive_auth() -> Result<GoogleDriveStatus, String> {
+    begin_drive_auth().map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn disconnect_google_drive() -> Result<GoogleDriveStatus, String> {
+    disconnect_drive().map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn start_offload(
+    state: State<'_, AppState>,
+    run_id: i64,
+    candidate_ids: Vec<String>,
+) -> Result<OffloadJobStatus, String> {
+    if candidate_ids.is_empty() {
+        return Err("Select at least one offload candidate.".to_string());
+    }
+    let plan = build_recommendations(&state.db, run_id, RecommendationFilters::default())
+        .map_err(to_command_error)?;
+    let candidates = resolve_recommendation_candidates(&plan.candidates, &candidate_ids)
+        .map_err(to_command_error)?;
+    if candidates
+        .iter()
+        .any(|candidate| !candidate.eligible_for_offload)
+    {
+        return Err("Only offload-eligible candidates can be sent to Google Drive.".to_string());
+    }
+
+    let drive = GoogleDriveClient::configured().map_err(to_command_error)?;
+    let recycler = WindowsRecycleBin;
+    let initial = create_offload_job(&state.db, run_id, &candidates).map_err(to_command_error)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .offload_cancels
+        .lock()
+        .map_err(|_| "offload status lock is poisoned".to_string())?
+        .insert(initial.id, Arc::clone(&cancel));
+
+    let db = state.db.clone();
+    let cancels = Arc::clone(&state.offload_cancels);
+    let job_id = initial.id;
+    thread::spawn(move || {
+        let _ =
+            process_offload_job_with_client(&db, job_id, candidates, &drive, &recycler, &cancel);
+        if let Ok(mut cancels) = cancels.lock() {
+            cancels.remove(&job_id);
+        }
+    });
+    Ok(initial)
+}
+
+#[tauri::command]
+pub fn offload_status(state: State<'_, AppState>, job_id: i64) -> Result<OffloadJobStatus, String> {
+    read_offload_status(&state.db, job_id).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn cancel_offload(state: State<'_, AppState>, job_id: i64) -> Result<OffloadJobStatus, String> {
+    if let Some(cancel) = state
+        .offload_cancels
+        .lock()
+        .map_err(|_| "offload status lock is poisoned".to_string())?
+        .get(&job_id)
+    {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    read_offload_status(&state.db, job_id).map_err(to_command_error)
 }
 
 #[tauri::command]
@@ -316,6 +423,7 @@ pub fn app_health(state: State<'_, AppState>) -> Result<AppHealth, String> {
         .lock()
         .map(|progress| progress.state.clone())
         .map_err(|_| "scan status lock is poisoned".to_string())?;
+    let drive = drive_status();
 
     Ok(AppHealth {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -327,8 +435,11 @@ pub fn app_health(state: State<'_, AppState>) -> Result<AppHealth, String> {
             .map_err(to_command_error)?,
         active_scan_state,
         pending_action_count: state.db.pending_action_count().map_err(to_command_error)?,
+        pending_offload_count: state.db.pending_offload_count().map_err(to_command_error)?,
         local_diagnostics_only: true,
         recycle_bin_cleanup: true,
+        google_drive_configured: drive.configured,
+        google_drive_connected: drive.connected,
     })
 }
 
