@@ -32,7 +32,7 @@ use crate::{
     },
     reports::{write_diagnostics_report, write_scan_report, ExportArtifact},
     scan::{choose_scan_plan, run_recursive_scan, ScanProgress, ScanRunOptions, ScanState},
-    volume::VolumeInfo,
+    volume::{resolve_local_scan_root, VolumeInfo},
 };
 
 pub struct AppState {
@@ -91,41 +91,13 @@ pub fn start_scan(
     root_path: String,
     file_system: Option<String>,
 ) -> Result<ScanProgress, String> {
-    {
-        let progress = state
-            .progress
-            .lock()
-            .map_err(|_| "scan status lock is poisoned".to_string())?;
-        if matches!(progress.state, ScanState::Running) {
-            return Err("A scan is already running.".to_string());
-        }
-    }
-
-    let plan = choose_scan_plan(&root_path, file_system.as_deref());
+    let _renderer_file_system = file_system;
+    let selected_volume = resolve_local_scan_root(&root_path, &crate::volume::list_volumes())?;
+    let root_path = selected_volume.root_path;
+    let trusted_file_system = selected_volume.file_system;
+    let plan = choose_scan_plan(&root_path, trusted_file_system.as_deref());
+    begin_scan_progress(&state.progress, &root_path, &plan)?;
     state.cancel.store(false, Ordering::Relaxed);
-    {
-        let mut progress = state
-            .progress
-            .lock()
-            .map_err(|_| "scan status lock is poisoned".to_string())?;
-        *progress = ScanProgress {
-            state: ScanState::Running,
-            run_id: None,
-            root_path: Some(root_path.clone()),
-            mode: Some(plan.mode),
-            attempted_mode: plan.attempted_mode,
-            fallback_reason: plan.fallback_reason.clone(),
-            files_indexed: 0,
-            directories_indexed: 0,
-            bytes_indexed: 0,
-            access_denied_count: 0,
-            skipped_reparse_count: 0,
-            error_count: 0,
-            last_error: None,
-            worker_count: None,
-            phase: Some("starting".to_string()),
-        };
-    }
 
     let db = state.db.clone();
     let progress = Arc::clone(&state.progress);
@@ -134,7 +106,7 @@ pub fn start_scan(
 
     thread::spawn(move || {
         let options = ScanRunOptions {
-            file_system,
+            file_system: trusted_file_system,
             attempted_mode: plan.attempted_mode,
             fallback_reason: plan.fallback_reason,
             cancel: Some(cancel),
@@ -151,6 +123,39 @@ pub fn start_scan(
     });
 
     scan_status(state)
+}
+
+pub fn begin_scan_progress(
+    progress: &Mutex<ScanProgress>,
+    root_path: &str,
+    plan: &crate::scan::ScanPlan,
+) -> Result<(), String> {
+    let mut progress = progress
+        .lock()
+        .map_err(|_| "scan status lock is poisoned".to_string())?;
+    if matches!(progress.state, ScanState::Running) {
+        return Err("A scan is already running.".to_string());
+    }
+
+    *progress = ScanProgress {
+        state: ScanState::Running,
+        run_id: None,
+        root_path: Some(root_path.to_string()),
+        mode: Some(plan.mode),
+        attempted_mode: plan.attempted_mode,
+        fallback_reason: plan.fallback_reason.clone(),
+        files_indexed: 0,
+        directories_indexed: 0,
+        bytes_indexed: 0,
+        access_denied_count: 0,
+        skipped_reparse_count: 0,
+        error_count: 0,
+        last_error: None,
+        worker_count: None,
+        phase: Some("starting".to_string()),
+    };
+
+    Ok(())
 }
 
 #[tauri::command]

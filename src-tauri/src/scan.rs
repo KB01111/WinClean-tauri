@@ -217,6 +217,11 @@ pub fn classify_file_attributes(attributes: u32) -> FileAttributeClassification 
     }
 }
 
+pub fn should_skip_directory_for_scan(attributes: u32, is_symlink: bool) -> bool {
+    let classification = classify_file_attributes(attributes);
+    classification.is_placeholder || is_symlink
+}
+
 pub fn choose_scan_plan(_root_path: &str, file_system: Option<&str>) -> ScanPlan {
     if file_system
         .map(|value| value.eq_ignore_ascii_case("NTFS"))
@@ -365,6 +370,8 @@ fn collect_parallel_scan(
     worker_count: usize,
     summary: &mut ScanSummary,
 ) -> anyhow::Result<HashMap<PathBuf, DirectoryRollup>> {
+    reject_reparse_scan_root(root)?;
+
     let queue_capacity = worker_count.max(1) * DIR_QUEUE_MULTIPLIER;
     let event_capacity = worker_count.max(1) * EVENT_QUEUE_MULTIPLIER;
     let (dir_sender, dir_receiver) = bounded::<PathBuf>(queue_capacity);
@@ -696,7 +703,9 @@ fn scan_directory(dir: &Path, cancel: &AtomicBool, event_sender: &Sender<ScanEve
         let is_file = metadata.is_file();
         let size = if is_file { metadata.len() } else { 0 };
 
-        if is_directory && classification.is_reparse_point {
+        if is_directory
+            && should_skip_directory_for_scan(attributes, metadata.file_type().is_symlink())
+        {
             skipped_reparse_count += 1;
         } else if is_directory {
             child_dirs.push(path.clone());
@@ -747,6 +756,22 @@ fn scan_directory(dir: &Path, cancel: &AtomicBool, event_sender: &Sender<ScanEve
             dir: dir.to_path_buf(),
         })
         .is_ok()
+}
+
+fn reject_reparse_scan_root(root: &Path) -> anyhow::Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(root) else {
+        return Ok(());
+    };
+    if should_skip_directory_for_scan(
+        file_attributes(&metadata),
+        metadata.file_type().is_symlink(),
+    ) {
+        anyhow::bail!(
+            "scan root cannot be a reparse point, placeholder, or symlink: {}",
+            root.display()
+        );
+    }
+    Ok(())
 }
 
 fn flush_scan_batch(

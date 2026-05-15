@@ -34,6 +34,7 @@ import {
 import { selectDashboardRun } from "@/lib/scan-selection"
 import {
   runDataRefreshKey,
+  shouldRefreshDashboardCollectionsForProgress,
   shouldRefreshRunDataForProgress,
 } from "@/lib/scan-refresh"
 import {
@@ -42,6 +43,7 @@ import {
   getOffloadProgress,
   type RecoverMode,
 } from "@/lib/recover-space"
+import { selectDefaultScanRoot } from "@/lib/volume-selection"
 
 type View = "overview" | "explorer" | "cleanup" | "history" | "settings"
 type ScanMode = "ntfsUsn" | "recursive"
@@ -312,6 +314,7 @@ function App() {
   const [loadingVolumes, setLoadingVolumes] = useState(true)
   const [loadingData, setLoadingData] = useState(false)
   const dashboardRefreshInFlight = useRef(false)
+  const scanStatusRefreshInFlight = useRef(false)
   const initialLoadStarted = useRef(false)
   const lastRunDataRefreshKey = useRef<string | null>(null)
 
@@ -321,7 +324,9 @@ function App() {
   )
   const activeRun = useMemo(
     () =>
-      scanRuns.find((run) => run.id === selectedRunId) ?? scanRuns[0] ?? null,
+      scanRuns.find((run) => run.id === selectedRunId) ??
+      scanRuns.find((run) => run.status === "completed") ??
+      null,
     [scanRuns, selectedRunId]
   )
   const isScanning = progress.state === "running"
@@ -475,12 +480,30 @@ function App() {
     }
   }, [currentDirectory, refreshRunData, selectedRunId])
 
+  const refreshScanStatus = useCallback(async () => {
+    if (scanStatusRefreshInFlight.current) {
+      return
+    }
+    scanStatusRefreshInFlight.current = true
+    try {
+      const nextProgress = await invoke<ScanProgress>("scan_status")
+      setProgress(nextProgress)
+      if (shouldRefreshDashboardCollectionsForProgress(nextProgress)) {
+        await refreshDashboard()
+      }
+    } catch (error) {
+      setMessage(formatError(error))
+    } finally {
+      scanStatusRefreshInFlight.current = false
+    }
+  }, [refreshDashboard])
+
   const refreshVolumes = useCallback(async () => {
     setLoadingVolumes(true)
     try {
       const nextVolumes = await invoke<VolumeInfo[]>("list_volumes")
       setVolumes(nextVolumes)
-      setSelectedRoot((current) => current || nextVolumes[0]?.rootPath || "")
+      setSelectedRoot((current) => selectDefaultScanRoot(nextVolumes, current))
     } catch (error) {
       setMessage(formatError(error))
     } finally {
@@ -502,10 +525,10 @@ function App() {
       return
     }
     const timer = window.setInterval(() => {
-      void refreshDashboard()
+      void refreshScanStatus()
     }, 900)
     return () => window.clearInterval(timer)
-  }, [isScanning, refreshDashboard])
+  }, [isScanning, refreshScanStatus])
 
   useEffect(() => {
     if (!activeOffloadJob || !offloadRunning) {

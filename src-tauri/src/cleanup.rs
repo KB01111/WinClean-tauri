@@ -5,7 +5,10 @@ use std::{
 
 use serde::Serialize;
 
-use crate::db::{CleanupActionInsert, CleanupActionRecord, CleanupFileRecord, Database};
+use crate::{
+    db::{CleanupActionInsert, CleanupActionRecord, CleanupFileRecord, Database},
+    scan::classify_file_attributes,
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,7 +115,28 @@ pub fn execute_cleanup_plan(
         })?;
 
         match validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms) {
-            Ok(()) => {}
+            Ok(path) => match recycle_file(&path) {
+                Ok(()) => {
+                    recycled_count += 1;
+                    db.update_cleanup_action(
+                        action_id,
+                        "recycled",
+                        Some(unix_millis()),
+                        None,
+                        Some("windows-recycle-bin"),
+                    )?;
+                }
+                Err(error) => {
+                    failed_count += 1;
+                    db.update_cleanup_action(
+                        action_id,
+                        "failed",
+                        Some(unix_millis()),
+                        Some(&error.to_string()),
+                        None,
+                    )?;
+                }
+            },
             Err(error) => {
                 skipped_count += 1;
                 db.update_cleanup_action(
@@ -126,29 +150,6 @@ pub fn execute_cleanup_plan(
                     actions.push(action);
                 }
                 continue;
-            }
-        }
-
-        match recycle_file(Path::new(&candidate.path)) {
-            Ok(()) => {
-                recycled_count += 1;
-                db.update_cleanup_action(
-                    action_id,
-                    "recycled",
-                    Some(unix_millis()),
-                    None,
-                    Some("windows-recycle-bin"),
-                )?;
-            }
-            Err(error) => {
-                failed_count += 1;
-                db.update_cleanup_action(
-                    action_id,
-                    "failed",
-                    Some(unix_millis()),
-                    Some(&error.to_string()),
-                    None,
-                )?;
             }
         }
 
@@ -215,6 +216,57 @@ pub fn restore_cleanup_action(
         .ok_or_else(|| anyhow::anyhow!("cleanup action {action_id} was not found after update"))
 }
 
+pub fn validate_cleanup_target(candidate: &CleanupCandidate) -> anyhow::Result<PathBuf> {
+    if is_protected_path(&candidate.path) {
+        anyhow::bail!("cleanup target is protected: {}", candidate.path);
+    }
+
+    let original = Path::new(&candidate.path);
+    let metadata = std::fs::symlink_metadata(original)
+        .map_err(|error| anyhow::anyhow!("cannot inspect {}: {error}", original.display()))?;
+    reject_live_cleanup_metadata(original, &metadata)?;
+
+    let canonical = std::fs::canonicalize(original)
+        .map_err(|error| anyhow::anyhow!("cannot recycle {}: {error}", original.display()))?;
+    let canonical_display = canonical.to_string_lossy();
+    if is_protected_path(&canonical_display) {
+        anyhow::bail!("cleanup target resolves to a protected path: {canonical_display}");
+    }
+
+    let canonical_metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot inspect resolved target {}: {error}",
+            canonical.display()
+        )
+    })?;
+    reject_live_cleanup_metadata(&canonical, &canonical_metadata)?;
+
+    Ok(canonical)
+}
+
+fn reject_live_cleanup_metadata(path: &Path, metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "cleanup only recycles files in this version: {}",
+            path.display()
+        );
+    }
+
+    let classification = classify_file_attributes(file_attributes(metadata));
+    if classification.is_reparse_point
+        || classification.is_placeholder
+        || classification.is_system
+        || metadata.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "cleanup target is not eligible because it is protected, system, or reparse-backed: {}",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 fn cleanup_candidate(scan_run_id: i64, record: CleanupFileRecord) -> Option<CleanupCandidate> {
     if record.is_reparse_point || record.is_placeholder || record.is_system {
         return None;
@@ -279,16 +331,30 @@ pub fn validate_file_for_action(
     path: &str,
     expected_size: u64,
     expected_modified_at_ms: Option<i64>,
-) -> anyhow::Result<()> {
-    if is_protected_path(path) {
-        anyhow::bail!("protected path is not eligible for automated actions");
-    }
-
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| anyhow::anyhow!("file is no longer available: {error}"))?;
-    if !metadata.is_file() {
-        anyhow::bail!("only files are eligible for this action");
-    }
+) -> anyhow::Result<PathBuf> {
+    let name = Path::new(path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let candidate = CleanupCandidate {
+        id: String::new(),
+        entry_id: 0,
+        scan_run_id: 0,
+        path: path.to_string(),
+        name,
+        size: expected_size,
+        reason: String::new(),
+        risk_level: CleanupRisk::Review,
+        action_kind: String::new(),
+        modified_at_ms: expected_modified_at_ms,
+    };
+    let canonical = validate_cleanup_target(&candidate)?;
+    let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot inspect resolved target {}: {error}",
+            canonical.display()
+        )
+    })?;
     if metadata.len() != expected_size {
         anyhow::bail!(
             "file changed since scan: expected {} bytes, found {} bytes",
@@ -305,7 +371,7 @@ pub fn validate_file_for_action(
             anyhow::bail!("file timestamp changed since scan");
         }
     }
-    Ok(())
+    Ok(canonical)
 }
 
 pub fn recycle_file(path: &Path) -> anyhow::Result<()> {
@@ -368,4 +434,16 @@ fn unix_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn file_attributes(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes()
+}
+
+#[cfg(not(windows))]
+fn file_attributes(_metadata: &std::fs::Metadata) -> u32 {
+    0
 }

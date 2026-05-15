@@ -417,6 +417,21 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    pub fn finalize_interrupted_scan_runs(&self) -> anyhow::Result<usize> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE scan_runs
+            SET status = 'failed',
+                finished_at_ms = COALESCE(finished_at_ms, ?1),
+                last_error = COALESCE(last_error, 'Scan was interrupted before the app closed.')
+            WHERE status = 'running'
+            "#,
+            params![unix_millis()],
+        )
+        .context("finalize interrupted scan runs")
+    }
+
     pub fn finish_scan_run(
         &self,
         summary: &ScanSummary,
@@ -709,7 +724,7 @@ impl Database {
             LIMIT ?2
             "#,
         )?;
-        let rows = stmt.query_map(params![run_id, limit], |row| {
+        let rows = stmt.query_map(params![run_id, limit.clamp(1, 100)], |row| {
             Ok(TopDirectory {
                 path: row.get(0)?,
                 total_size: row.get::<_, i64>(1)? as u64,
@@ -789,6 +804,13 @@ impl Database {
             WHERE scan_run_id = ?1
               AND is_directory = 0
               AND size > 0
+              AND is_reparse_point = 0
+              AND is_placeholder = 0
+              AND is_system = 0
+              AND (
+                  LOWER(COALESCE(extension, '')) IN ('tmp', 'temp', 'log', 'bak', 'old', 'dmp')
+                  OR LOWER(name) = 'thumbs.db'
+              )
             ORDER BY size DESC, path ASC
             LIMIT ?2
             "#,
