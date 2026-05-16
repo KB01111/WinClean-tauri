@@ -10,6 +10,9 @@ use crate::{
     scan::classify_file_attributes,
 };
 
+const CLEANUP_MIN_AGE_MS: i64 = 24 * 60 * 60 * 1000;
+const CLEANUP_METADATA_TOLERANCE_MS: i64 = 2_000;
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CleanupPlan {
@@ -47,6 +50,7 @@ pub struct CleanupExecutionResult {
     pub actions: Vec<CleanupActionRecord>,
     pub recycled_count: u64,
     pub failed_count: u64,
+    pub skipped_count: u64,
     pub bytes_requested: u64,
 }
 
@@ -60,9 +64,10 @@ pub fn build_cleanup_plan(
     limit: u32,
 ) -> anyhow::Result<CleanupPlan> {
     let records = db.cleanup_file_records(scan_run_id, 5000)?;
+    let now_ms = unix_millis();
     let mut candidates = records
         .into_iter()
-        .filter_map(|record| cleanup_candidate(scan_run_id, record))
+        .filter_map(|record| cleanup_candidate(scan_run_id, record, now_ms))
         .take(limit.clamp(1, 500) as usize)
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -94,6 +99,7 @@ pub fn execute_cleanup_plan(
     let mut actions = Vec::new();
     let mut recycled_count = 0;
     let mut failed_count = 0;
+    let mut skipped_count = 0;
     let mut bytes_requested = 0;
 
     for candidate in candidates {
@@ -112,22 +118,34 @@ pub fn execute_cleanup_plan(
             undo_token: None,
         })?;
 
-        match validate_cleanup_target(&candidate).and_then(|path| move_to_recycle_bin(&path)) {
-            Ok(()) => {
-                recycled_count += 1;
-                db.update_cleanup_action(
-                    action_id,
-                    "recycled",
-                    Some(unix_millis()),
-                    None,
-                    Some("windows-recycle-bin"),
-                )?;
-            }
+        match validate_cleanup_target(&candidate) {
+            Ok(path) => match move_to_recycle_bin(&path) {
+                Ok(()) => {
+                    recycled_count += 1;
+                    db.update_cleanup_action(
+                        action_id,
+                        "recycled",
+                        Some(unix_millis()),
+                        None,
+                        Some("windows-recycle-bin"),
+                    )?;
+                }
+                Err(error) => {
+                    failed_count += 1;
+                    db.update_cleanup_action(
+                        action_id,
+                        "failed",
+                        Some(unix_millis()),
+                        Some(&error.to_string()),
+                        None,
+                    )?;
+                }
+            },
             Err(error) => {
-                failed_count += 1;
+                skipped_count += 1;
                 db.update_cleanup_action(
                     action_id,
-                    "failed",
+                    "skipped",
                     Some(unix_millis()),
                     Some(&error.to_string()),
                     None,
@@ -144,6 +162,7 @@ pub fn execute_cleanup_plan(
         actions,
         recycled_count,
         failed_count,
+        skipped_count,
         bytes_requested,
     })
 }
@@ -173,39 +192,20 @@ pub fn resolve_cleanup_candidates(
     Ok(resolved)
 }
 
-pub fn restore_cleanup_action(
-    db: &Database,
-    action_id: i64,
-) -> anyhow::Result<CleanupActionRecord> {
-    let action = db
-        .cleanup_action(action_id)?
-        .ok_or_else(|| anyhow::anyhow!("cleanup action {action_id} was not found"))?;
-
-    if action.status != "recycled" {
-        anyhow::bail!("only recycled cleanup actions can be restored");
-    }
-
-    db.update_cleanup_action(
-        action_id,
-        "restore_requested",
-        Some(unix_millis()),
-        Some("Restore is available from the Windows Recycle Bin. Open Recycle Bin and restore this item to its original path."),
-        action.undo_token.as_deref(),
-    )?;
-
-    db.cleanup_action(action_id)?
-        .ok_or_else(|| anyhow::anyhow!("cleanup action {action_id} was not found after update"))
-}
-
 pub fn validate_cleanup_target(candidate: &CleanupCandidate) -> anyhow::Result<PathBuf> {
     if is_protected_path(&candidate.path) {
         anyhow::bail!("cleanup target is protected: {}", candidate.path);
     }
+    validate_cleanup_age(candidate.modified_at_ms, unix_millis())?;
 
     let original = Path::new(&candidate.path);
-    let metadata = std::fs::symlink_metadata(original)
-        .map_err(|error| anyhow::anyhow!("cannot inspect {}: {error}", original.display()))?;
-    reject_live_cleanup_metadata(original, &metadata)?;
+    let metadata = std::fs::symlink_metadata(original).map_err(|error| {
+        anyhow::anyhow!(
+            "cleanup target is no longer available: {}: {error}",
+            original.display()
+        )
+    })?;
+    reject_live_cleanup_metadata(candidate, original, &metadata)?;
 
     let canonical = std::fs::canonicalize(original)
         .map_err(|error| anyhow::anyhow!("cannot recycle {}: {error}", original.display()))?;
@@ -220,12 +220,16 @@ pub fn validate_cleanup_target(candidate: &CleanupCandidate) -> anyhow::Result<P
             canonical.display()
         )
     })?;
-    reject_live_cleanup_metadata(&canonical, &canonical_metadata)?;
+    reject_live_cleanup_metadata(candidate, &canonical, &canonical_metadata)?;
 
     Ok(canonical)
 }
 
-fn reject_live_cleanup_metadata(path: &Path, metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+fn reject_live_cleanup_metadata(
+    candidate: &CleanupCandidate,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> anyhow::Result<()> {
     if !metadata.is_file() {
         anyhow::bail!(
             "cleanup only recycles files in this version: {}",
@@ -245,15 +249,47 @@ fn reject_live_cleanup_metadata(path: &Path, metadata: &std::fs::Metadata) -> an
         );
     }
 
+    if metadata.len() != candidate.size {
+        anyhow::bail!("cleanup target changed since scan: {}", path.display());
+    }
+    let current_modified_at_ms = metadata
+        .modified()
+        .ok()
+        .map(unix_millis_from_system_time)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cleanup target modified time is unavailable: {}",
+                path.display()
+            )
+        })?;
+    validate_cleanup_age(Some(current_modified_at_ms), unix_millis())?;
+    let scanned_modified_at_ms = candidate.modified_at_ms.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cleanup target modified time was unavailable during scan: {}",
+            path.display()
+        )
+    })?;
+    if (current_modified_at_ms - scanned_modified_at_ms).abs() > CLEANUP_METADATA_TOLERANCE_MS {
+        anyhow::bail!("cleanup target changed since scan: {}", path.display());
+    }
+
     Ok(())
 }
 
-fn cleanup_candidate(scan_run_id: i64, record: CleanupFileRecord) -> Option<CleanupCandidate> {
+fn cleanup_candidate(
+    scan_run_id: i64,
+    record: CleanupFileRecord,
+    now_ms: i64,
+) -> Option<CleanupCandidate> {
     if record.is_reparse_point || record.is_placeholder || record.is_system {
         return None;
     }
 
     if is_protected_path(&record.path) {
+        return None;
+    }
+
+    if validate_cleanup_age(record.modified_at_ms, now_ms).is_err() {
         return None;
     }
 
@@ -301,6 +337,7 @@ fn is_protected_path(path: &str) -> bool {
         || normalized.contains("\\program files\\")
         || normalized.contains("\\program files (x86)\\")
         || normalized.contains("\\programdata\\")
+        || normalized.contains("\\appdata\\")
         || normalized.contains("\\appdata\\local\\microsoft\\windows\\")
 }
 
@@ -360,10 +397,23 @@ fn move_to_recycle_bin(path: &Path) -> anyhow::Result<()> {
 }
 
 fn unix_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    unix_millis_from_system_time(std::time::SystemTime::now())
+}
+
+fn unix_millis_from_system_time(time: std::time::SystemTime) -> i64 {
+    time.duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+fn validate_cleanup_age(modified_at_ms: Option<i64>, now_ms: i64) -> anyhow::Result<()> {
+    let Some(modified_at_ms) = modified_at_ms else {
+        anyhow::bail!("cleanup target modified time is unavailable");
+    };
+    if now_ms.saturating_sub(modified_at_ms) < CLEANUP_MIN_AGE_MS {
+        anyhow::bail!("cleanup target was modified within the last 24 hours");
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

@@ -49,8 +49,9 @@ pub fn write_scan_report(
     let scan_run = db
         .scan_run(scan_run_id)?
         .ok_or_else(|| anyhow::anyhow!("scan run {scan_run_id} was not found"))?;
+    let exported_at_ms = unix_millis();
     let report = ScanReport {
-        exported_at_ms: unix_millis(),
+        exported_at_ms,
         top_directories: db.top_directories(scan_run_id, 50)?,
         extensions: db.extension_summary(scan_run_id, 50)?,
         categories: db.category_summary(scan_run_id)?,
@@ -59,7 +60,7 @@ pub fn write_scan_report(
     };
     write_json_artifact(
         export_dir,
-        &format!("winclean-scan-report-{scan_run_id}.json"),
+        &format!("winclean-scan-report-{scan_run_id}-{exported_at_ms}.json"),
         &report,
     )
 }
@@ -69,8 +70,9 @@ pub fn write_diagnostics_report(
     app_version: &str,
     export_dir: &Path,
 ) -> anyhow::Result<ExportArtifact> {
+    let exported_at_ms = unix_millis();
     let report = DiagnosticsReport {
-        exported_at_ms: unix_millis(),
+        exported_at_ms,
         app_version: app_version.to_string(),
         database_path: db.path().display().to_string(),
         schema_version: db.schema_version()?,
@@ -78,7 +80,11 @@ pub fn write_diagnostics_report(
         scan_runs: db.list_scan_runs(25)?,
         cleanup_history: db.cleanup_history(50)?,
     };
-    write_json_artifact(export_dir, "winclean-diagnostics.json", &report)
+    write_json_artifact(
+        export_dir,
+        &format!("winclean-diagnostics-{exported_at_ms}.json"),
+        &report,
+    )
 }
 
 fn write_json_artifact<T: Serialize>(

@@ -494,6 +494,30 @@ impl Database {
         .context("read scan run")
     }
 
+    pub fn delete_scan_run(&self, run_id: i64) -> anyhow::Result<bool> {
+        let Some(run) = self.scan_run(run_id)? else {
+            return Ok(false);
+        };
+        if run.status == "running" {
+            anyhow::bail!("Cannot delete a scan while it is running.");
+        }
+
+        let conn = self.connect()?;
+        let deleted = conn
+            .execute("DELETE FROM scan_runs WHERE id = ?1", params![run_id])
+            .context("delete scan run")?;
+        Ok(deleted > 0)
+    }
+
+    pub fn clear_scan_history(&self) -> anyhow::Result<usize> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM scan_runs WHERE status IN ('completed', 'failed', 'canceled')",
+            [],
+        )
+        .context("clear scan history")
+    }
+
     pub fn latest_completed_run_id(&self) -> anyhow::Result<Option<i64>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -818,7 +842,7 @@ impl Database {
     pub fn pending_action_count(&self) -> anyhow::Result<u64> {
         let conn = self.connect()?;
         let count = conn.query_row(
-            "SELECT COUNT(*) FROM action_history WHERE status IN ('planned', 'running', 'restore_requested')",
+            "SELECT COUNT(*) FROM action_history WHERE status IN ('planned', 'running')",
             [],
             |row| row.get::<_, i64>(0),
         )?;
