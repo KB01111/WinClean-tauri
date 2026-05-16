@@ -12,10 +12,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::{
-    cleanup::{
-        build_cleanup_plan, execute_cleanup_plan, restore_cleanup_action as restore_cleanup,
-        CleanupPlan,
-    },
+    cleanup::{build_cleanup_plan, execute_cleanup_plan, CleanupPlan},
     db::{
         CategorySummary, CleanupActionRecord, Database, DirectoryChild, ExtensionSummary,
         FileSearchResult, ScanRunRecord, TopDirectory,
@@ -389,11 +386,33 @@ pub fn cleanup_history(
 }
 
 #[tauri::command]
-pub fn restore_cleanup_action(
-    state: State<'_, AppState>,
-    action_id: i64,
-) -> Result<CleanupActionRecord, String> {
-    restore_cleanup(&state.db, action_id).map_err(to_command_error)
+pub fn open_recycle_bin() -> Result<(), String> {
+    open_recycle_bin_impl().map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn delete_scan_run(state: State<'_, AppState>, run_id: i64) -> Result<bool, String> {
+    let active_run_id = state
+        .progress
+        .lock()
+        .map(|progress| {
+            if matches!(progress.state, ScanState::Running) {
+                progress.run_id
+            } else {
+                None
+            }
+        })
+        .map_err(|_| "scan status lock is poisoned".to_string())?;
+    if active_run_id == Some(run_id) {
+        return Err("Cannot delete a scan while it is running.".to_string());
+    }
+
+    state.db.delete_scan_run(run_id).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn clear_scan_history(state: State<'_, AppState>) -> Result<usize, String> {
+    state.db.clear_scan_history().map_err(to_command_error)
 }
 
 #[tauri::command]
@@ -454,4 +473,18 @@ fn resolve_run_id(db: &Database, run_id: Option<i64>) -> Result<Option<i64>, Str
 
 fn to_command_error(error: anyhow::Error) -> String {
     error.to_string()
+}
+
+#[cfg(windows)]
+fn open_recycle_bin_impl() -> anyhow::Result<()> {
+    std::process::Command::new("explorer.exe")
+        .arg("shell:RecycleBinFolder")
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("failed to open Windows Recycle Bin: {error}"))
+}
+
+#[cfg(not(windows))]
+fn open_recycle_bin_impl() -> anyhow::Result<()> {
+    anyhow::bail!("Opening Recycle Bin is only available on Windows in this build")
 }

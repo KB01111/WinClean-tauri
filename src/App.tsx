@@ -12,7 +12,8 @@ import {
   Loader2,
   Play,
   RefreshCw,
-  RotateCcw,
+  ChevronRight,
+  ChevronUp,
   Search,
   Settings,
   ShieldCheck,
@@ -24,6 +25,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { invoke } from "@tauri-apps/api/core"
 
 import { Button } from "@/components/ui/button"
+import {
+  cleanupActionDisabled,
+  directoryBreadcrumbs,
+  parentDirectoryPath,
+  pruneCleanupSelection,
+  shouldCommitRunDataResponse,
+} from "@/lib/app-state"
 import {
   formatBytes,
   formatDateTime,
@@ -314,10 +322,19 @@ function App() {
   const [message, setMessage] = useState<string | null>(null)
   const [loadingVolumes, setLoadingVolumes] = useState(true)
   const [loadingData, setLoadingData] = useState(false)
+  const [loadingRunData, setLoadingRunData] = useState(false)
+  const [scanPending, setScanPending] = useState(false)
+  const [cancelPending, setCancelPending] = useState(false)
+  const [cleanupPending, setCleanupPending] = useState(false)
+  const [reportPending, setReportPending] = useState(false)
+  const [diagnosticsPending, setDiagnosticsPending] = useState(false)
+  const [historyPending, setHistoryPending] = useState(false)
   const dashboardRefreshInFlight = useRef(false)
   const scanStatusRefreshInFlight = useRef(false)
   const initialLoadStarted = useRef(false)
   const lastRunDataRefreshKey = useRef<string | null>(null)
+  const runDataRequestId = useRef(0)
+  const cleanupPlanRunId = useRef<number | null>(null)
 
   const selectedVolume = useMemo(
     () => volumes.find((volume) => volume.rootPath === selectedRoot),
@@ -369,10 +386,24 @@ function App() {
     driveStatus,
     running: offloadRunning,
   })
+  const explorerBreadcrumbs = useMemo(
+    () => directoryBreadcrumbs(activeRun?.rootPath, currentDirectory),
+    [activeRun?.rootPath, currentDirectory]
+  )
+  const explorerParentDirectory = useMemo(
+    () => parentDirectoryPath(currentDirectory, activeRun?.rootPath),
+    [activeRun?.rootPath, currentDirectory]
+  )
 
   const refreshRunData = useCallback(
-    async (runId?: number | null, parentPath?: string | null) => {
+    async (
+      runId?: number | null,
+      parentPath?: string | null,
+      options?: { clearMessage?: boolean }
+    ) => {
+      const requestId = ++runDataRequestId.current
       const resolvedRunId = runId ?? selectedRunId ?? null
+      setLoadingRunData(true)
       if (!resolvedRunId) {
         setTopDirectories([])
         setDirectoryChildren([])
@@ -381,7 +412,10 @@ function App() {
         setCategories([])
         setCleanupPlan(null)
         setRecommendationPlan(null)
-        return
+        cleanupPlanRunId.current = null
+        setSelectedCleanupIds(new Set())
+        setLoadingRunData(false)
+        return true
       }
       const minSizeMb = Number(minSizeMbFilter)
       const minSize =
@@ -389,107 +423,164 @@ function App() {
           ? minSizeMb * 1024 * 1024
           : null
 
-      const [
-        top,
-        children,
-        foundFiles,
-        extensionRows,
-        categoryRows,
-        plan,
-        recommendations,
-      ] = await Promise.all([
-        invoke<TopDirectory[]>("top_directories", {
-          runId: resolvedRunId,
-          limit: 25,
-        }),
-        invoke<DirectoryChild[]>("directory_children", {
-          runId: resolvedRunId,
-          parentPath: parentPath ?? null,
-          limit: 250,
-        }),
-        invoke<FileSearchResult[]>("file_search", {
-          runId: resolvedRunId,
-          query: fileQuery || null,
-          extension: extensionFilter || null,
-          minSize,
-          limit: 100,
-        }),
-        invoke<ExtensionSummary[]>("extension_summary", {
-          runId: resolvedRunId,
-          limit: 20,
-        }),
-        invoke<CategorySummary[]>("category_summary", {
-          runId: resolvedRunId,
-        }),
-        invoke<CleanupPlan | null>("cleanup_plan", {
-          runId: resolvedRunId,
-          limit: 100,
-        }),
-        invoke<RecommendationPlan | null>("recommendations", {
-          runId: resolvedRunId,
-          filters: null,
-        }),
-      ])
-      setTopDirectories(top)
-      setDirectoryChildren(children)
-      setFiles(foundFiles)
-      setExtensions(extensionRows)
-      setCategories(categoryRows)
-      setCleanupPlan(plan)
-      setRecommendationPlan(recommendations)
-      setSelectedCleanupIds(new Set())
+      try {
+        const [
+          top,
+          children,
+          foundFiles,
+          extensionRows,
+          categoryRows,
+          plan,
+          recommendations,
+        ] = await Promise.all([
+          invoke<TopDirectory[]>("top_directories", {
+            runId: resolvedRunId,
+            limit: 25,
+          }),
+          invoke<DirectoryChild[]>("directory_children", {
+            runId: resolvedRunId,
+            parentPath: parentPath ?? null,
+            limit: 250,
+          }),
+          invoke<FileSearchResult[]>("file_search", {
+            runId: resolvedRunId,
+            query: fileQuery || null,
+            extension: extensionFilter || null,
+            minSize,
+            limit: 100,
+          }),
+          invoke<ExtensionSummary[]>("extension_summary", {
+            runId: resolvedRunId,
+            limit: 20,
+          }),
+          invoke<CategorySummary[]>("category_summary", {
+            runId: resolvedRunId,
+          }),
+          invoke<CleanupPlan | null>("cleanup_plan", {
+            runId: resolvedRunId,
+            limit: 100,
+          }),
+          invoke<RecommendationPlan | null>("recommendations", {
+            runId: resolvedRunId,
+            filters: null,
+          }),
+        ])
+        if (
+          !shouldCommitRunDataResponse({
+            requestId,
+            latestRequestId: runDataRequestId.current,
+          })
+        ) {
+          return false
+        }
+
+        setTopDirectories(top)
+        setDirectoryChildren(children)
+        setFiles(foundFiles)
+        setExtensions(extensionRows)
+        setCategories(categoryRows)
+        const previousPlanRunId = cleanupPlanRunId.current
+        const nextPlanRunId =
+          recommendations?.scanRunId ?? plan?.scanRunId ?? null
+        cleanupPlanRunId.current = nextPlanRunId
+        setCleanupPlan(plan)
+        setRecommendationPlan(recommendations)
+        setSelectedCleanupIds((current) =>
+          previousPlanRunId === nextPlanRunId
+            ? pruneCleanupSelection(
+                current,
+                (recommendations?.candidates ?? plan?.candidates ?? []).map(
+                  (candidate) => candidate.id
+                )
+              )
+            : new Set()
+        )
+        if (options?.clearMessage !== false) {
+          setMessage(null)
+        }
+        return true
+      } catch (error) {
+        if (
+          shouldCommitRunDataResponse({
+            requestId,
+            latestRequestId: runDataRequestId.current,
+          })
+        ) {
+          setMessage(formatError(error))
+        }
+        return false
+      } finally {
+        if (
+          shouldCommitRunDataResponse({
+            requestId,
+            latestRequestId: runDataRequestId.current,
+          })
+        ) {
+          setLoadingRunData(false)
+        }
+      }
     },
     [extensionFilter, fileQuery, minSizeMbFilter, selectedRunId]
   )
 
-  const refreshDashboard = useCallback(async () => {
-    if (dashboardRefreshInFlight.current) {
-      return
-    }
-    dashboardRefreshInFlight.current = true
-    setLoadingData(true)
-    try {
-      const [nextProgress, runs, historyRows, nextHealth, nextDriveStatus] =
-        await Promise.all([
-          invoke<ScanProgress>("scan_status"),
-          invoke<ScanRunRecord[]>("scan_runs", { limit: 30 }),
-          invoke<CleanupActionRecord[]>("cleanup_history", { limit: 50 }),
-          invoke<AppHealth>("app_health"),
-          invoke<GoogleDriveStatus>("google_drive_status"),
-        ])
-      setProgress(nextProgress)
-      setScanRuns(runs)
-      setCleanupHistory(historyRows)
-      setHealth(nextHealth)
-      setDriveStatus(nextDriveStatus)
-      const selection = selectDashboardRun({
-        runs,
-        selectedRunId,
-        progressState: nextProgress.state,
-        progressRunId: nextProgress.runId ?? null,
-        progressRootPath: nextProgress.rootPath ?? null,
-        currentDirectory,
-      })
-      const nextRunId = selection.runId
-      const nextDirectory = selection.directory
-      setSelectedRunId(nextRunId)
-      setCurrentDirectory(nextDirectory)
-      if (shouldRefreshRunDataForProgress(nextProgress)) {
-        lastRunDataRefreshKey.current = runDataRefreshKey(
-          nextRunId,
-          nextDirectory
-        )
-        await refreshRunData(nextRunId, nextDirectory)
+  const refreshDashboard = useCallback(
+    async (options?: { clearMessage?: boolean }) => {
+      if (dashboardRefreshInFlight.current) {
+        return
       }
-      setMessage(null)
-    } catch (error) {
-      lastRunDataRefreshKey.current = null
-      setMessage(formatError(error))
-    } finally {
-      dashboardRefreshInFlight.current = false
-      setLoadingData(false)
-    }
-  }, [currentDirectory, refreshRunData, selectedRunId])
+      dashboardRefreshInFlight.current = true
+      setLoadingData(true)
+      try {
+        const [nextProgress, runs, historyRows, nextHealth, nextDriveStatus] =
+          await Promise.all([
+            invoke<ScanProgress>("scan_status"),
+            invoke<ScanRunRecord[]>("scan_runs", { limit: 30 }),
+            invoke<CleanupActionRecord[]>("cleanup_history", { limit: 50 }),
+            invoke<AppHealth>("app_health"),
+            invoke<GoogleDriveStatus>("google_drive_status"),
+          ])
+        setProgress(nextProgress)
+        setScanRuns(runs)
+        setCleanupHistory(historyRows)
+        setHealth(nextHealth)
+        setDriveStatus(nextDriveStatus)
+        const selection = selectDashboardRun({
+          runs,
+          selectedRunId,
+          progressState: nextProgress.state,
+          progressRunId: nextProgress.runId ?? null,
+          progressRootPath: nextProgress.rootPath ?? null,
+          currentDirectory,
+        })
+        const nextRunId = selection.runId
+        const nextDirectory = selection.directory
+        setSelectedRunId(nextRunId)
+        setCurrentDirectory(nextDirectory)
+        let runDataRefreshSucceeded = true
+        if (shouldRefreshRunDataForProgress(nextProgress)) {
+          lastRunDataRefreshKey.current = runDataRefreshKey(
+            nextRunId,
+            nextDirectory
+          )
+          runDataRefreshSucceeded = await refreshRunData(
+            nextRunId,
+            nextDirectory,
+            { clearMessage: options?.clearMessage }
+          )
+        }
+        if (runDataRefreshSucceeded && options?.clearMessage !== false) {
+          setMessage(null)
+        }
+      } catch (error) {
+        lastRunDataRefreshKey.current = null
+        setMessage(formatError(error))
+      } finally {
+        dashboardRefreshInFlight.current = false
+        setLoadingData(false)
+      }
+    },
+    [currentDirectory, refreshRunData, selectedRunId]
+  )
 
   const refreshScanStatus = useCallback(async () => {
     if (scanStatusRefreshInFlight.current) {
@@ -584,10 +675,11 @@ function App() {
   ])
 
   async function startScan() {
-    if (!selectedVolume) {
+    if (!selectedVolume || scanPending) {
       return
     }
 
+    setScanPending(true)
     setMessage(null)
     setTopDirectories([])
     setDirectoryChildren([])
@@ -608,15 +700,23 @@ function App() {
       setView("overview")
     } catch (error) {
       setMessage(formatError(error))
+    } finally {
+      setScanPending(false)
     }
   }
 
   async function cancelScan() {
+    if (cancelPending) {
+      return
+    }
+    setCancelPending(true)
     try {
       setProgress(await invoke<ScanProgress>("cancel_scan"))
       await refreshDashboard()
     } catch (error) {
       setMessage(formatError(error))
+    } finally {
+      setCancelPending(false)
     }
   }
 
@@ -649,9 +749,10 @@ function App() {
       visibleRecommendations,
       selectedCleanupIds
     )
-    if (!runId || candidateIds.length === 0) {
+    if (!runId || candidateIds.length === 0 || cleanupPending) {
       return
     }
+    setCleanupPending(true)
     try {
       const result = await invoke<{
         recycledCount: number
@@ -665,9 +766,11 @@ function App() {
       setMessage(
         `Cleanup sent ${result.recycledCount} item(s) to Recycle Bin; ${result.skippedCount} skipped; ${result.failedCount} failed.`
       )
-      await refreshDashboard()
+      await refreshDashboard({ clearMessage: false })
     } catch (error) {
       setMessage(formatError(error))
+    } finally {
+      setCleanupPending(false)
     }
   }
 
@@ -736,20 +839,20 @@ function App() {
     }
   }
 
-  async function restoreAction(actionId: number) {
+  async function openRecycleBin() {
     try {
-      const action = await invoke<CleanupActionRecord>(
-        "restore_cleanup_action",
-        { actionId }
-      )
-      setMessage(action.explanation ?? "Restore request recorded.")
-      await refreshDashboard()
+      await invoke("open_recycle_bin")
+      setMessage("Windows Recycle Bin opened.")
     } catch (error) {
       setMessage(formatError(error))
     }
   }
 
   async function exportReport() {
+    if (reportPending) {
+      return
+    }
+    setReportPending(true)
     try {
       const artifact = await invoke<ExportArtifact | null>("export_report", {
         runId: activeRun?.id ?? null,
@@ -759,15 +862,65 @@ function App() {
       }
     } catch (error) {
       setMessage(formatError(error))
+    } finally {
+      setReportPending(false)
     }
   }
 
   async function exportDiagnostics() {
+    if (diagnosticsPending) {
+      return
+    }
+    setDiagnosticsPending(true)
     try {
       const artifact = await invoke<ExportArtifact>("export_diagnostics")
       setMessage(`Diagnostics exported to ${artifact.path}`)
     } catch (error) {
       setMessage(formatError(error))
+    } finally {
+      setDiagnosticsPending(false)
+    }
+  }
+
+  async function deleteRun(runId: number) {
+    if (historyPending) {
+      return
+    }
+    setHistoryPending(true)
+    try {
+      const deleted = await invoke<boolean>("delete_scan_run", { runId })
+      if (deleted) {
+        if (selectedRunId === runId) {
+          setSelectedRunId(null)
+          setCurrentDirectory(null)
+          lastRunDataRefreshKey.current = null
+        }
+        setMessage("Scan history entry deleted.")
+      }
+      await refreshDashboard({ clearMessage: false })
+    } catch (error) {
+      setMessage(formatError(error))
+    } finally {
+      setHistoryPending(false)
+    }
+  }
+
+  async function clearScanHistory() {
+    if (historyPending) {
+      return
+    }
+    setHistoryPending(true)
+    try {
+      const deletedCount = await invoke<number>("clear_scan_history")
+      setSelectedRunId(null)
+      setCurrentDirectory(null)
+      lastRunDataRefreshKey.current = null
+      setMessage(`Cleared ${formatNumber(deletedCount)} completed scan(s).`)
+      await refreshDashboard({ clearMessage: false })
+    } catch (error) {
+      setMessage(formatError(error))
+    } finally {
+      setHistoryPending(false)
     }
   }
 
@@ -877,24 +1030,44 @@ function App() {
             <div className="flex flex-wrap items-center gap-2">
               <Button
                 variant="outline"
-                onClick={refreshDashboard}
-                disabled={loadingData}
+                onClick={() => void refreshDashboard()}
+                disabled={loadingData || loadingRunData}
               >
                 <RefreshCw className="size-4" aria-hidden="true" />
                 Refresh
               </Button>
               {isScanning ? (
-                <Button variant="destructive" onClick={cancelScan}>
-                  <Square className="size-4" aria-hidden="true" />
-                  Cancel
+                <Button
+                  variant="destructive"
+                  onClick={cancelScan}
+                  disabled={cancelPending}
+                >
+                  {cancelPending ? (
+                    <Loader2
+                      className="size-4 animate-spin"
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <Square className="size-4" aria-hidden="true" />
+                  )}
+                  {cancelPending ? "Canceling" : "Cancel"}
                 </Button>
               ) : (
                 <Button
                   onClick={startScan}
-                  disabled={!selectedVolume || !selectedVolume.isReady}
+                  disabled={
+                    !selectedVolume || !selectedVolume.isReady || scanPending
+                  }
                 >
-                  <Play className="size-4" aria-hidden="true" />
-                  Scan
+                  {scanPending ? (
+                    <Loader2
+                      className="size-4 animate-spin"
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <Play className="size-4" aria-hidden="true" />
+                  )}
+                  {scanPending ? "Starting" : "Scan"}
                 </Button>
               )}
             </div>
@@ -921,16 +1094,20 @@ function App() {
               recommendationPlan={recommendationPlan}
               onSelectRun={selectRun}
               onExportReport={exportReport}
+              reportPending={reportPending}
             />
           )}
           {view === "explorer" && (
             <ExplorerView
               activeRun={activeRun}
               currentDirectory={currentDirectory}
+              breadcrumbs={explorerBreadcrumbs}
+              parentDirectory={explorerParentDirectory}
               directoryChildren={directoryChildren}
               files={files}
               fileQuery={fileQuery}
               extensionFilter={extensionFilter}
+              loadingRunData={loadingRunData}
               minSizeMbFilter={minSizeMbFilter}
               onFileQueryChange={setFileQuery}
               onExtensionFilterChange={setExtensionFilter}
@@ -949,6 +1126,8 @@ function App() {
               }}
               selectedCleanupIds={selectedCleanupIds}
               selectedRecommendationBytes={selectedRecommendationBytes}
+              cleanupPending={cleanupPending}
+              isScanning={isScanning}
               driveStatus={driveStatus}
               offloadActionState={offloadActionState}
               activeOffloadJob={activeOffloadJob}
@@ -964,13 +1143,17 @@ function App() {
             <HistoryView
               cleanupHistory={cleanupHistory}
               scanRuns={scanRuns}
-              onRestore={restoreAction}
+              historyPending={historyPending}
+              onOpenRecycleBin={openRecycleBin}
+              onDeleteRun={deleteRun}
+              onClearScanHistory={clearScanHistory}
             />
           )}
           {view === "settings" && (
             <SettingsView
               health={health}
               onExportDiagnostics={exportDiagnostics}
+              diagnosticsPending={diagnosticsPending}
             />
           )}
         </section>
@@ -990,6 +1173,7 @@ function OverviewView({
   recommendationPlan,
   onSelectRun,
   onExportReport,
+  reportPending,
 }: {
   progress: ScanProgress
   scanRuns: ScanRunRecord[]
@@ -1001,6 +1185,7 @@ function OverviewView({
   recommendationPlan: RecommendationPlan | null
   onSelectRun: (run: ScanRunRecord) => void
   onExportReport: () => void
+  reportPending: boolean
 }) {
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
@@ -1045,10 +1230,14 @@ function OverviewView({
             <Button
               variant="outline"
               onClick={onExportReport}
-              disabled={!activeRun}
+              disabled={!activeRun || reportPending}
             >
-              <Download className="size-4" aria-hidden="true" />
-              Export
+              {reportPending ? (
+                <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <Download className="size-4" aria-hidden="true" />
+              )}
+              {reportPending ? "Exporting" : "Export"}
             </Button>
           }
         >
@@ -1142,10 +1331,13 @@ function OverviewView({
 function ExplorerView({
   activeRun,
   currentDirectory,
+  breadcrumbs,
+  parentDirectory,
   directoryChildren,
   files,
   fileQuery,
   extensionFilter,
+  loadingRunData,
   minSizeMbFilter,
   onFileQueryChange,
   onExtensionFilterChange,
@@ -1154,10 +1346,13 @@ function ExplorerView({
 }: {
   activeRun: ScanRunRecord | null
   currentDirectory: string | null
+  breadcrumbs: { label: string; path: string }[]
+  parentDirectory: string | null
   directoryChildren: DirectoryChild[]
   files: FileSearchResult[]
   fileQuery: string
   extensionFilter: string
+  loadingRunData: boolean
   minSizeMbFilter: string
   onFileQueryChange: (value: string) => void
   onExtensionFilterChange: (value: string) => void
@@ -1166,15 +1361,52 @@ function ExplorerView({
 }) {
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_420px]">
-      <Panel title="Directory browser">
-        <div className="mb-3 flex items-center gap-2 rounded-md bg-[#f3f5ef] px-3 py-2 text-sm text-[#596259]">
-          <FolderOpen className="size-4" aria-hidden="true" />
-          <span className="truncate">
-            {currentDirectory ?? activeRun?.rootPath ?? "No scan selected"}
-          </span>
+      <Panel
+        title="Directory browser"
+        action={
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!parentDirectory || loadingRunData}
+            onClick={() => parentDirectory && onOpenDirectory(parentDirectory)}
+          >
+            <ChevronUp className="size-4" aria-hidden="true" />
+            Up
+          </Button>
+        }
+      >
+        <div className="mb-3 space-y-2 rounded-md bg-[#f3f5ef] px-3 py-2 text-sm text-[#596259]">
+          <div className="flex items-center gap-2">
+            <FolderOpen className="size-4" aria-hidden="true" />
+            <span className="truncate">
+              {currentDirectory ?? activeRun?.rootPath ?? "No scan selected"}
+            </span>
+          </div>
+          {breadcrumbs.length > 0 ? (
+            <div className="flex flex-wrap items-center gap-1 text-xs">
+              {breadcrumbs.map((crumb, index) => (
+                <span key={crumb.path} className="flex items-center gap-1">
+                  {index > 0 ? (
+                    <ChevronRight className="size-3" aria-hidden="true" />
+                  ) : null}
+                  <button
+                    type="button"
+                    className="max-w-44 truncate rounded px-1 py-0.5 text-[#2d6654] hover:bg-white"
+                    onClick={() => onOpenDirectory(crumb.path)}
+                    disabled={loadingRunData || crumb.path === currentDirectory}
+                    title={crumb.path}
+                  >
+                    {crumb.label}
+                  </button>
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
         <div className="max-h-[560px] overflow-auto">
-          {directoryChildren.length === 0 ? (
+          {loadingRunData ? (
+            <EmptyState text="Loading directory data" />
+          ) : directoryChildren.length === 0 ? (
             <EmptyState text="No children for this directory" />
           ) : (
             directoryChildren.map((entry) => (
@@ -1277,6 +1509,8 @@ function RecoverSpaceView({
   onRecoverModeChange,
   selectedCleanupIds,
   selectedRecommendationBytes,
+  cleanupPending,
+  isScanning,
   driveStatus,
   offloadActionState,
   activeOffloadJob,
@@ -1293,6 +1527,8 @@ function RecoverSpaceView({
   onRecoverModeChange: (mode: RecoverMode) => void
   selectedCleanupIds: Set<string>
   selectedRecommendationBytes: number
+  cleanupPending: boolean
+  isScanning: boolean
   driveStatus: GoogleDriveStatus | null
   offloadActionState: ReturnType<typeof getOffloadActionState>
   activeOffloadJob: OffloadJobStatus | null
@@ -1309,14 +1545,21 @@ function RecoverSpaceView({
   const selectedCount = visibleRecommendations.filter((candidate) =>
     selectedCleanupIds.has(candidate.id)
   ).length
+  const executeDisabled = cleanupActionDisabled({
+    hasPlan: Boolean(recommendationPlan),
+    selectedCount,
+    pending: cleanupPending,
+    scanning: isScanning,
+  })
   const primaryAction =
     recoverMode === "clean" ? (
-      <Button
-        onClick={onClean}
-        disabled={!recommendationPlan || selectedCount === 0}
-      >
-        <Trash2 className="size-4" aria-hidden="true" />
-        Move to Recycle Bin
+      <Button onClick={onClean} disabled={executeDisabled}>
+        {cleanupPending ? (
+          <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+        ) : (
+          <Trash2 className="size-4" aria-hidden="true" />
+        )}
+        {cleanupPending ? "Moving" : "Move to Recycle Bin"}
       </Button>
     ) : recoverMode === "offload" ? (
       <Button onClick={onOffload} disabled={offloadActionState.disabled}>
@@ -1457,15 +1700,33 @@ function RecoverSpaceView({
 function HistoryView({
   cleanupHistory,
   scanRuns,
-  onRestore,
+  historyPending,
+  onOpenRecycleBin,
+  onDeleteRun,
+  onClearScanHistory,
 }: {
   cleanupHistory: CleanupActionRecord[]
   scanRuns: ScanRunRecord[]
-  onRestore: (actionId: number) => void
+  historyPending: boolean
+  onOpenRecycleBin: () => void
+  onDeleteRun: (runId: number) => void
+  onClearScanHistory: () => void
 }) {
+  const clearableScanCount = scanRuns.filter(
+    (run) => run.status !== "running"
+  ).length
+
   return (
     <div className="grid gap-4 xl:grid-cols-2">
-      <Panel title="Cleanup history">
+      <Panel
+        title="Cleanup history"
+        action={
+          <Button variant="outline" size="sm" onClick={onOpenRecycleBin}>
+            <FolderOpen className="size-4" aria-hidden="true" />
+            Open Recycle Bin
+          </Button>
+        }
+      >
         {cleanupHistory.length === 0 ? (
           <EmptyState text="No cleanup actions recorded yet" />
         ) : (
@@ -1481,32 +1742,57 @@ function HistoryView({
                   · {formatDateTime(action.createdAtMs)}
                 </div>
               </div>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={action.status !== "recycled"}
-                onClick={() => void onRestore(action.id)}
-              >
-                <RotateCcw className="size-4" aria-hidden="true" />
-                Restore
-              </Button>
             </div>
           ))
         )}
       </Panel>
 
-      <Panel title="Completed scans">
+      <Panel
+        title="Completed scans"
+        action={
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={historyPending || clearableScanCount === 0}
+            onClick={onClearScanHistory}
+          >
+            {historyPending ? (
+              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+            ) : (
+              <Trash2 className="size-4" aria-hidden="true" />
+            )}
+            Clear
+          </Button>
+        }
+      >
         {scanRuns.length === 0 ? (
           <EmptyState text="No scan history recorded yet" />
         ) : (
-          <DataTable
-            headers={["Root", "Indexed", "Finished"]}
-            rows={scanRuns.map((run) => [
-              run.rootPath,
-              formatBytes(run.bytesIndexed),
-              formatDateTime(run.finishedAtMs),
-            ])}
-          />
+          <div className="space-y-2">
+            {scanRuns.map((run) => (
+              <div
+                key={run.id}
+                className="flex items-center justify-between gap-3 border-b border-[#edf0ea] py-3 text-sm"
+              >
+                <div className="min-w-0">
+                  <div className="truncate font-medium">{run.rootPath}</div>
+                  <div className="text-xs text-[#697267]">
+                    {run.status} · {formatBytes(run.bytesIndexed)} ·{" "}
+                    {formatDateTime(run.finishedAtMs)}
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={historyPending || run.status === "running"}
+                  onClick={() => void onDeleteRun(run.id)}
+                >
+                  <Trash2 className="size-4" aria-hidden="true" />
+                  Delete
+                </Button>
+              </div>
+            ))}
+          </div>
         )}
       </Panel>
     </div>
@@ -1516,18 +1802,28 @@ function HistoryView({
 function SettingsView({
   health,
   onExportDiagnostics,
+  diagnosticsPending,
 }: {
   health: AppHealth | null
   onExportDiagnostics: () => void
+  diagnosticsPending: boolean
 }) {
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
       <Panel
         title="Production posture"
         action={
-          <Button variant="outline" onClick={onExportDiagnostics}>
-            <Download className="size-4" aria-hidden="true" />
-            Export diagnostics
+          <Button
+            variant="outline"
+            onClick={onExportDiagnostics}
+            disabled={diagnosticsPending}
+          >
+            {diagnosticsPending ? (
+              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+            ) : (
+              <Download className="size-4" aria-hidden="true" />
+            )}
+            {diagnosticsPending ? "Exporting" : "Export diagnostics"}
           </Button>
         }
       >

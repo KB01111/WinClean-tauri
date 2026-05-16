@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     },
+    time::{Duration, UNIX_EPOCH},
 };
 
 use std::collections::HashMap;
@@ -17,7 +18,7 @@ use winclean_lib::recommendations::{
     build_recommendations, resolve_offload_recommendation_candidates, RecommendationFilters,
     RecommendationKind, RecommendedAction,
 };
-use winclean_lib::reports::write_scan_report;
+use winclean_lib::reports::{write_diagnostics_report, write_scan_report};
 use winclean_lib::scan::{
     balanced_worker_count, choose_scan_plan, classify_file_attributes, finalize_failed_scan_run,
     run_recursive_scan, should_skip_directory_for_scan, DirectoryRollup, FileAttributeFlags,
@@ -25,7 +26,7 @@ use winclean_lib::scan::{
 };
 use winclean_lib::{
     cleanup::{
-        build_cleanup_plan, cleanup_candidate_id, resolve_cleanup_candidates,
+        build_cleanup_plan, cleanup_candidate_id, execute_cleanup_plan, resolve_cleanup_candidates,
         validate_cleanup_target, CleanupCandidate, CleanupRisk,
     },
     commands::begin_scan_progress,
@@ -399,18 +400,31 @@ fn scan_history_and_directory_queries_expose_persisted_scan_data() {
 #[test]
 fn cleanup_plan_only_includes_conservative_file_candidates() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().join("fixture");
-    fs::create_dir_all(&root).expect("fixture dir");
-    fs::write(root.join("cache.tmp"), vec![1_u8; 20]).expect("tmp file");
-    fs::write(root.join("debug.log"), vec![1_u8; 30]).expect("log file");
-    fs::write(root.join("photo.jpg"), vec![1_u8; 40]).expect("photo file");
-
     let db_path = temp.path().join("index.sqlite3");
     let db = Database::open(&db_path).expect("open db");
     db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run(
+            "C:\\Data",
+            Some("NTFS"),
+            ScanMode::Recursive,
+            None,
+            None,
+            100,
+        )
+        .expect("create scan run");
+    let old_modified = current_test_millis() - hours_ms(25);
+    db.insert_file_entries(
+        run_id,
+        &[
+            cleanup_indexed_entry("C:\\Data\\cache.tmp", 20, Some(old_modified)),
+            cleanup_indexed_entry("C:\\Data\\debug.log", 30, Some(old_modified)),
+            cleanup_indexed_entry("C:\\Data\\photo.jpg", 40, Some(old_modified)),
+        ],
+    )
+    .expect("insert file entries");
 
-    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
-    let plan = build_cleanup_plan(&db, summary.run_id, 50).expect("cleanup plan");
+    let plan = build_cleanup_plan(&db, run_id, 50).expect("cleanup plan");
 
     assert_eq!(plan.candidates.len(), 2);
     assert_eq!(plan.total_bytes, 50);
@@ -427,14 +441,14 @@ fn cleanup_plan_only_includes_conservative_file_candidates() {
         .iter()
         .any(|candidate| candidate.path.ends_with("photo.jpg")));
     assert_eq!(
-        cleanup_candidate_id(summary.run_id, plan.candidates[0].entry_id),
+        cleanup_candidate_id(run_id, plan.candidates[0].entry_id),
         plan.candidates[0].id
     );
 }
 
 #[test]
 fn recommendations_split_safe_cleanup_from_review_and_offload_candidates() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = safe_tempdir();
     let root = temp.path().join("fixture");
     let downloads = root.join("Users").join("kevin").join("Downloads");
     let duplicates_a = root.join("A");
@@ -491,11 +505,12 @@ fn recommendations_split_safe_cleanup_from_review_and_offload_candidates() {
 
 #[test]
 fn cleanup_revalidates_changed_files_before_recycling() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = safe_tempdir();
     let root = temp.path().join("fixture");
     fs::create_dir_all(&root).expect("fixture dir");
     let candidate_path = root.join("cache.tmp");
     fs::write(&candidate_path, vec![1_u8; 20]).expect("tmp file");
+    set_modified_time(&candidate_path, current_test_millis() - hours_ms(25));
 
     let db_path = temp.path().join("index.sqlite3");
     let db = Database::open(&db_path).expect("open db");
@@ -524,11 +539,12 @@ fn cleanup_revalidates_changed_files_before_recycling() {
 
 #[test]
 fn offload_job_uploads_verifies_then_recycles_with_fake_drive_client() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = safe_tempdir();
     let root = temp.path().join("fixture");
     fs::create_dir_all(&root).expect("fixture dir");
     let file_path = root.join("movie.mp4");
     write_sparse_file(&file_path, 120 * 1024 * 1024);
+    set_modified_time(&file_path, current_test_millis() - hours_ms(25));
 
     let db_path = temp.path().join("index.sqlite3");
     let db = Database::open(&db_path).expect("open db");
@@ -575,7 +591,7 @@ fn offload_job_uploads_verifies_then_recycles_with_fake_drive_client() {
 
 #[test]
 fn offload_candidate_resolution_rejects_review_candidates_even_when_eligible() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = safe_tempdir();
     let root = temp.path().join("fixture");
     let duplicates_a = root.join("A");
     let duplicates_b = root.join("B");
@@ -612,11 +628,12 @@ fn offload_candidate_resolution_rejects_review_candidates_even_when_eligible() {
 
 #[test]
 fn offload_job_rejects_item_count_mismatches_before_uploading() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = safe_tempdir();
     let root = temp.path().join("fixture");
     fs::create_dir_all(&root).expect("fixture dir");
     let file_path = root.join("movie.mp4");
     write_sparse_file(&file_path, 120 * 1024 * 1024);
+    set_modified_time(&file_path, current_test_millis() - hours_ms(25));
 
     let db_path = temp.path().join("index.sqlite3");
     let db = Database::open(&db_path).expect("open db");
@@ -648,11 +665,12 @@ fn offload_job_rejects_item_count_mismatches_before_uploading() {
 
 #[test]
 fn offload_job_skips_changed_files_without_counting_uploaded_bytes() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = safe_tempdir();
     let root = temp.path().join("fixture");
     fs::create_dir_all(&root).expect("fixture dir");
     let file_path = root.join("movie.mp4");
     write_sparse_file(&file_path, 120 * 1024 * 1024);
+    set_modified_time(&file_path, current_test_millis() - hours_ms(25));
 
     let db_path = temp.path().join("index.sqlite3");
     let db = Database::open(&db_path).expect("open db");
@@ -695,11 +713,12 @@ fn offload_job_skips_changed_files_without_counting_uploaded_bytes() {
 
 #[test]
 fn offload_job_can_be_cancelled_before_side_effects() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = safe_tempdir();
     let root = temp.path().join("fixture");
     fs::create_dir_all(&root).expect("fixture dir");
     let file_path = root.join("movie.mp4");
     write_sparse_file(&file_path, 120 * 1024 * 1024);
+    set_modified_time(&file_path, current_test_millis() - hours_ms(25));
 
     let db_path = temp.path().join("index.sqlite3");
     let db = Database::open(&db_path).expect("open db");
@@ -738,17 +757,30 @@ fn offload_job_can_be_cancelled_before_side_effects() {
 #[test]
 fn cleanup_candidate_resolution_dedupes_and_rejects_stale_ids_before_cleanup() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().join("fixture");
-    fs::create_dir_all(&root).expect("fixture dir");
-    fs::write(root.join("cache.tmp"), vec![1_u8; 20]).expect("tmp file");
-    fs::write(root.join("debug.log"), vec![1_u8; 30]).expect("log file");
-
     let db_path = temp.path().join("index.sqlite3");
     let db = Database::open(&db_path).expect("open db");
     db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run(
+            "C:\\Data",
+            Some("NTFS"),
+            ScanMode::Recursive,
+            None,
+            None,
+            100,
+        )
+        .expect("create scan run");
+    let old_modified = current_test_millis() - hours_ms(25);
+    db.insert_file_entries(
+        run_id,
+        &[
+            cleanup_indexed_entry("C:\\Data\\cache.tmp", 20, Some(old_modified)),
+            cleanup_indexed_entry("C:\\Data\\debug.log", 30, Some(old_modified)),
+        ],
+    )
+    .expect("insert file entries");
 
-    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
-    let plan = build_cleanup_plan(&db, summary.run_id, 50).expect("cleanup plan");
+    let plan = build_cleanup_plan(&db, run_id, 50).expect("cleanup plan");
     let tmp_id = plan
         .candidates
         .iter()
@@ -788,6 +820,7 @@ fn cleanup_plan_filters_candidates_in_sql_before_size_limit() {
         .create_scan_run("C:\\", Some("NTFS"), ScanMode::Recursive, None, None, 100)
         .expect("create scan run");
 
+    let old_modified = current_test_millis() - hours_ms(25);
     let mut entries = (0..5000)
         .map(|index| IndexedEntry {
             path: format!("C:\\Data\\photo-{index}.jpg"),
@@ -796,7 +829,7 @@ fn cleanup_plan_filters_candidates_in_sql_before_size_limit() {
             extension: Some("jpg".to_string()),
             is_directory: false,
             size: 10_000,
-            modified_at_ms: None,
+            modified_at_ms: Some(old_modified),
             created_at_ms: None,
             accessed_at_ms: None,
             attributes: 0,
@@ -812,7 +845,7 @@ fn cleanup_plan_filters_candidates_in_sql_before_size_limit() {
         extension: Some("tmp".to_string()),
         is_directory: false,
         size: 1,
-        modified_at_ms: None,
+        modified_at_ms: Some(old_modified),
         created_at_ms: None,
         accessed_at_ms: None,
         attributes: 0,
@@ -829,6 +862,93 @@ fn cleanup_plan_filters_candidates_in_sql_before_size_limit() {
         .candidates
         .iter()
         .any(|candidate| candidate.path.ends_with("cache.tmp")));
+}
+
+#[test]
+fn cleanup_plan_skips_recent_and_unknown_age_candidates() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run(
+            "C:\\Data",
+            Some("NTFS"),
+            ScanMode::Recursive,
+            None,
+            None,
+            100,
+        )
+        .expect("create scan run");
+    let now = current_test_millis();
+    db.insert_file_entries(
+        run_id,
+        &[
+            cleanup_indexed_entry("C:\\Data\\old.tmp", 10, Some(now - hours_ms(25))),
+            cleanup_indexed_entry("C:\\Data\\recent.tmp", 20, Some(now - hours_ms(1))),
+            cleanup_indexed_entry("C:\\Data\\unknown.tmp", 30, None),
+        ],
+    )
+    .expect("insert file entries");
+
+    let plan = build_cleanup_plan(&db, run_id, 50).expect("cleanup plan");
+
+    assert_eq!(plan.candidates.len(), 1);
+    assert!(plan.candidates[0].path.ends_with("old.tmp"));
+}
+
+#[test]
+fn cleanup_execution_reports_missing_and_changed_candidates_as_skipped() {
+    let temp = tempfile::Builder::new()
+        .prefix("winclean-cleanup-")
+        .tempdir_in("C:\\tmp")
+        .expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let changed_path = root.join("changed.tmp");
+    fs::write(&changed_path, vec![1_u8; 40]).expect("changed file");
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run(
+            root.to_string_lossy().as_ref(),
+            Some("NTFS"),
+            ScanMode::Recursive,
+            None,
+            None,
+            100,
+        )
+        .expect("create scan run");
+    let old_modified = current_test_millis() - hours_ms(25);
+    let missing_path = root.join("missing.tmp");
+    db.insert_file_entries(
+        run_id,
+        &[
+            cleanup_indexed_entry(&changed_path.to_string_lossy(), 10, Some(old_modified)),
+            cleanup_indexed_entry(&missing_path.to_string_lossy(), 10, Some(old_modified)),
+        ],
+    )
+    .expect("insert file entries");
+    let plan = build_cleanup_plan(&db, run_id, 50).expect("cleanup plan");
+    let candidate_ids = plan
+        .candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+
+    let result = execute_cleanup_plan(&db, run_id, &candidate_ids).expect("cleanup execution");
+
+    assert_eq!(result.recycled_count, 0);
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.skipped_count, 2);
+    assert!(changed_path.exists());
+    assert!(db
+        .cleanup_history(10)
+        .expect("cleanup history")
+        .iter()
+        .all(|action| action.status == "skipped"));
 }
 
 #[test]
@@ -951,9 +1071,167 @@ fn scan_report_export_writes_local_json_artifact() {
     assert!(body.contains("\"cleanupPreview\""));
 }
 
+#[test]
+fn repeated_exports_use_distinct_timestamped_paths() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    fs::write(root.join("cache.tmp"), vec![1_u8; 20]).expect("tmp file");
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+
+    let first_scan = write_scan_report(&db, summary.run_id, temp.path()).expect("first report");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let second_scan = write_scan_report(&db, summary.run_id, temp.path()).expect("second report");
+    let first_diagnostics =
+        write_diagnostics_report(&db, "0.1.0", temp.path()).expect("first diagnostics");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let second_diagnostics =
+        write_diagnostics_report(&db, "0.1.0", temp.path()).expect("second diagnostics");
+
+    assert_ne!(first_scan.path, second_scan.path);
+    assert_ne!(first_diagnostics.path, second_diagnostics.path);
+    assert!(first_scan
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .starts_with(&format!("winclean-scan-report-{}-", summary.run_id)));
+    assert!(first_diagnostics
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .starts_with("winclean-diagnostics-"));
+}
+
+#[test]
+fn deleting_scan_history_removes_scan_data_but_preserves_cleanup_history() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    fs::write(root.join("old.tmp"), vec![1_u8; 20]).expect("tmp file");
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    db.record_cleanup_action(CleanupActionInsert {
+        action_type: "recycle_bin".to_string(),
+        status: "skipped".to_string(),
+        target_path: root.join("old.tmp").to_string_lossy().to_string(),
+        original_path: Some(root.join("old.tmp").to_string_lossy().to_string()),
+        destination_path: Some("Windows Recycle Bin".to_string()),
+        scan_run_id: Some(summary.run_id),
+        explanation: Some("test action".to_string()),
+        created_at_ms: 10,
+        completed_at_ms: Some(20),
+        undo_token: None,
+    })
+    .expect("record cleanup action");
+
+    assert_eq!(
+        db.delete_scan_run(summary.run_id).expect("delete scan"),
+        true
+    );
+
+    assert!(db.scan_run(summary.run_id).expect("read scan").is_none());
+    assert!(db
+        .top_directories(summary.run_id, 10)
+        .expect("top directories")
+        .is_empty());
+    let history = db.cleanup_history(10).expect("cleanup history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].scan_run_id, None);
+}
+
+#[test]
+fn clear_scan_history_keeps_running_scans() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let completed_run = db
+        .create_scan_run(
+            "C:\\Done",
+            Some("NTFS"),
+            ScanMode::Recursive,
+            None,
+            None,
+            100,
+        )
+        .expect("create completed scan");
+    let running_run = db
+        .create_scan_run(
+            "C:\\Running",
+            Some("NTFS"),
+            ScanMode::Recursive,
+            None,
+            None,
+            200,
+        )
+        .expect("create running scan");
+    let summary = ScanSummary {
+        run_id: completed_run,
+        root_path: "C:\\Done".to_string(),
+        mode: ScanMode::Recursive,
+        attempted_mode: None,
+        fallback_reason: None,
+        started_at_ms: 100,
+        finished_at_ms: 150,
+        files_indexed: 0,
+        directories_indexed: 0,
+        bytes_indexed: 0,
+        access_denied_count: 0,
+        skipped_reparse_count: 0,
+        error_count: 0,
+        canceled: false,
+    };
+    db.finish_scan_run(&summary, "completed", None)
+        .expect("finish completed scan");
+
+    assert_eq!(db.clear_scan_history().expect("clear history"), 1);
+
+    assert!(db
+        .scan_run(completed_run)
+        .expect("completed scan")
+        .is_none());
+    assert_eq!(
+        db.scan_run(running_run)
+            .expect("running scan")
+            .map(|run| run.status),
+        Some("running".to_string())
+    );
+}
+
 fn write_sparse_file(path: &std::path::Path, size: u64) {
     let file = File::create(path).expect("create sparse file");
     file.set_len(size).expect("set sparse file length");
+}
+
+fn set_modified_time(path: &std::path::Path, modified_at_ms: i64) {
+    let modified = UNIX_EPOCH + Duration::from_millis(modified_at_ms as u64);
+    File::options()
+        .write(true)
+        .open(path)
+        .expect("open file for timestamp")
+        .set_modified(modified)
+        .expect("set modified time");
+}
+
+fn safe_tempdir() -> tempfile::TempDir {
+    let fixture_root = std::env::current_dir()
+        .expect("current dir")
+        .join("target")
+        .join("test-fixtures");
+    fs::create_dir_all(&fixture_root).expect("fixture root");
+    tempfile::Builder::new()
+        .prefix("winclean-")
+        .tempdir_in(fixture_root)
+        .expect("safe temp dir")
 }
 
 #[derive(Default)]
@@ -1029,4 +1307,41 @@ fn cleanup_candidate_for_path(path: &str) -> CleanupCandidate {
         action_kind: "recycle_bin".to_string(),
         modified_at_ms: None,
     }
+}
+
+fn cleanup_indexed_entry(path: &str, size: u64, modified_at_ms: Option<i64>) -> IndexedEntry {
+    let path_buf = std::path::PathBuf::from(path);
+    IndexedEntry {
+        path: path.to_string(),
+        parent_path: path_buf
+            .parent()
+            .map(|parent| parent.to_string_lossy().to_string()),
+        name: path_buf
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string()),
+        extension: path_buf
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_string()),
+        is_directory: false,
+        size,
+        modified_at_ms,
+        created_at_ms: None,
+        accessed_at_ms: None,
+        attributes: 0,
+        is_reparse_point: false,
+        is_placeholder: false,
+        is_system: false,
+    }
+}
+
+fn current_test_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn hours_ms(hours: i64) -> i64 {
+    hours * 60 * 60 * 1000
 }
