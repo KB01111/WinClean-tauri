@@ -37,7 +37,7 @@ pub struct CleanupCandidate {
     pub modified_at_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CleanupRisk {
     Low,
@@ -118,8 +118,8 @@ pub fn execute_cleanup_plan(
             undo_token: None,
         })?;
 
-        match validate_cleanup_target(&candidate) {
-            Ok(path) => match move_to_recycle_bin(&path) {
+        match validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms) {
+            Ok(path) => match recycle_file(&path) {
                 Ok(()) => {
                     recycled_count += 1;
                     db.update_cleanup_action(
@@ -150,6 +150,10 @@ pub fn execute_cleanup_plan(
                     Some(&error.to_string()),
                     None,
                 )?;
+                if let Some(action) = db.cleanup_action(action_id)? {
+                    actions.push(action);
+                }
+                continue;
             }
         }
 
@@ -308,7 +312,7 @@ fn cleanup_candidate(
     })
 }
 
-fn cleanup_reason(record: &CleanupFileRecord) -> Option<(String, CleanupRisk)> {
+pub fn cleanup_reason(record: &CleanupFileRecord) -> Option<(String, CleanupRisk)> {
     let extension = record
         .extension
         .as_deref()
@@ -326,7 +330,7 @@ fn cleanup_reason(record: &CleanupFileRecord) -> Option<(String, CleanupRisk)> {
     }
 }
 
-fn is_protected_path(path: &str) -> bool {
+pub fn is_protected_path(path: &str) -> bool {
     let normalized = normalize_for_rules(path);
     let root_like = normalized.ends_with(":\\")
         || normalized.matches('\\').count() <= 1
@@ -343,6 +347,57 @@ fn is_protected_path(path: &str) -> bool {
 
 fn normalize_for_rules(path: &str) -> String {
     path.replace('/', "\\").to_ascii_lowercase()
+}
+
+pub fn validate_file_for_action(
+    path: &str,
+    expected_size: u64,
+    expected_modified_at_ms: Option<i64>,
+) -> anyhow::Result<PathBuf> {
+    let name = Path::new(path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let candidate = CleanupCandidate {
+        id: String::new(),
+        entry_id: 0,
+        scan_run_id: 0,
+        path: path.to_string(),
+        name,
+        size: expected_size,
+        reason: String::new(),
+        risk_level: CleanupRisk::Review,
+        action_kind: String::new(),
+        modified_at_ms: expected_modified_at_ms,
+    };
+    let canonical = validate_cleanup_target(&candidate)?;
+    let metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot inspect resolved target {}: {error}",
+            canonical.display()
+        )
+    })?;
+    if metadata.len() != expected_size {
+        anyhow::bail!(
+            "file changed since scan: expected {} bytes, found {} bytes",
+            expected_size,
+            metadata.len()
+        );
+    }
+    if let (Some(expected), Ok(modified)) = (expected_modified_at_ms, metadata.modified()) {
+        let actual = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
+        if (actual - expected).abs() > 1_000 {
+            anyhow::bail!("file timestamp changed since scan");
+        }
+    }
+    Ok(canonical)
+}
+
+pub fn recycle_file(path: &Path) -> anyhow::Result<()> {
+    move_to_recycle_bin(path)
 }
 
 #[cfg(windows)]

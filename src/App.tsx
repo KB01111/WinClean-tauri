@@ -1,7 +1,7 @@
 import {
   AlertTriangle,
   BarChart3,
-  CheckCircle2,
+  Cloud,
   Database,
   Download,
   FileSearch,
@@ -19,6 +19,7 @@ import {
   ShieldCheck,
   Square,
   Trash2,
+  UploadCloud,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { invoke } from "@tauri-apps/api/core"
@@ -44,6 +45,13 @@ import {
   shouldRefreshDashboardCollectionsForProgress,
   shouldRefreshRunDataForProgress,
 } from "@/lib/scan-refresh"
+import {
+  getVisibleRecoverCandidates,
+  getOffloadActionState,
+  getOffloadProgress,
+  selectedVisibleCandidateIds,
+  type RecoverMode,
+} from "@/lib/recover-space"
 import { selectDefaultScanRoot } from "@/lib/volume-selection"
 
 type View = "overview" | "explorer" | "cleanup" | "history" | "settings"
@@ -166,6 +174,32 @@ type CleanupPlan = {
   warnings: string[]
 }
 
+type RecommendationCandidate = {
+  id: string
+  entryId: number
+  scanRunId: number
+  path: string
+  name: string
+  size: number
+  kind: RecoverMode
+  riskLevel: "low" | "review"
+  recommendedAction: "recycleBin" | "googleDriveOffload" | "review"
+  reason: string
+  confidence: number
+  ageDays?: number | null
+  eligibleForOffload: boolean
+  modifiedAtMs?: number | null
+}
+
+type RecommendationPlan = {
+  scanRunId: number
+  candidates: RecommendationCandidate[]
+  cleanBytes: number
+  offloadBytes: number
+  reviewBytes: number
+  warnings: string[]
+}
+
 type CleanupActionRecord = {
   id: number
   actionType: string
@@ -187,8 +221,54 @@ type AppHealth = {
   latestCompletedRunId?: number | null
   activeScanState: ScanState
   pendingActionCount: number
+  pendingOffloadCount: number
   localDiagnosticsOnly: boolean
   recycleBinCleanup: boolean
+  googleDriveConfigured: boolean
+  googleDriveConnected: boolean
+}
+
+type GoogleDriveStatus = {
+  configured: boolean
+  connected: boolean
+  accountEmail?: string | null
+  error?: string | null
+}
+
+type OffloadItemRecord = {
+  id: number
+  jobId: number
+  entryId: number
+  candidateId: string
+  sourcePath: string
+  size: number
+  status: string
+  driveFileId?: string | null
+  driveWebUrl?: string | null
+  uploadedBytes: number
+  md5Checksum?: string | null
+  error?: string | null
+  recycleStatus?: string | null
+  createdAtMs: number
+  completedAtMs?: number | null
+}
+
+type OffloadJobStatus = {
+  id: number
+  scanRunId: number
+  status: string
+  destinationLabel: string
+  driveFolderId?: string | null
+  totalItems: number
+  completedItems: number
+  failedItems: number
+  totalBytes: number
+  uploadedBytes: number
+  createdAtMs: number
+  startedAtMs?: number | null
+  completedAtMs?: number | null
+  lastError?: string | null
+  items: OffloadItemRecord[]
 }
 
 type ExportArtifact = {
@@ -222,15 +302,22 @@ function App() {
   const [files, setFiles] = useState<FileSearchResult[]>([])
   const [fileQuery, setFileQuery] = useState("")
   const [extensionFilter, setExtensionFilter] = useState("")
+  const [minSizeMbFilter, setMinSizeMbFilter] = useState("")
   const [extensions, setExtensions] = useState<ExtensionSummary[]>([])
   const [categories, setCategories] = useState<CategorySummary[]>([])
   const [cleanupPlan, setCleanupPlan] = useState<CleanupPlan | null>(null)
+  const [recommendationPlan, setRecommendationPlan] =
+    useState<RecommendationPlan | null>(null)
+  const [recoverMode, setRecoverMode] = useState<RecoverMode>("clean")
   const [selectedCleanupIds, setSelectedCleanupIds] = useState<Set<string>>(
     new Set()
   )
   const [cleanupHistory, setCleanupHistory] = useState<CleanupActionRecord[]>(
     []
   )
+  const [driveStatus, setDriveStatus] = useState<GoogleDriveStatus | null>(null)
+  const [activeOffloadJob, setActiveOffloadJob] =
+    useState<OffloadJobStatus | null>(null)
   const [health, setHealth] = useState<AppHealth | null>(null)
   const [message, setMessage] = useState<string | null>(null)
   const [loadingVolumes, setLoadingVolumes] = useState(true)
@@ -261,14 +348,44 @@ function App() {
     [scanRuns, selectedRunId]
   )
   const isScanning = progress.state === "running"
-  const selectedCleanupBytes = useMemo(() => {
-    if (!cleanupPlan) {
+  const executableCleanIds = useMemo(
+    () =>
+      new Set(cleanupPlan?.candidates.map((candidate) => candidate.id) ?? []),
+    [cleanupPlan]
+  )
+  const visibleRecommendations = useMemo(() => {
+    if (!recommendationPlan) {
+      return []
+    }
+    return getVisibleRecoverCandidates(
+      recommendationPlan.candidates,
+      recoverMode,
+      executableCleanIds
+    )
+  }, [executableCleanIds, recommendationPlan, recoverMode])
+  const selectedRecommendationBytes = useMemo(() => {
+    if (!recommendationPlan) {
       return 0
     }
-    return cleanupPlan.candidates
+    return recommendationPlan.candidates
       .filter((candidate) => selectedCleanupIds.has(candidate.id))
       .reduce((sum, candidate) => sum + candidate.size, 0)
-  }, [cleanupPlan, selectedCleanupIds])
+  }, [recommendationPlan, selectedCleanupIds])
+  const selectedVisibleCount = useMemo(
+    () =>
+      visibleRecommendations.filter((candidate) =>
+        selectedCleanupIds.has(candidate.id)
+      ).length,
+    [selectedCleanupIds, visibleRecommendations]
+  )
+  const offloadRunning =
+    activeOffloadJob?.status === "queued" ||
+    activeOffloadJob?.status === "running"
+  const offloadActionState = getOffloadActionState({
+    selectedCount: selectedVisibleCount,
+    driveStatus,
+    running: offloadRunning,
+  })
   const explorerBreadcrumbs = useMemo(
     () => directoryBreadcrumbs(activeRun?.rootPath, currentDirectory),
     [activeRun?.rootPath, currentDirectory]
@@ -279,7 +396,11 @@ function App() {
   )
 
   const refreshRunData = useCallback(
-    async (runId?: number | null, parentPath?: string | null) => {
+    async (
+      runId?: number | null,
+      parentPath?: string | null,
+      options?: { clearMessage?: boolean }
+    ) => {
       const requestId = ++runDataRequestId.current
       const resolvedRunId = runId ?? selectedRunId ?? null
       setLoadingRunData(true)
@@ -290,43 +411,60 @@ function App() {
         setExtensions([])
         setCategories([])
         setCleanupPlan(null)
+        setRecommendationPlan(null)
         cleanupPlanRunId.current = null
         setSelectedCleanupIds(new Set())
         setLoadingRunData(false)
         return true
       }
+      const minSizeMb = Number(minSizeMbFilter)
+      const minSize =
+        Number.isFinite(minSizeMb) && minSizeMb > 0
+          ? minSizeMb * 1024 * 1024
+          : null
 
       try {
-        const [top, children, foundFiles, extensionRows, categoryRows, plan] =
-          await Promise.all([
-            invoke<TopDirectory[]>("top_directories", {
-              runId: resolvedRunId,
-              limit: 25,
-            }),
-            invoke<DirectoryChild[]>("directory_children", {
-              runId: resolvedRunId,
-              parentPath: parentPath ?? null,
-              limit: 250,
-            }),
-            invoke<FileSearchResult[]>("file_search", {
-              runId: resolvedRunId,
-              query: fileQuery || null,
-              extension: extensionFilter || null,
-              minSize: null,
-              limit: 100,
-            }),
-            invoke<ExtensionSummary[]>("extension_summary", {
-              runId: resolvedRunId,
-              limit: 20,
-            }),
-            invoke<CategorySummary[]>("category_summary", {
-              runId: resolvedRunId,
-            }),
-            invoke<CleanupPlan | null>("cleanup_plan", {
-              runId: resolvedRunId,
-              limit: 100,
-            }),
-          ])
+        const [
+          top,
+          children,
+          foundFiles,
+          extensionRows,
+          categoryRows,
+          plan,
+          recommendations,
+        ] = await Promise.all([
+          invoke<TopDirectory[]>("top_directories", {
+            runId: resolvedRunId,
+            limit: 25,
+          }),
+          invoke<DirectoryChild[]>("directory_children", {
+            runId: resolvedRunId,
+            parentPath: parentPath ?? null,
+            limit: 250,
+          }),
+          invoke<FileSearchResult[]>("file_search", {
+            runId: resolvedRunId,
+            query: fileQuery || null,
+            extension: extensionFilter || null,
+            minSize,
+            limit: 100,
+          }),
+          invoke<ExtensionSummary[]>("extension_summary", {
+            runId: resolvedRunId,
+            limit: 20,
+          }),
+          invoke<CategorySummary[]>("category_summary", {
+            runId: resolvedRunId,
+          }),
+          invoke<CleanupPlan | null>("cleanup_plan", {
+            runId: resolvedRunId,
+            limit: 100,
+          }),
+          invoke<RecommendationPlan | null>("recommendations", {
+            runId: resolvedRunId,
+            filters: null,
+          }),
+        ])
         if (
           !shouldCommitRunDataResponse({
             requestId,
@@ -342,18 +480,24 @@ function App() {
         setExtensions(extensionRows)
         setCategories(categoryRows)
         const previousPlanRunId = cleanupPlanRunId.current
-        const nextPlanRunId = plan?.scanRunId ?? null
+        const nextPlanRunId =
+          recommendations?.scanRunId ?? plan?.scanRunId ?? null
         cleanupPlanRunId.current = nextPlanRunId
         setCleanupPlan(plan)
+        setRecommendationPlan(recommendations)
         setSelectedCleanupIds((current) =>
-          previousPlanRunId === nextPlanRunId && plan
+          previousPlanRunId === nextPlanRunId
             ? pruneCleanupSelection(
                 current,
-                plan.candidates.map((candidate) => candidate.id)
+                (recommendations?.candidates ?? plan?.candidates ?? []).map(
+                  (candidate) => candidate.id
+                )
               )
             : new Set()
         )
-        setMessage(null)
+        if (options?.clearMessage !== false) {
+          setMessage(null)
+        }
         return true
       } catch (error) {
         if (
@@ -376,7 +520,7 @@ function App() {
         }
       }
     },
-    [extensionFilter, fileQuery, selectedRunId]
+    [extensionFilter, fileQuery, minSizeMbFilter, selectedRunId]
   )
 
   const refreshDashboard = useCallback(
@@ -387,18 +531,19 @@ function App() {
       dashboardRefreshInFlight.current = true
       setLoadingData(true)
       try {
-        const [nextProgress, runs, historyRows, nextHealth] = await Promise.all(
-          [
+        const [nextProgress, runs, historyRows, nextHealth, nextDriveStatus] =
+          await Promise.all([
             invoke<ScanProgress>("scan_status"),
             invoke<ScanRunRecord[]>("scan_runs", { limit: 30 }),
             invoke<CleanupActionRecord[]>("cleanup_history", { limit: 50 }),
             invoke<AppHealth>("app_health"),
-          ]
-        )
+            invoke<GoogleDriveStatus>("google_drive_status"),
+          ])
         setProgress(nextProgress)
         setScanRuns(runs)
         setCleanupHistory(historyRows)
         setHealth(nextHealth)
+        setDriveStatus(nextDriveStatus)
         const selection = selectDashboardRun({
           runs,
           selectedRunId,
@@ -419,7 +564,8 @@ function App() {
           )
           runDataRefreshSucceeded = await refreshRunData(
             nextRunId,
-            nextDirectory
+            nextDirectory,
+            { clearMessage: options?.clearMessage }
           )
         }
         if (runDataRefreshSucceeded && options?.clearMessage !== false) {
@@ -487,6 +633,26 @@ function App() {
   }, [isScanning, refreshScanStatus])
 
   useEffect(() => {
+    if (!activeOffloadJob || !offloadRunning) {
+      return
+    }
+    const timer = window.setInterval(async () => {
+      try {
+        const nextJob = await invoke<OffloadJobStatus>("offload_status", {
+          jobId: activeOffloadJob.id,
+        })
+        setActiveOffloadJob(nextJob)
+        if (nextJob.status !== "queued" && nextJob.status !== "running") {
+          await refreshDashboard()
+        }
+      } catch (error) {
+        setMessage(formatError(error))
+      }
+    }, 1200)
+    return () => window.clearInterval(timer)
+  }, [activeOffloadJob, offloadRunning, refreshDashboard])
+
+  useEffect(() => {
     if (!activeRun || isScanning) {
       return
     }
@@ -519,6 +685,7 @@ function App() {
     setDirectoryChildren([])
     setFiles([])
     setCleanupPlan(null)
+    setRecommendationPlan(null)
     setSelectedCleanupIds(new Set())
     setSelectedRunId(null)
     setCurrentDirectory(selectedVolume.rootPath)
@@ -577,7 +744,12 @@ function App() {
   }
 
   async function executeSelectedCleanup() {
-    if (!cleanupPlan || selectedCleanupIds.size === 0 || cleanupPending) {
+    const runId = recommendationPlan?.scanRunId ?? cleanupPlan?.scanRunId
+    const candidateIds = selectedVisibleCandidateIds(
+      visibleRecommendations,
+      selectedCleanupIds
+    )
+    if (!runId || candidateIds.length === 0 || cleanupPending) {
       return
     }
     setCleanupPending(true)
@@ -588,8 +760,8 @@ function App() {
         skippedCount: number
         bytesRequested: number
       }>("execute_cleanup", {
-        runId: cleanupPlan.scanRunId,
-        candidateIds: Array.from(selectedCleanupIds),
+        runId,
+        candidateIds,
       })
       setMessage(
         `Cleanup sent ${result.recycledCount} item(s) to Recycle Bin; ${result.skippedCount} skipped; ${result.failedCount} failed.`
@@ -599,6 +771,71 @@ function App() {
       setMessage(formatError(error))
     } finally {
       setCleanupPending(false)
+    }
+  }
+
+  async function connectGoogleDrive() {
+    try {
+      setMessage("Opening Google Drive sign-in...")
+      const status = await invoke<GoogleDriveStatus>("begin_google_drive_auth")
+      setDriveStatus(status)
+      setMessage(
+        status.connected
+          ? "Google Drive connected."
+          : (status.error ?? "Google Drive is not connected.")
+      )
+      await refreshDashboard()
+    } catch (error) {
+      setMessage(formatError(error))
+    }
+  }
+
+  async function disconnectGoogleDrive() {
+    try {
+      const status = await invoke<GoogleDriveStatus>("disconnect_google_drive")
+      setDriveStatus(status)
+      setMessage("Google Drive disconnected.")
+      await refreshDashboard()
+    } catch (error) {
+      setMessage(formatError(error))
+    }
+  }
+
+  async function startSelectedOffload() {
+    if (!recommendationPlan) {
+      return
+    }
+    const candidateIds = selectedVisibleCandidateIds(
+      visibleRecommendations,
+      selectedCleanupIds
+    )
+    if (candidateIds.length === 0) {
+      return
+    }
+    try {
+      const job = await invoke<OffloadJobStatus>("start_offload", {
+        runId: recommendationPlan.scanRunId,
+        candidateIds,
+      })
+      setActiveOffloadJob(job)
+      setMessage(`Offload batch ${job.id} queued for Google Drive.`)
+    } catch (error) {
+      setMessage(formatError(error))
+    }
+  }
+
+  async function cancelActiveOffload() {
+    if (!activeOffloadJob) {
+      return
+    }
+    try {
+      const job = await invoke<OffloadJobStatus>("cancel_offload", {
+        jobId: activeOffloadJob.id,
+      })
+      setActiveOffloadJob(job)
+      setMessage("Offload cancel requested.")
+    } catch (error) {
+      setMessage(formatError(error))
     }
   }
 
@@ -793,7 +1030,7 @@ function App() {
             <div className="flex flex-wrap items-center gap-2">
               <Button
                 variant="outline"
-                onClick={refreshDashboard}
+                onClick={() => void refreshDashboard()}
                 disabled={loadingData || loadingRunData}
               >
                 <RefreshCw className="size-4" aria-hidden="true" />
@@ -851,8 +1088,10 @@ function App() {
               scanRuns={scanRuns}
               activeRun={activeRun}
               topDirectories={topDirectories}
+              topFiles={files}
               categories={categories}
               extensions={extensions}
+              recommendationPlan={recommendationPlan}
               onSelectRun={selectRun}
               onExportReport={exportReport}
               reportPending={reportPending}
@@ -869,20 +1108,35 @@ function App() {
               fileQuery={fileQuery}
               extensionFilter={extensionFilter}
               loadingRunData={loadingRunData}
+              minSizeMbFilter={minSizeMbFilter}
               onFileQueryChange={setFileQuery}
               onExtensionFilterChange={setExtensionFilter}
+              onMinSizeMbFilterChange={setMinSizeMbFilter}
               onOpenDirectory={openDirectory}
             />
           )}
           {view === "cleanup" && (
-            <CleanupView
-              cleanupPlan={cleanupPlan}
+            <RecoverSpaceView
+              recommendationPlan={recommendationPlan}
+              visibleRecommendations={visibleRecommendations}
+              recoverMode={recoverMode}
+              onRecoverModeChange={(mode) => {
+                setRecoverMode(mode)
+                setSelectedCleanupIds(new Set())
+              }}
               selectedCleanupIds={selectedCleanupIds}
-              selectedCleanupBytes={selectedCleanupBytes}
+              selectedRecommendationBytes={selectedRecommendationBytes}
               cleanupPending={cleanupPending}
               isScanning={isScanning}
+              driveStatus={driveStatus}
+              offloadActionState={offloadActionState}
+              activeOffloadJob={activeOffloadJob}
               onToggleCandidate={toggleCleanupCandidate}
-              onExecute={executeSelectedCleanup}
+              onClean={executeSelectedCleanup}
+              onOffload={startSelectedOffload}
+              onConnectDrive={connectGoogleDrive}
+              onDisconnectDrive={disconnectGoogleDrive}
+              onCancelOffload={cancelActiveOffload}
             />
           )}
           {view === "history" && (
@@ -913,8 +1167,10 @@ function OverviewView({
   scanRuns,
   activeRun,
   topDirectories,
+  topFiles,
   categories,
   extensions,
+  recommendationPlan,
   onSelectRun,
   onExportReport,
   reportPending,
@@ -923,8 +1179,10 @@ function OverviewView({
   scanRuns: ScanRunRecord[]
   activeRun: ScanRunRecord | null
   topDirectories: TopDirectory[]
+  topFiles: FileSearchResult[]
   categories: CategorySummary[]
   extensions: ExtensionSummary[]
+  recommendationPlan: RecommendationPlan | null
   onSelectRun: (run: ScanRunRecord) => void
   onExportReport: () => void
   reportPending: boolean
@@ -957,6 +1215,13 @@ function OverviewView({
               progress.accessDeniedCount || activeRun?.accessDeniedCount || 0
             )}
           />
+          <Metric
+            label="Recoverable"
+            value={formatBytes(
+              (recommendationPlan?.cleanBytes ?? 0) +
+                (recommendationPlan?.offloadBytes ?? 0)
+            )}
+          />
         </div>
 
         <Panel
@@ -985,6 +1250,20 @@ function OverviewView({
               formatNumber(directory.fileCount),
               formatNumber(directory.directoryCount),
             ])}
+          />
+        </Panel>
+
+        <Panel title="Largest files">
+          <DataTable
+            headers={["File", "Size", "Modified"]}
+            empty="No file data yet"
+            rows={topFiles
+              .slice(0, 10)
+              .map((file) => [
+                file.path,
+                formatBytes(file.size),
+                formatDateTime(file.modifiedAtMs),
+              ])}
           />
         </Panel>
       </div>
@@ -1059,8 +1338,10 @@ function ExplorerView({
   fileQuery,
   extensionFilter,
   loadingRunData,
+  minSizeMbFilter,
   onFileQueryChange,
   onExtensionFilterChange,
+  onMinSizeMbFilterChange,
   onOpenDirectory,
 }: {
   activeRun: ScanRunRecord | null
@@ -1072,8 +1353,10 @@ function ExplorerView({
   fileQuery: string
   extensionFilter: string
   loadingRunData: boolean
+  minSizeMbFilter: string
   onFileQueryChange: (value: string) => void
   onExtensionFilterChange: (value: string) => void
+  onMinSizeMbFilterChange: (value: string) => void
   onOpenDirectory: (path: string) => void
 }) {
   return (
@@ -1170,7 +1453,7 @@ function ExplorerView({
       </Panel>
 
       <Panel title="File search">
-        <div className="mb-3 grid grid-cols-[1fr_96px] gap-2">
+        <div className="mb-3 grid grid-cols-[1fr_90px_110px] gap-2">
           <label className="flex items-center gap-2 rounded-md border border-[#d8ddd2] bg-white px-3 py-2">
             <Search className="size-4 text-[#697267]" aria-hidden="true" />
             <input
@@ -1185,6 +1468,13 @@ function ExplorerView({
             onChange={(event) => onExtensionFilterChange(event.target.value)}
             className="rounded-md border border-[#d8ddd2] bg-white px-3 py-2 text-sm outline-none"
             placeholder=".log"
+          />
+          <input
+            value={minSizeMbFilter}
+            onChange={(event) => onMinSizeMbFilterChange(event.target.value)}
+            className="rounded-md border border-[#d8ddd2] bg-white px-3 py-2 text-sm outline-none"
+            placeholder="Min MB"
+            inputMode="numeric"
           />
         </div>
         <div className="max-h-[560px] overflow-auto">
@@ -1212,68 +1502,172 @@ function ExplorerView({
   )
 }
 
-function CleanupView({
-  cleanupPlan,
+function RecoverSpaceView({
+  recommendationPlan,
+  visibleRecommendations,
+  recoverMode,
+  onRecoverModeChange,
   selectedCleanupIds,
-  selectedCleanupBytes,
+  selectedRecommendationBytes,
   cleanupPending,
   isScanning,
+  driveStatus,
+  offloadActionState,
+  activeOffloadJob,
   onToggleCandidate,
-  onExecute,
+  onClean,
+  onOffload,
+  onConnectDrive,
+  onDisconnectDrive,
+  onCancelOffload,
 }: {
-  cleanupPlan: CleanupPlan | null
+  recommendationPlan: RecommendationPlan | null
+  visibleRecommendations: RecommendationCandidate[]
+  recoverMode: RecoverMode
+  onRecoverModeChange: (mode: RecoverMode) => void
   selectedCleanupIds: Set<string>
-  selectedCleanupBytes: number
+  selectedRecommendationBytes: number
   cleanupPending: boolean
   isScanning: boolean
+  driveStatus: GoogleDriveStatus | null
+  offloadActionState: ReturnType<typeof getOffloadActionState>
+  activeOffloadJob: OffloadJobStatus | null
   onToggleCandidate: (id: string) => void
-  onExecute: () => void
+  onClean: () => void
+  onOffload: () => void
+  onConnectDrive: () => void
+  onDisconnectDrive: () => void
+  onCancelOffload: () => void
 }) {
+  const offloadProgress = activeOffloadJob
+    ? getOffloadProgress(activeOffloadJob)
+    : null
+  const selectedCount = visibleRecommendations.filter((candidate) =>
+    selectedCleanupIds.has(candidate.id)
+  ).length
   const executeDisabled = cleanupActionDisabled({
-    hasPlan: Boolean(cleanupPlan),
-    selectedCount: selectedCleanupIds.size,
+    hasPlan: Boolean(recommendationPlan),
+    selectedCount,
     pending: cleanupPending,
     scanning: isScanning,
   })
+  const primaryAction =
+    recoverMode === "clean" ? (
+      <Button onClick={onClean} disabled={executeDisabled}>
+        {cleanupPending ? (
+          <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+        ) : (
+          <Trash2 className="size-4" aria-hidden="true" />
+        )}
+        {cleanupPending ? "Moving" : "Move to Recycle Bin"}
+      </Button>
+    ) : recoverMode === "offload" ? (
+      <Button onClick={onOffload} disabled={offloadActionState.disabled}>
+        <UploadCloud className="size-4" aria-hidden="true" />
+        {offloadActionState.label}
+      </Button>
+    ) : null
 
   return (
     <div className="space-y-4">
       <div className="grid gap-3 md:grid-cols-3">
         <Metric
-          label="Candidates"
-          value={formatNumber(cleanupPlan?.candidates.length ?? 0)}
+          label="Clean"
+          value={formatBytes(recommendationPlan?.cleanBytes ?? 0)}
         />
         <Metric
-          label="Potential recovery"
-          value={formatBytes(cleanupPlan?.totalBytes ?? 0)}
+          label="Offload"
+          value={formatBytes(recommendationPlan?.offloadBytes ?? 0)}
         />
-        <Metric label="Selected" value={formatBytes(selectedCleanupBytes)} />
+        <Metric
+          label="Selected"
+          value={formatBytes(selectedRecommendationBytes)}
+        />
       </div>
 
       <Panel
-        title="Safe cleanup preview"
+        title="Recover Space"
         action={
-          <Button onClick={onExecute} disabled={executeDisabled}>
-            {cleanupPending ? (
-              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-            ) : (
-              <Trash2 className="size-4" aria-hidden="true" />
+          <div className="flex flex-wrap items-center gap-2">
+            {recoverMode === "offload" && (
+              <Button
+                variant="outline"
+                onClick={
+                  driveStatus?.connected ? onDisconnectDrive : onConnectDrive
+                }
+              >
+                <Cloud className="size-4" aria-hidden="true" />
+                {driveStatus?.connected ? "Disconnect Drive" : "Connect Drive"}
+              </Button>
             )}
-            {cleanupPending ? "Moving" : "Move to Recycle Bin"}
-          </Button>
+            {primaryAction}
+          </div>
         }
       >
-        {cleanupPlan?.warnings.map((warning) => (
+        <div className="mb-3 flex flex-wrap gap-2">
+          {(["clean", "offload", "review"] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => onRecoverModeChange(mode)}
+              className={[
+                "rounded-md border px-3 py-2 text-sm font-medium capitalize transition",
+                recoverMode === mode
+                  ? "border-[#2d6654] bg-[#edf6ef] text-[#123c2f]"
+                  : "border-[#d8ddd2] bg-white text-[#596259] hover:border-[#9db2a7]",
+              ].join(" ")}
+            >
+              {mode}
+            </button>
+          ))}
+        </div>
+
+        {recommendationPlan?.warnings.map((warning) => (
           <Notice key={warning} tone="info" text={warning} />
         ))}
+        {recoverMode === "offload" && driveStatus?.error ? (
+          <Notice tone="warning" text={driveStatus.error} />
+        ) : null}
+        {recoverMode === "offload" && offloadActionState.reason ? (
+          <Notice tone="warning" text={offloadActionState.reason} />
+        ) : null}
+        {activeOffloadJob && offloadProgress ? (
+          <div className="my-3 rounded-md border border-[#d8ddd2] bg-white p-3">
+            <div className="flex items-center justify-between gap-3 text-sm">
+              <span className="font-medium">
+                Batch {activeOffloadJob.id} · {activeOffloadJob.status}
+              </span>
+              <span className="tabular-nums">{offloadProgress.percent}%</span>
+            </div>
+            <div className="mt-2 h-2 overflow-hidden rounded-full bg-[#e1e5dd]">
+              <div
+                className="h-full bg-[#2d6654]"
+                style={{ width: `${offloadProgress.percent}%` }}
+              />
+            </div>
+            <div className="mt-2 flex items-center justify-between gap-3 text-xs text-[#697267]">
+              <span>{offloadProgress.text}</span>
+              {activeOffloadJob.status === "queued" ||
+              activeOffloadJob.status === "running" ? (
+                <button
+                  type="button"
+                  onClick={onCancelOffload}
+                  className="font-medium text-[#8d2f24]"
+                >
+                  Cancel
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
         <div className="mt-3 max-h-[560px] overflow-auto">
-          {!cleanupPlan || cleanupPlan.candidates.length === 0 ? (
-            <EmptyState text="No conservative cleanup candidates found" />
+          {!recommendationPlan || visibleRecommendations.length === 0 ? (
+            <EmptyState text="No candidates found for this mode" />
           ) : (
-            cleanupPlan.candidates.map((candidate) => (
+            visibleRecommendations.map((candidate) => (
               <label
                 key={candidate.id}
-                className="grid cursor-pointer grid-cols-[24px_1fr_130px_90px] items-center gap-3 border-b border-[#edf0ea] py-3 text-sm"
+                className="grid cursor-pointer grid-cols-[24px_1fr_150px_90px] items-center gap-3 border-b border-[#edf0ea] py-3 text-sm"
               >
                 <input
                   type="checkbox"
@@ -1289,7 +1683,7 @@ function CleanupView({
                   </span>
                 </span>
                 <span className="text-xs text-[#697267]">
-                  {candidate.reason}
+                  {candidate.reason} · {candidate.riskLevel}
                 </span>
                 <span className="text-right tabular-nums">
                   {formatBytes(candidate.size)}
@@ -1437,7 +1831,7 @@ function SettingsView({
           <Posture
             icon={ShieldCheck}
             title="Privacy"
-            text="Diagnostics and scan data stay local unless exported."
+            text="Scan data stays local; selected files leave the device only when offloaded."
           />
           <Posture
             icon={Trash2}
@@ -1450,9 +1844,15 @@ function SettingsView({
             text={`SQLite schema ${health?.schemaVersion ?? "unknown"}`}
           />
           <Posture
-            icon={CheckCircle2}
-            title="Release"
-            text="Direct Windows installer path with signing and updater readiness."
+            icon={Cloud}
+            title="Google Drive"
+            text={
+              health?.googleDriveConnected
+                ? "Connected for verified offload batches."
+                : health?.googleDriveConfigured
+                  ? "Configured, waiting for sign-in."
+                  : "Set WINCLEAN_GOOGLE_CLIENT_ID to enable offload."
+            }
           />
         </div>
       </Panel>
@@ -1469,6 +1869,10 @@ function SettingsView({
                 : "none",
             ],
             ["Pending actions", formatNumber(health?.pendingActionCount ?? 0)],
+            [
+              "Pending offloads",
+              formatNumber(health?.pendingOffloadCount ?? 0),
+            ],
             ["Database", health?.databasePath ?? "unknown"],
           ]}
         />
@@ -1499,7 +1903,7 @@ function NavButton({
           : "text-[#4d574e] hover:bg-[#eef2eb]",
       ].join(" ")}
     >
-      <Icon className="size-4" aria-hidden="true" />
+      <Icon className="size-4" aria-hidden={true} />
       {label}
     </button>
   )
@@ -1643,7 +2047,7 @@ function Posture({
   return (
     <div className="rounded-md border border-[#e3e7df] bg-[#fbfcf8] p-3">
       <div className="mb-2 flex items-center gap-2 font-medium">
-        <Icon className="size-4 text-[#2d6654]" aria-hidden="true" />
+        <Icon className="size-4 text-[#2d6654]" aria-hidden={true} />
         {title}
       </div>
       <p className="text-sm text-[#667066]">{text}</p>
