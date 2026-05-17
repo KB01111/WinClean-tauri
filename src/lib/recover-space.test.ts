@@ -7,6 +7,7 @@ import {
   getOffloadProgress,
   selectedVisibleCandidateIds,
   summarizeRecoverCandidates,
+  visibleOffloadItemWindow,
   visibleRecoverCandidateWindow,
 } from "./recover-space"
 
@@ -132,6 +133,20 @@ describe("Recover Space helpers", () => {
   test("limits visible candidate rows while reporting total available rows", () => {
     expect(visibleRecoverCandidateWindow(candidates, 2)).toEqual({
       rows: [candidates[0], candidates[1]],
+      hiddenCount: 1,
+      totalCount: 3,
+    })
+  })
+
+  test("limits offload item rows and prioritizes items with errors", () => {
+    const items = [
+      { id: 1, status: "completed", error: null },
+      { id: 2, status: "failed", error: "upload failed" },
+      { id: 3, status: "uploading", error: null },
+    ]
+
+    expect(visibleOffloadItemWindow(items, 2)).toEqual({
+      rows: [items[1], items[0]],
       hiddenCount: 1,
       totalCount: 3,
     })

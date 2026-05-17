@@ -5,7 +5,9 @@ use std::{
 };
 
 use anyhow::Context;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, types::Value, Connection, OptionalExtension, TransactionBehavior,
+};
 use serde::Serialize;
 
 use crate::scan::{DirectoryRollup, IndexedEntry, ScanMode, ScanSummary};
@@ -436,6 +438,22 @@ impl Database {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let interrupted_message = "Offload was interrupted before the app closed.";
+        let now_ms = unix_millis();
+        tx.execute(
+            r#"
+            UPDATE offload_items
+            SET status = 'failed',
+                error = COALESCE(error, ?1),
+                completed_at_ms = COALESCE(completed_at_ms, ?2)
+            WHERE job_id IN (
+                SELECT id FROM offload_jobs
+                WHERE status IN ('queued', 'running')
+            )
+              AND status IN ('queued', 'validating', 'uploading')
+            "#,
+            params![interrupted_message, now_ms],
+        )
+        .context("finalize interrupted offload items")?;
         let finalized = tx
             .execute(
                 r#"
@@ -445,24 +463,9 @@ impl Database {
                     last_error = COALESCE(last_error, ?2)
                 WHERE status IN ('queued', 'running')
                 "#,
-                params![unix_millis(), interrupted_message],
+                params![now_ms, interrupted_message],
             )
             .context("finalize interrupted offload jobs")?;
-        tx.execute(
-            r#"
-            UPDATE offload_items
-            SET status = 'failed',
-                error = COALESCE(error, ?1),
-                completed_at_ms = COALESCE(completed_at_ms, ?2)
-            WHERE job_id IN (
-                SELECT id FROM offload_jobs
-                WHERE status = 'failed' AND last_error = ?1
-            )
-              AND status IN ('queued', 'validating', 'uploading')
-            "#,
-            params![interrupted_message, unix_millis()],
-        )
-        .context("finalize interrupted offload items")?;
         tx.commit()?;
         Ok(finalized)
     }
@@ -891,6 +894,59 @@ impl Database {
             .context("read cleanup candidate files")
     }
 
+    pub fn cleanup_file_records_by_ids(
+        &self,
+        run_id: i64,
+        entry_ids: &[i64],
+    ) -> anyhow::Result<Vec<CleanupFileRecord>> {
+        if entry_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = (0..entry_ids.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT id, path, name, extension, size, modified_at_ms,
+                   is_reparse_point, is_placeholder, is_system
+            FROM file_entries
+            WHERE scan_run_id = ?
+              AND id IN ({placeholders})
+              AND is_directory = 0
+              AND size > 0
+              AND is_reparse_point = 0
+              AND is_placeholder = 0
+              AND is_system = 0
+              AND (
+                  LOWER(COALESCE(extension, '')) IN ('tmp', 'temp', 'log', 'bak', 'old', 'dmp')
+                  OR LOWER(name) = 'thumbs.db'
+              )
+            "#
+        );
+        let mut values = Vec::with_capacity(entry_ids.len() + 1);
+        values.push(Value::Integer(run_id));
+        values.extend(entry_ids.iter().copied().map(Value::Integer));
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok(CleanupFileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                extension: row.get(3)?,
+                size: row.get::<_, i64>(4)? as u64,
+                modified_at_ms: row.get(5)?,
+                is_reparse_point: row.get::<_, bool>(6)?,
+                is_placeholder: row.get::<_, bool>(7)?,
+                is_system: row.get::<_, bool>(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read selected cleanup candidate files")
+    }
+
     pub fn recommendation_file_records(
         &self,
         run_id: i64,
@@ -1045,7 +1101,19 @@ impl Database {
         items: &[OffloadItemInsert],
     ) -> anyhow::Result<i64> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if matches!(job.status.as_str(), "queued" | "running") {
+            let active_count = tx.query_row(
+                "SELECT COUNT(*) FROM offload_jobs WHERE status IN ('queued', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if active_count > 0 {
+                anyhow::bail!(
+                    "Wait for the current offload batch to finish before starting another."
+                );
+            }
+        }
         tx.execute(
             r#"
             INSERT INTO offload_jobs (

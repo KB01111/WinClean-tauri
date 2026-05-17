@@ -51,6 +51,7 @@ import {
   getOffloadProgress,
   selectedVisibleCandidateIds,
   summarizeRecoverCandidates,
+  visibleOffloadItemWindow,
   visibleRecoverCandidateWindow,
   type RecoverMode,
   type RecoverCandidateSummary,
@@ -291,6 +292,7 @@ const emptyProgress: ScanProgress = {
   errorCount: 0,
 }
 const MAX_RECOVER_CANDIDATE_ROWS = 300
+const MAX_OFFLOAD_ITEM_ROWS = 50
 
 function App() {
   const [view, setView] = useState<View>("overview")
@@ -1585,6 +1587,9 @@ function RecoverSpaceView({
   const offloadProgress = activeOffloadJob
     ? getOffloadProgress(activeOffloadJob)
     : null
+  const offloadItemWindow = activeOffloadJob
+    ? visibleOffloadItemWindow(activeOffloadJob.items, MAX_OFFLOAD_ITEM_ROWS)
+    : { rows: [], hiddenCount: 0, totalCount: 0 }
   const selectedCount = visibleRecommendations.filter((candidate) =>
     selectedCleanupIds.has(candidate.id)
   ).length
@@ -1763,9 +1768,9 @@ function RecoverSpaceView({
                 </button>
               ) : null}
             </div>
-            {activeOffloadJob.items.length > 0 ? (
+            {offloadItemWindow.rows.length > 0 ? (
               <div className="mt-3 max-h-52 overflow-auto border-t border-[#edf0ea] pt-2">
-                {activeOffloadJob.items.map((item) => (
+                {offloadItemWindow.rows.map((item) => (
                   <div
                     key={item.id}
                     className="grid grid-cols-[1fr_110px_110px] gap-3 py-1.5 text-xs text-[#596259]"
@@ -1784,6 +1789,13 @@ function RecoverSpaceView({
                     ) : null}
                   </div>
                 ))}
+                {offloadItemWindow.hiddenCount > 0 ? (
+                  <div className="border-t border-[#edf0ea] pt-2 text-xs text-[#697267]">
+                    Showing {formatNumber(offloadItemWindow.rows.length)} of{" "}
+                    {formatNumber(offloadItemWindow.totalCount)} items; failed
+                    items are shown first.
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>

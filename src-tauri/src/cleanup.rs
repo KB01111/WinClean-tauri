@@ -56,6 +56,10 @@ pub struct CleanupExecutionResult {
 
 pub trait FileRecycler {
     fn recycle_file(&self, path: &Path) -> anyhow::Result<()>;
+
+    fn recycle_files(&self, paths: &[PathBuf]) -> Vec<anyhow::Result<()>> {
+        paths.iter().map(|path| self.recycle_file(path)).collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -64,6 +68,10 @@ pub struct SystemRecycleBin;
 impl FileRecycler for SystemRecycleBin {
     fn recycle_file(&self, path: &Path) -> anyhow::Result<()> {
         recycle_file(path)
+    }
+
+    fn recycle_files(&self, paths: &[PathBuf]) -> Vec<anyhow::Result<()>> {
+        recycle_files(paths)
     }
 }
 
@@ -115,10 +123,10 @@ pub fn execute_cleanup_plan_with_recycler(
     candidate_ids: &[String],
     recycler: &dyn FileRecycler,
 ) -> anyhow::Result<CleanupExecutionResult> {
-    let plan = build_cleanup_plan(db, scan_run_id, 500)?;
-    let candidates = resolve_cleanup_candidates(&plan.candidates, candidate_ids)?;
+    let candidates = resolve_selected_cleanup_candidates(db, scan_run_id, candidate_ids)?;
 
     let mut actions = Vec::new();
+    let mut pending_recycles = Vec::new();
     let mut recycled_count = 0;
     let mut failed_count = 0;
     let mut skipped_count = 0;
@@ -141,28 +149,7 @@ pub fn execute_cleanup_plan_with_recycler(
         })?;
 
         match validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms) {
-            Ok(path) => match recycler.recycle_file(&path) {
-                Ok(()) => {
-                    recycled_count += 1;
-                    db.update_cleanup_action(
-                        action_id,
-                        "recycled",
-                        Some(unix_millis()),
-                        None,
-                        Some("windows-recycle-bin"),
-                    )?;
-                }
-                Err(error) => {
-                    failed_count += 1;
-                    db.update_cleanup_action(
-                        action_id,
-                        "failed",
-                        Some(unix_millis()),
-                        Some(&error.to_string()),
-                        None,
-                    )?;
-                }
-            },
+            Ok(path) => pending_recycles.push(PendingRecycle { action_id, path }),
             Err(error) => {
                 skipped_count += 1;
                 db.update_cleanup_action(
@@ -178,8 +165,45 @@ pub fn execute_cleanup_plan_with_recycler(
                 continue;
             }
         }
+    }
 
-        if let Some(action) = db.cleanup_action(action_id)? {
+    let recycle_paths = pending_recycles
+        .iter()
+        .map(|pending| pending.path.clone())
+        .collect::<Vec<_>>();
+    let mut recycle_results = recycler.recycle_files(&recycle_paths).into_iter();
+
+    for pending in pending_recycles {
+        let recycle_result = recycle_results.next().unwrap_or_else(|| {
+            Err(anyhow::anyhow!(
+                "Recycle Bin worker did not return a result for {}",
+                pending.path.display()
+            ))
+        });
+        match recycle_result {
+            Ok(()) => {
+                recycled_count += 1;
+                db.update_cleanup_action(
+                    pending.action_id,
+                    "recycled",
+                    Some(unix_millis()),
+                    None,
+                    Some("windows-recycle-bin"),
+                )?;
+            }
+            Err(error) => {
+                failed_count += 1;
+                db.update_cleanup_action(
+                    pending.action_id,
+                    "failed",
+                    Some(unix_millis()),
+                    Some(&error.to_string()),
+                    None,
+                )?;
+            }
+        }
+
+        if let Some(action) = db.cleanup_action(pending.action_id)? {
             actions.push(action);
         }
     }
@@ -191,6 +215,11 @@ pub fn execute_cleanup_plan_with_recycler(
         skipped_count,
         bytes_requested,
     })
+}
+
+struct PendingRecycle {
+    action_id: i64,
+    path: PathBuf,
 }
 
 pub fn resolve_cleanup_candidates(
@@ -216,6 +245,54 @@ pub fn resolve_cleanup_candidates(
     }
 
     Ok(resolved)
+}
+
+fn resolve_selected_cleanup_candidates(
+    db: &Database,
+    scan_run_id: i64,
+    candidate_ids: &[String],
+) -> anyhow::Result<Vec<CleanupCandidate>> {
+    let mut seen = HashSet::new();
+    let mut requested = Vec::new();
+    for candidate_id in candidate_ids {
+        if !seen.insert(candidate_id.as_str()) {
+            continue;
+        }
+        let entry_id = cleanup_entry_id_from_candidate_id(scan_run_id, candidate_id)?;
+        requested.push((candidate_id.clone(), entry_id));
+    }
+
+    let entry_ids = requested
+        .iter()
+        .map(|(_, entry_id)| *entry_id)
+        .collect::<Vec<_>>();
+    let now_ms = unix_millis();
+    let candidates_by_entry_id = db
+        .cleanup_file_records_by_ids(scan_run_id, &entry_ids)?
+        .into_iter()
+        .filter_map(|record| cleanup_candidate(scan_run_id, record, now_ms))
+        .map(|candidate| (candidate.entry_id, candidate))
+        .collect::<HashMap<_, _>>();
+
+    let mut resolved = Vec::new();
+    for (candidate_id, entry_id) in requested {
+        let Some(candidate) = candidates_by_entry_id.get(&entry_id) else {
+            anyhow::bail!("cleanup candidate {candidate_id} is no longer available");
+        };
+        resolved.push(candidate.clone());
+    }
+
+    Ok(resolved)
+}
+
+fn cleanup_entry_id_from_candidate_id(scan_run_id: i64, candidate_id: &str) -> anyhow::Result<i64> {
+    let prefix = format!("scan-{scan_run_id}:entry-");
+    let Some(raw_entry_id) = candidate_id.strip_prefix(&prefix) else {
+        anyhow::bail!("cleanup candidate {candidate_id} is no longer available");
+    };
+    let entry_id = raw_entry_id.parse::<i64>().ok().filter(|value| *value > 0);
+    entry_id
+        .ok_or_else(|| anyhow::anyhow!("cleanup candidate {candidate_id} is no longer available"))
 }
 
 pub fn validate_cleanup_target(candidate: &CleanupCandidate) -> anyhow::Result<PathBuf> {
@@ -422,6 +499,10 @@ pub fn recycle_file(path: &Path) -> anyhow::Result<()> {
     move_to_recycle_bin(path)
 }
 
+pub fn recycle_files(paths: &[PathBuf]) -> Vec<anyhow::Result<()>> {
+    move_to_recycle_bin_batch(paths)
+}
+
 #[cfg(windows)]
 fn move_to_recycle_bin(path: &Path) -> anyhow::Result<()> {
     let canonical = std::fs::canonicalize(path)
@@ -444,9 +525,77 @@ fn move_to_recycle_bin(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn run_recycle_operation_on_worker<F>(operation: F) -> anyhow::Result<()>
+fn move_to_recycle_bin_batch(paths: &[PathBuf]) -> Vec<anyhow::Result<()>> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    let canonical_results = paths
+        .iter()
+        .map(|path| {
+            let canonical = std::fs::canonicalize(path)
+                .map_err(|error| format!("cannot recycle {}: {error}", path.display()))?;
+            if !canonical.is_file() {
+                return Err(format!(
+                    "cleanup only recycles files in this version: {}",
+                    path.display()
+                ));
+            }
+            Ok(canonical)
+        })
+        .collect::<Vec<Result<PathBuf, String>>>();
+    let valid_paths = canonical_results
+        .iter()
+        .filter_map(|result| result.as_ref().ok().cloned())
+        .collect::<Vec<_>>();
+
+    let mut valid_results = if valid_paths.is_empty() {
+        Vec::new().into_iter()
+    } else {
+        match run_recycle_operation_on_worker(move || {
+            Ok(valid_paths
+                .into_iter()
+                .map(|canonical| {
+                    trash::delete(&canonical).map_err(|error| {
+                        format!(
+                            "failed to move {} to the Windows Recycle Bin: {error}",
+                            canonical.display()
+                        )
+                    })
+                })
+                .collect::<Vec<Result<(), String>>>())
+        }) {
+            Ok(results) => results.into_iter(),
+            Err(error) => {
+                let message = error.to_string();
+                return canonical_results
+                    .into_iter()
+                    .map(|result| match result {
+                        Ok(_) => Err(anyhow::anyhow!(message.clone())),
+                        Err(error) => Err(anyhow::anyhow!(error)),
+                    })
+                    .collect();
+            }
+        }
+    };
+
+    canonical_results
+        .into_iter()
+        .map(|result| match result {
+            Ok(_) => valid_results
+                .next()
+                .unwrap_or_else(|| Err("Recycle Bin worker did not return a result".to_string()))
+                .map_err(anyhow::Error::msg),
+            Err(error) => Err(anyhow::anyhow!(error)),
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn run_recycle_operation_on_worker<F, T>(operation: F) -> anyhow::Result<T>
 where
-    F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
 {
     let worker = std::thread::Builder::new()
         .name("winclean-recycle-bin".to_string())
@@ -473,6 +622,11 @@ fn move_to_recycle_bin(path: &Path) -> anyhow::Result<()> {
         "Recycle Bin cleanup is only available on Windows in this build: {}",
         path.display()
     )
+}
+
+#[cfg(not(windows))]
+fn move_to_recycle_bin_batch(paths: &[PathBuf]) -> Vec<anyhow::Result<()>> {
+    paths.iter().map(|path| move_to_recycle_bin(path)).collect()
 }
 
 fn unix_millis() -> i64 {
@@ -593,12 +747,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cleanup_execution_resolves_selected_candidates_beyond_plan_preview_limit() {
+        let temp = safe_tempdir();
+        let root = temp.path().join("fixture");
+        fs::create_dir_all(&root).expect("fixture dir");
+        let old_modified = current_test_millis() - hours_ms(25);
+
+        let db_path = temp.path().join("index.sqlite3");
+        let db = Database::open(&db_path).expect("open db");
+        db.migrate().expect("migrate db");
+        let run_id = db
+            .create_scan_run(
+                root.to_string_lossy().as_ref(),
+                Some("NTFS"),
+                ScanMode::Recursive,
+                None,
+                None,
+                100,
+            )
+            .expect("create scan run");
+        let mut entries = Vec::new();
+        for index in 0..501 {
+            let candidate_path = root.join(format!("cache-{index:03}.tmp"));
+            fs::write(&candidate_path, vec![1_u8; 10]).expect("tmp file");
+            set_modified_time(&candidate_path, old_modified);
+            entries.push(cleanup_indexed_entry(
+                &candidate_path.to_string_lossy(),
+                10,
+                Some(old_modified),
+            ));
+        }
+        db.insert_file_entries(run_id, &entries)
+            .expect("insert file entries");
+        let hidden_candidate_id = cleanup_candidate_id(run_id, 501);
+        let recycler = RecordingRecycler::default();
+
+        let result = execute_cleanup_plan_with_recycler(
+            &db,
+            run_id,
+            std::slice::from_ref(&hidden_candidate_id),
+            &recycler,
+        )
+        .expect("cleanup execution");
+
+        assert_eq!(result.recycled_count, 1);
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(recycler.recycled_paths().len(), 1);
+        assert!(recycler.recycled_paths()[0].ends_with("cache-500.tmp"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn recycle_worker_returns_operation_errors() {
-        let error =
-            super::run_recycle_operation_on_worker(|| anyhow::bail!("simulated recycle failure"))
-                .expect_err("worker should return operation errors");
+        let error = super::run_recycle_operation_on_worker::<_, ()>(|| {
+            anyhow::bail!("simulated recycle failure")
+        })
+        .expect_err("worker should return operation errors");
 
         assert!(error.to_string().contains("simulated recycle failure"));
     }

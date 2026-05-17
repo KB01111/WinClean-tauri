@@ -11,6 +11,7 @@ const LARGE_FILE_BYTES: u64 = 100 * 1024 * 1024;
 const LARGE_INSTALLER_OR_ARCHIVE_BYTES: u64 = 50 * 1024 * 1024;
 const DUPLICATE_REVIEW_BYTES: u64 = 10 * 1024 * 1024;
 const OLD_DOWNLOAD_DAYS: u64 = 30;
+const MAX_RECOMMENDATION_WINDOW: usize = 1_000;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,11 +119,11 @@ pub fn build_recommendations(
     let review_bytes = sum_kind(&candidates, RecommendationKind::Review);
     let total_candidate_count = candidates.len() as u64;
     let offset = filters.offset.unwrap_or(0) as usize;
-    let limit = filters.limit.map(|value| value.clamp(1, 1_000) as usize);
-    let candidates = match limit {
-        Some(limit) => candidates.into_iter().skip(offset).take(limit).collect(),
-        None => candidates.into_iter().skip(offset).collect(),
-    };
+    let limit = filters
+        .limit
+        .map(|value| value.clamp(1, MAX_RECOMMENDATION_WINDOW as u32) as usize)
+        .unwrap_or(MAX_RECOMMENDATION_WINDOW);
+    let candidates = candidates.into_iter().skip(offset).take(limit).collect();
 
     Ok(RecommendationPlan {
         scan_run_id,

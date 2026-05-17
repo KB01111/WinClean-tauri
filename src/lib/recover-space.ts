@@ -51,6 +51,11 @@ export type RecoverCandidateWindow<T> = {
   totalCount: number
 }
 
+export type OffloadItemLike = {
+  error?: string | null
+  status?: string | null
+}
+
 export function filterRecommendations<T extends RecoverCandidate>(
   candidates: readonly T[],
   mode: RecoverMode
@@ -121,6 +126,30 @@ export function visibleRecoverCandidateWindow<T>(
     rows,
     hiddenCount: Math.max(0, candidates.length - rows.length),
     totalCount: candidates.length,
+  }
+}
+
+export function visibleOffloadItemWindow<T extends OffloadItemLike>(
+  items: readonly T[],
+  maxRows: number
+): RecoverCandidateWindow<T> {
+  const rowLimit = Math.max(0, Math.floor(maxRows))
+  const attentionRows: T[] = []
+  const otherRows: T[] = []
+  for (const item of items) {
+    if (Boolean(item.error) || item.status === "failed") {
+      if (attentionRows.length < rowLimit) {
+        attentionRows.push(item)
+      }
+    } else if (otherRows.length < rowLimit) {
+      otherRows.push(item)
+    }
+  }
+  const rows = attentionRows.concat(otherRows).slice(0, rowLimit)
+  return {
+    rows,
+    hiddenCount: Math.max(0, items.length - rows.length),
+    totalCount: items.length,
   }
 }
 
