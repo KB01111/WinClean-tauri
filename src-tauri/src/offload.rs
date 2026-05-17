@@ -151,24 +151,28 @@ pub fn create_offload_job(
     let created_at_ms = unix_millis();
     let total_bytes = candidates.iter().map(|candidate| candidate.size).sum();
     let destination_label = batch_folder_name();
-    let job_id = db.create_offload_job(OffloadJobInsert {
-        scan_run_id,
-        status: "queued".to_string(),
-        destination_label,
-        total_items: candidates.len() as u64,
-        total_bytes,
-        created_at_ms,
-    })?;
-    for candidate in candidates {
-        db.insert_offload_item(OffloadItemInsert {
-            job_id,
+    let items = candidates
+        .iter()
+        .map(|candidate| OffloadItemInsert {
+            job_id: 0,
             entry_id: candidate.entry_id,
             candidate_id: candidate.id.clone(),
             source_path: candidate.path.clone(),
             size: candidate.size,
             created_at_ms,
-        })?;
-    }
+        })
+        .collect::<Vec<_>>();
+    let job_id = db.create_offload_job_with_items(
+        OffloadJobInsert {
+            scan_run_id,
+            status: "queued".to_string(),
+            destination_label,
+            total_items: candidates.len() as u64,
+            total_bytes,
+            created_at_ms,
+        },
+        &items,
+    )?;
     offload_status(db, job_id)
 }
 

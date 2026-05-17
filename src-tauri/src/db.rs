@@ -5,7 +5,9 @@ use std::{
 };
 
 use anyhow::Context;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, types::Value, Connection, OptionalExtension, TransactionBehavior,
+};
 use serde::Serialize;
 
 use crate::scan::{DirectoryRollup, IndexedEntry, ScanMode, ScanSummary};
@@ -432,6 +434,42 @@ impl Database {
         .context("finalize interrupted scan runs")
     }
 
+    pub fn finalize_interrupted_offload_jobs(&self) -> anyhow::Result<usize> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let interrupted_message = "Offload was interrupted before the app closed.";
+        let now_ms = unix_millis();
+        tx.execute(
+            r#"
+            UPDATE offload_items
+            SET status = 'failed',
+                error = COALESCE(error, ?1),
+                completed_at_ms = COALESCE(completed_at_ms, ?2)
+            WHERE job_id IN (
+                SELECT id FROM offload_jobs
+                WHERE status IN ('queued', 'running')
+            )
+              AND status IN ('queued', 'validating', 'uploading')
+            "#,
+            params![interrupted_message, now_ms],
+        )
+        .context("finalize interrupted offload items")?;
+        let finalized = tx
+            .execute(
+                r#"
+                UPDATE offload_jobs
+                SET status = 'failed',
+                    completed_at_ms = COALESCE(completed_at_ms, ?1),
+                    last_error = COALESCE(last_error, ?2)
+                WHERE status IN ('queued', 'running')
+                "#,
+                params![now_ms, interrupted_message],
+            )
+            .context("finalize interrupted offload jobs")?;
+        tx.commit()?;
+        Ok(finalized)
+    }
+
     pub fn finish_scan_run(
         &self,
         summary: &ScanSummary,
@@ -856,6 +894,59 @@ impl Database {
             .context("read cleanup candidate files")
     }
 
+    pub fn cleanup_file_records_by_ids(
+        &self,
+        run_id: i64,
+        entry_ids: &[i64],
+    ) -> anyhow::Result<Vec<CleanupFileRecord>> {
+        if entry_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = (0..entry_ids.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT id, path, name, extension, size, modified_at_ms,
+                   is_reparse_point, is_placeholder, is_system
+            FROM file_entries
+            WHERE scan_run_id = ?
+              AND id IN ({placeholders})
+              AND is_directory = 0
+              AND size > 0
+              AND is_reparse_point = 0
+              AND is_placeholder = 0
+              AND is_system = 0
+              AND (
+                  LOWER(COALESCE(extension, '')) IN ('tmp', 'temp', 'log', 'bak', 'old', 'dmp')
+                  OR LOWER(name) = 'thumbs.db'
+              )
+            "#
+        );
+        let mut values = Vec::with_capacity(entry_ids.len() + 1);
+        values.push(Value::Integer(run_id));
+        values.extend(entry_ids.iter().copied().map(Value::Integer));
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok(CleanupFileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                extension: row.get(3)?,
+                size: row.get::<_, i64>(4)? as u64,
+                modified_at_ms: row.get(5)?,
+                is_reparse_point: row.get::<_, bool>(6)?,
+                is_placeholder: row.get::<_, bool>(7)?,
+                is_system: row.get::<_, bool>(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read selected cleanup candidate files")
+    }
+
     pub fn recommendation_file_records(
         &self,
         run_id: i64,
@@ -1002,6 +1093,75 @@ impl Database {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn create_offload_job_with_items(
+        &self,
+        job: OffloadJobInsert,
+        items: &[OffloadItemInsert],
+    ) -> anyhow::Result<i64> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if matches!(job.status.as_str(), "queued" | "running") {
+            let active_count = tx.query_row(
+                "SELECT COUNT(*) FROM offload_jobs WHERE status IN ('queued', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if active_count > 0 {
+                anyhow::bail!(
+                    "Wait for the current offload batch to finish before starting another."
+                );
+            }
+        }
+        tx.execute(
+            r#"
+            INSERT INTO offload_jobs (
+                scan_run_id,
+                status,
+                destination_label,
+                total_items,
+                total_bytes,
+                created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                job.scan_run_id,
+                job.status,
+                job.destination_label,
+                job.total_items as i64,
+                job.total_bytes as i64,
+                job.created_at_ms
+            ],
+        )?;
+        let job_id = tx.last_insert_rowid();
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO offload_items (
+                    job_id,
+                    entry_id,
+                    candidate_id,
+                    source_path,
+                    size,
+                    status,
+                    created_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)
+                "#,
+            )?;
+            for item in items {
+                stmt.execute(params![
+                    job_id,
+                    item.entry_id,
+                    item.candidate_id,
+                    item.source_path,
+                    item.size as i64,
+                    item.created_at_ms
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(job_id)
     }
 
     pub fn insert_offload_item(&self, item: OffloadItemInsert) -> anyhow::Result<i64> {

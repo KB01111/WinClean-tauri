@@ -34,6 +34,28 @@ export type OffloadProgressInput = {
   status: string
 }
 
+export type RecoverCandidateSummary = {
+  cleanBytes: number
+  cleanCount: number
+  offloadBytes: number
+  offloadCount: number
+  reviewBytes: number
+  reviewCount: number
+  totalBytes: number
+  totalCount: number
+}
+
+export type RecoverCandidateWindow<T> = {
+  rows: T[]
+  hiddenCount: number
+  totalCount: number
+}
+
+export type OffloadItemLike = {
+  error?: string | null
+  status?: string | null
+}
+
 export function filterRecommendations<T extends RecoverCandidate>(
   candidates: readonly T[],
   mode: RecoverMode
@@ -60,6 +82,75 @@ export function selectedVisibleCandidateIds<T extends RecoverCandidate>(
   return candidates
     .filter((candidate) => selectedIds.has(candidate.id))
     .map((candidate) => candidate.id)
+}
+
+export function summarizeRecoverCandidates(
+  candidates: readonly RecoverCandidate[]
+): RecoverCandidateSummary {
+  return candidates.reduce<RecoverCandidateSummary>(
+    (summary, candidate) => {
+      summary.totalBytes += candidate.size
+      summary.totalCount += 1
+      if (candidate.kind === "clean") {
+        summary.cleanBytes += candidate.size
+        summary.cleanCount += 1
+      } else if (candidate.kind === "offload") {
+        summary.offloadBytes += candidate.size
+        summary.offloadCount += 1
+      } else {
+        summary.reviewBytes += candidate.size
+        summary.reviewCount += 1
+      }
+      return summary
+    },
+    {
+      cleanBytes: 0,
+      cleanCount: 0,
+      offloadBytes: 0,
+      offloadCount: 0,
+      reviewBytes: 0,
+      reviewCount: 0,
+      totalBytes: 0,
+      totalCount: 0,
+    }
+  )
+}
+
+export function visibleRecoverCandidateWindow<T>(
+  candidates: readonly T[],
+  maxRows: number
+): RecoverCandidateWindow<T> {
+  const rowLimit = Math.max(0, Math.floor(maxRows))
+  const rows = candidates.slice(0, rowLimit)
+  return {
+    rows,
+    hiddenCount: Math.max(0, candidates.length - rows.length),
+    totalCount: candidates.length,
+  }
+}
+
+export function visibleOffloadItemWindow<T extends OffloadItemLike>(
+  items: readonly T[],
+  maxRows: number
+): RecoverCandidateWindow<T> {
+  const rowLimit = Math.max(0, Math.floor(maxRows))
+  const attentionRows: T[] = []
+  const otherRows: T[] = []
+  for (const item of items) {
+    if (Boolean(item.error) || item.status === "failed") {
+      if (attentionRows.length < rowLimit) {
+        attentionRows.push(item)
+      }
+    } else if (otherRows.length < rowLimit) {
+      otherRows.push(item)
+    }
+  }
+  const rows = attentionRows.concat(otherRows).slice(0, rowLimit)
+  return {
+    rows,
+    hiddenCount: Math.max(0, items.length - rows.length),
+    totalCount: items.length,
+  }
 }
 
 export function getOffloadActionState({
