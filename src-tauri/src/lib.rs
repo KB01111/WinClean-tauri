@@ -18,6 +18,7 @@ pub fn run() {
             let database = db::Database::open(app_data_dir.join("winclean.sqlite3"))?;
             database.migrate()?;
             database.finalize_interrupted_scan_runs()?;
+            database.finalize_interrupted_offload_jobs()?;
             app.manage(commands::AppState::new(database, app_data_dir));
             Ok(())
         })

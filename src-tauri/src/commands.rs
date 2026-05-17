@@ -325,6 +325,11 @@ pub fn start_offload(
     if candidate_ids.is_empty() {
         return Err("Select at least one offload candidate.".to_string());
     }
+    if state.db.pending_offload_count().map_err(to_command_error)? > 0 {
+        return Err(
+            "Wait for the current offload batch to finish before starting another.".to_string(),
+        );
+    }
     let plan = build_recommendations(&state.db, run_id, RecommendationFilters::default())
         .map_err(to_command_error)?;
     let candidates = resolve_offload_recommendation_candidates(&plan.candidates, &candidate_ids)
@@ -347,8 +352,18 @@ pub fn start_offload(
     let cancels = Arc::clone(&state.offload_cancels);
     let job_id = initial.id;
     thread::spawn(move || {
-        let _ =
-            process_offload_job_with_client(&db, job_id, candidates, &drive, &recycler, &cancel);
+        if let Err(error) =
+            process_offload_job_with_client(&db, job_id, candidates, &drive, &recycler, &cancel)
+        {
+            let _ = db.update_offload_job(
+                job_id,
+                "failed",
+                None,
+                None,
+                Some(unix_millis()),
+                Some(&error.to_string()),
+            );
+        }
         if let Ok(mut cancels) = cancels.lock() {
             cancels.remove(&job_id);
         }
@@ -473,6 +488,13 @@ fn resolve_run_id(db: &Database, run_id: Option<i64>) -> Result<Option<i64>, Str
 
 fn to_command_error(error: anyhow::Error) -> String {
     error.to_string()
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 #[cfg(windows)]

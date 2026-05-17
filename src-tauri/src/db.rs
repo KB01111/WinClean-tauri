@@ -432,6 +432,41 @@ impl Database {
         .context("finalize interrupted scan runs")
     }
 
+    pub fn finalize_interrupted_offload_jobs(&self) -> anyhow::Result<usize> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let interrupted_message = "Offload was interrupted before the app closed.";
+        let finalized = tx
+            .execute(
+                r#"
+                UPDATE offload_jobs
+                SET status = 'failed',
+                    completed_at_ms = COALESCE(completed_at_ms, ?1),
+                    last_error = COALESCE(last_error, ?2)
+                WHERE status IN ('queued', 'running')
+                "#,
+                params![unix_millis(), interrupted_message],
+            )
+            .context("finalize interrupted offload jobs")?;
+        tx.execute(
+            r#"
+            UPDATE offload_items
+            SET status = 'failed',
+                error = COALESCE(error, ?1),
+                completed_at_ms = COALESCE(completed_at_ms, ?2)
+            WHERE job_id IN (
+                SELECT id FROM offload_jobs
+                WHERE status = 'failed' AND last_error = ?1
+            )
+              AND status IN ('queued', 'validating', 'uploading')
+            "#,
+            params![interrupted_message, unix_millis()],
+        )
+        .context("finalize interrupted offload items")?;
+        tx.commit()?;
+        Ok(finalized)
+    }
+
     pub fn finish_scan_run(
         &self,
         summary: &ScanSummary,
@@ -1002,6 +1037,63 @@ impl Database {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn create_offload_job_with_items(
+        &self,
+        job: OffloadJobInsert,
+        items: &[OffloadItemInsert],
+    ) -> anyhow::Result<i64> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO offload_jobs (
+                scan_run_id,
+                status,
+                destination_label,
+                total_items,
+                total_bytes,
+                created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                job.scan_run_id,
+                job.status,
+                job.destination_label,
+                job.total_items as i64,
+                job.total_bytes as i64,
+                job.created_at_ms
+            ],
+        )?;
+        let job_id = tx.last_insert_rowid();
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO offload_items (
+                    job_id,
+                    entry_id,
+                    candidate_id,
+                    source_path,
+                    size,
+                    status,
+                    created_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)
+                "#,
+            )?;
+            for item in items {
+                stmt.execute(params![
+                    job_id,
+                    item.entry_id,
+                    item.candidate_id,
+                    item.source_path,
+                    item.size as i64,
+                    item.created_at_ms
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(job_id)
     }
 
     pub fn insert_offload_item(&self, item: OffloadItemInsert) -> anyhow::Result<i64> {

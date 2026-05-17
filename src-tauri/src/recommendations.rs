@@ -18,6 +18,8 @@ pub struct RecommendationFilters {
     pub mode: Option<String>,
     pub min_size: Option<u64>,
     pub only_offload_eligible: Option<bool>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -25,6 +27,7 @@ pub struct RecommendationFilters {
 pub struct RecommendationPlan {
     pub scan_run_id: i64,
     pub candidates: Vec<RecommendationCandidate>,
+    pub total_candidate_count: u64,
     pub clean_bytes: u64,
     pub offload_bytes: u64,
     pub review_bytes: u64,
@@ -113,10 +116,18 @@ pub fn build_recommendations(
     let clean_bytes = sum_kind(&candidates, RecommendationKind::Clean);
     let offload_bytes = sum_kind(&candidates, RecommendationKind::Offload);
     let review_bytes = sum_kind(&candidates, RecommendationKind::Review);
+    let total_candidate_count = candidates.len() as u64;
+    let offset = filters.offset.unwrap_or(0) as usize;
+    let limit = filters.limit.map(|value| value.clamp(1, 1_000) as usize);
+    let candidates = match limit {
+        Some(limit) => candidates.into_iter().skip(offset).take(limit).collect(),
+        None => candidates.into_iter().skip(offset).collect(),
+    };
 
     Ok(RecommendationPlan {
         scan_run_id,
         candidates,
+        total_candidate_count,
         clean_bytes,
         offload_bytes,
         review_bytes,

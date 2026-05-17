@@ -22,7 +22,6 @@ import {
   UploadCloud,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { invoke } from "@tauri-apps/api/core"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -45,12 +44,16 @@ import {
   shouldRefreshDashboardCollectionsForProgress,
   shouldRefreshRunDataForProgress,
 } from "@/lib/scan-refresh"
+import { invokeWinClean } from "@/lib/tauri-api"
 import {
   getVisibleRecoverCandidates,
   getOffloadActionState,
   getOffloadProgress,
   selectedVisibleCandidateIds,
+  summarizeRecoverCandidates,
+  visibleRecoverCandidateWindow,
   type RecoverMode,
+  type RecoverCandidateSummary,
 } from "@/lib/recover-space"
 import { selectDefaultScanRoot } from "@/lib/volume-selection"
 
@@ -194,6 +197,7 @@ type RecommendationCandidate = {
 type RecommendationPlan = {
   scanRunId: number
   candidates: RecommendationCandidate[]
+  totalCandidateCount: number
   cleanBytes: number
   offloadBytes: number
   reviewBytes: number
@@ -286,6 +290,7 @@ const emptyProgress: ScanProgress = {
   skippedReparseCount: 0,
   errorCount: 0,
 }
+const MAX_RECOVER_CANDIDATE_ROWS = 300
 
 function App() {
   const [view, setView] = useState<View>("overview")
@@ -300,6 +305,7 @@ function App() {
   )
   const [currentDirectory, setCurrentDirectory] = useState<string | null>(null)
   const [files, setFiles] = useState<FileSearchResult[]>([])
+  const [largestFiles, setLargestFiles] = useState<FileSearchResult[]>([])
   const [fileQuery, setFileQuery] = useState("")
   const [extensionFilter, setExtensionFilter] = useState("")
   const [minSizeMbFilter, setMinSizeMbFilter] = useState("")
@@ -363,14 +369,23 @@ function App() {
       executableCleanIds
     )
   }, [executableCleanIds, recommendationPlan, recoverMode])
+  const recoverSummary = useMemo(
+    () => summarizeRecoverCandidates(recommendationPlan?.candidates ?? []),
+    [recommendationPlan]
+  )
+  const recoverCandidateWindow = useMemo(
+    () =>
+      visibleRecoverCandidateWindow(
+        visibleRecommendations,
+        MAX_RECOVER_CANDIDATE_ROWS
+      ),
+    [visibleRecommendations]
+  )
   const selectedRecommendationBytes = useMemo(() => {
-    if (!recommendationPlan) {
-      return 0
-    }
-    return recommendationPlan.candidates
+    return visibleRecommendations
       .filter((candidate) => selectedCleanupIds.has(candidate.id))
       .reduce((sum, candidate) => sum + candidate.size, 0)
-  }, [recommendationPlan, selectedCleanupIds])
+  }, [selectedCleanupIds, visibleRecommendations])
   const selectedVisibleCount = useMemo(
     () =>
       visibleRecommendations.filter((candidate) =>
@@ -408,6 +423,7 @@ function App() {
         setTopDirectories([])
         setDirectoryChildren([])
         setFiles([])
+        setLargestFiles([])
         setExtensions([])
         setCategories([])
         setCleanupPlan(null)
@@ -428,39 +444,47 @@ function App() {
           top,
           children,
           foundFiles,
+          topFiles,
           extensionRows,
           categoryRows,
           plan,
           recommendations,
         ] = await Promise.all([
-          invoke<TopDirectory[]>("top_directories", {
+          invokeWinClean<TopDirectory[]>("top_directories", {
             runId: resolvedRunId,
             limit: 25,
           }),
-          invoke<DirectoryChild[]>("directory_children", {
+          invokeWinClean<DirectoryChild[]>("directory_children", {
             runId: resolvedRunId,
             parentPath: parentPath ?? null,
             limit: 250,
           }),
-          invoke<FileSearchResult[]>("file_search", {
+          invokeWinClean<FileSearchResult[]>("file_search", {
             runId: resolvedRunId,
             query: fileQuery || null,
             extension: extensionFilter || null,
             minSize,
             limit: 100,
           }),
-          invoke<ExtensionSummary[]>("extension_summary", {
+          invokeWinClean<FileSearchResult[]>("file_search", {
+            runId: resolvedRunId,
+            query: null,
+            extension: null,
+            minSize: null,
+            limit: 25,
+          }),
+          invokeWinClean<ExtensionSummary[]>("extension_summary", {
             runId: resolvedRunId,
             limit: 20,
           }),
-          invoke<CategorySummary[]>("category_summary", {
+          invokeWinClean<CategorySummary[]>("category_summary", {
             runId: resolvedRunId,
           }),
-          invoke<CleanupPlan | null>("cleanup_plan", {
+          invokeWinClean<CleanupPlan | null>("cleanup_plan", {
             runId: resolvedRunId,
             limit: 100,
           }),
-          invoke<RecommendationPlan | null>("recommendations", {
+          invokeWinClean<RecommendationPlan | null>("recommendations", {
             runId: resolvedRunId,
             filters: null,
           }),
@@ -477,6 +501,7 @@ function App() {
         setTopDirectories(top)
         setDirectoryChildren(children)
         setFiles(foundFiles)
+        setLargestFiles(topFiles)
         setExtensions(extensionRows)
         setCategories(categoryRows)
         const previousPlanRunId = cleanupPlanRunId.current
@@ -533,11 +558,11 @@ function App() {
       try {
         const [nextProgress, runs, historyRows, nextHealth, nextDriveStatus] =
           await Promise.all([
-            invoke<ScanProgress>("scan_status"),
-            invoke<ScanRunRecord[]>("scan_runs", { limit: 30 }),
-            invoke<CleanupActionRecord[]>("cleanup_history", { limit: 50 }),
-            invoke<AppHealth>("app_health"),
-            invoke<GoogleDriveStatus>("google_drive_status"),
+            invokeWinClean<ScanProgress>("scan_status"),
+            invokeWinClean<ScanRunRecord[]>("scan_runs", { limit: 30 }),
+            invokeWinClean<CleanupActionRecord[]>("cleanup_history", { limit: 50 }),
+            invokeWinClean<AppHealth>("app_health"),
+            invokeWinClean<GoogleDriveStatus>("google_drive_status"),
           ])
         setProgress(nextProgress)
         setScanRuns(runs)
@@ -588,7 +613,7 @@ function App() {
     }
     scanStatusRefreshInFlight.current = true
     try {
-      const nextProgress = await invoke<ScanProgress>("scan_status")
+      const nextProgress = await invokeWinClean<ScanProgress>("scan_status")
       setProgress(nextProgress)
       if (shouldRefreshDashboardCollectionsForProgress(nextProgress)) {
         await refreshDashboard()
@@ -603,7 +628,7 @@ function App() {
   const refreshVolumes = useCallback(async () => {
     setLoadingVolumes(true)
     try {
-      const nextVolumes = await invoke<VolumeInfo[]>("list_volumes")
+      const nextVolumes = await invokeWinClean<VolumeInfo[]>("list_volumes")
       setVolumes(nextVolumes)
       setSelectedRoot((current) => selectDefaultScanRoot(nextVolumes, current))
     } catch (error) {
@@ -638,7 +663,7 @@ function App() {
     }
     const timer = window.setInterval(async () => {
       try {
-        const nextJob = await invoke<OffloadJobStatus>("offload_status", {
+        const nextJob = await invokeWinClean<OffloadJobStatus>("offload_status", {
           jobId: activeOffloadJob.id,
         })
         setActiveOffloadJob(nextJob)
@@ -690,7 +715,7 @@ function App() {
     setSelectedRunId(null)
     setCurrentDirectory(selectedVolume.rootPath)
     try {
-      const nextProgress = await invoke<ScanProgress>("start_scan", {
+      const nextProgress = await invokeWinClean<ScanProgress>("start_scan", {
         rootPath: selectedVolume.rootPath,
         fileSystem: selectedVolume.fileSystem ?? null,
       })
@@ -711,7 +736,7 @@ function App() {
     }
     setCancelPending(true)
     try {
-      setProgress(await invoke<ScanProgress>("cancel_scan"))
+      setProgress(await invokeWinClean<ScanProgress>("cancel_scan"))
       await refreshDashboard()
     } catch (error) {
       setMessage(formatError(error))
@@ -754,7 +779,7 @@ function App() {
     }
     setCleanupPending(true)
     try {
-      const result = await invoke<{
+      const result = await invokeWinClean<{
         recycledCount: number
         failedCount: number
         skippedCount: number
@@ -777,7 +802,7 @@ function App() {
   async function connectGoogleDrive() {
     try {
       setMessage("Opening Google Drive sign-in...")
-      const status = await invoke<GoogleDriveStatus>("begin_google_drive_auth")
+      const status = await invokeWinClean<GoogleDriveStatus>("begin_google_drive_auth")
       setDriveStatus(status)
       setMessage(
         status.connected
@@ -792,7 +817,7 @@ function App() {
 
   async function disconnectGoogleDrive() {
     try {
-      const status = await invoke<GoogleDriveStatus>("disconnect_google_drive")
+      const status = await invokeWinClean<GoogleDriveStatus>("disconnect_google_drive")
       setDriveStatus(status)
       setMessage("Google Drive disconnected.")
       await refreshDashboard()
@@ -813,7 +838,7 @@ function App() {
       return
     }
     try {
-      const job = await invoke<OffloadJobStatus>("start_offload", {
+      const job = await invokeWinClean<OffloadJobStatus>("start_offload", {
         runId: recommendationPlan.scanRunId,
         candidateIds,
       })
@@ -829,7 +854,7 @@ function App() {
       return
     }
     try {
-      const job = await invoke<OffloadJobStatus>("cancel_offload", {
+      const job = await invokeWinClean<OffloadJobStatus>("cancel_offload", {
         jobId: activeOffloadJob.id,
       })
       setActiveOffloadJob(job)
@@ -841,7 +866,7 @@ function App() {
 
   async function openRecycleBin() {
     try {
-      await invoke("open_recycle_bin")
+      await invokeWinClean("open_recycle_bin")
       setMessage("Windows Recycle Bin opened.")
     } catch (error) {
       setMessage(formatError(error))
@@ -854,7 +879,7 @@ function App() {
     }
     setReportPending(true)
     try {
-      const artifact = await invoke<ExportArtifact | null>("export_report", {
+      const artifact = await invokeWinClean<ExportArtifact | null>("export_report", {
         runId: activeRun?.id ?? null,
       })
       if (artifact) {
@@ -873,7 +898,7 @@ function App() {
     }
     setDiagnosticsPending(true)
     try {
-      const artifact = await invoke<ExportArtifact>("export_diagnostics")
+      const artifact = await invokeWinClean<ExportArtifact>("export_diagnostics")
       setMessage(`Diagnostics exported to ${artifact.path}`)
     } catch (error) {
       setMessage(formatError(error))
@@ -888,7 +913,7 @@ function App() {
     }
     setHistoryPending(true)
     try {
-      const deleted = await invoke<boolean>("delete_scan_run", { runId })
+      const deleted = await invokeWinClean<boolean>("delete_scan_run", { runId })
       if (deleted) {
         if (selectedRunId === runId) {
           setSelectedRunId(null)
@@ -911,7 +936,7 @@ function App() {
     }
     setHistoryPending(true)
     try {
-      const deletedCount = await invoke<number>("clear_scan_history")
+      const deletedCount = await invokeWinClean<number>("clear_scan_history")
       setSelectedRunId(null)
       setCurrentDirectory(null)
       lastRunDataRefreshKey.current = null
@@ -1088,7 +1113,7 @@ function App() {
               scanRuns={scanRuns}
               activeRun={activeRun}
               topDirectories={topDirectories}
-              topFiles={files}
+              topFiles={largestFiles}
               categories={categories}
               extensions={extensions}
               recommendationPlan={recommendationPlan}
@@ -1118,7 +1143,9 @@ function App() {
           {view === "cleanup" && (
             <RecoverSpaceView
               recommendationPlan={recommendationPlan}
-              visibleRecommendations={visibleRecommendations}
+              recoverSummary={recoverSummary}
+              visibleRecommendations={recoverCandidateWindow.rows}
+              hiddenCandidateCount={recoverCandidateWindow.hiddenCount}
               recoverMode={recoverMode}
               onRecoverModeChange={(mode) => {
                 setRecoverMode(mode)
@@ -1126,6 +1153,10 @@ function App() {
               }}
               selectedCleanupIds={selectedCleanupIds}
               selectedRecommendationBytes={selectedRecommendationBytes}
+              topDirectories={topDirectories}
+              topFiles={largestFiles}
+              categories={categories}
+              extensions={extensions}
               cleanupPending={cleanupPending}
               isScanning={isScanning}
               driveStatus={driveStatus}
@@ -1504,11 +1535,17 @@ function ExplorerView({
 
 function RecoverSpaceView({
   recommendationPlan,
+  recoverSummary,
   visibleRecommendations,
+  hiddenCandidateCount,
   recoverMode,
   onRecoverModeChange,
   selectedCleanupIds,
   selectedRecommendationBytes,
+  topDirectories,
+  topFiles,
+  categories,
+  extensions,
   cleanupPending,
   isScanning,
   driveStatus,
@@ -1522,11 +1559,17 @@ function RecoverSpaceView({
   onCancelOffload,
 }: {
   recommendationPlan: RecommendationPlan | null
+  recoverSummary: RecoverCandidateSummary
   visibleRecommendations: RecommendationCandidate[]
+  hiddenCandidateCount: number
   recoverMode: RecoverMode
   onRecoverModeChange: (mode: RecoverMode) => void
   selectedCleanupIds: Set<string>
   selectedRecommendationBytes: number
+  topDirectories: TopDirectory[]
+  topFiles: FileSearchResult[]
+  categories: CategorySummary[]
+  extensions: ExtensionSummary[]
   cleanupPending: boolean
   isScanning: boolean
   driveStatus: GoogleDriveStatus | null
@@ -1570,20 +1613,80 @@ function RecoverSpaceView({
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-3 md:grid-cols-3">
+      <div className="grid gap-3 md:grid-cols-4">
         <Metric
-          label="Clean"
-          value={formatBytes(recommendationPlan?.cleanBytes ?? 0)}
+          label={`Clean (${formatNumber(recoverSummary.cleanCount)})`}
+          value={formatBytes(recoverSummary.cleanBytes)}
         />
         <Metric
-          label="Offload"
-          value={formatBytes(recommendationPlan?.offloadBytes ?? 0)}
+          label={`Offload (${formatNumber(recoverSummary.offloadCount)})`}
+          value={formatBytes(recoverSummary.offloadBytes)}
+        />
+        <Metric
+          label={`Review (${formatNumber(recoverSummary.reviewCount)})`}
+          value={formatBytes(recoverSummary.reviewBytes)}
         />
         <Metric
           label="Selected"
           value={formatBytes(selectedRecommendationBytes)}
         />
       </div>
+
+      <Panel title="Space usage">
+        <div className="grid gap-4 xl:grid-cols-2">
+          <div>
+            <h3 className="mb-2 text-sm font-semibold text-[#253128]">
+              Largest directories
+            </h3>
+            <DataTable
+              headers={["Path", "Size", "Files"]}
+              empty="No directory data yet"
+              rows={topDirectories.slice(0, 8).map((directory) => [
+                directory.path,
+                formatBytes(directory.totalSize),
+                formatNumber(directory.fileCount),
+              ])}
+            />
+          </div>
+          <div>
+            <h3 className="mb-2 text-sm font-semibold text-[#253128]">
+              Largest files
+            </h3>
+            <DataTable
+              headers={["File", "Size", "Modified"]}
+              empty="No file data yet"
+              rows={topFiles.slice(0, 8).map((file) => [
+                file.path,
+                formatBytes(file.size),
+                formatDateTime(file.modifiedAtMs),
+              ])}
+            />
+          </div>
+          <div>
+            <h3 className="mb-2 text-sm font-semibold text-[#253128]">
+              File mix
+            </h3>
+            <SummaryList
+              rows={categories
+                .slice(0, 8)
+                .map((row) => [row.category, formatBytes(row.totalSize)])}
+            />
+          </div>
+          <div>
+            <h3 className="mb-2 text-sm font-semibold text-[#253128]">
+              Top extensions
+            </h3>
+            <SummaryList
+              rows={extensions
+                .slice(0, 8)
+                .map((row) => [
+                  row.extension ? `.${row.extension}` : "No extension",
+                  formatBytes(row.totalSize),
+                ])}
+            />
+          </div>
+        </div>
+      </Panel>
 
       <Panel
         title="Recover Space"
@@ -1597,7 +1700,9 @@ function RecoverSpaceView({
                 }
               >
                 <Cloud className="size-4" aria-hidden="true" />
-                {driveStatus?.connected ? "Disconnect Drive" : "Connect Drive"}
+                {driveStatus?.connected
+                  ? "Disconnect Drive"
+                  : "Sign in with Google"}
               </Button>
             )}
             {primaryAction}
@@ -1658,6 +1763,29 @@ function RecoverSpaceView({
                 </button>
               ) : null}
             </div>
+            {activeOffloadJob.items.length > 0 ? (
+              <div className="mt-3 max-h-52 overflow-auto border-t border-[#edf0ea] pt-2">
+                {activeOffloadJob.items.map((item) => (
+                  <div
+                    key={item.id}
+                    className="grid grid-cols-[1fr_110px_110px] gap-3 py-1.5 text-xs text-[#596259]"
+                  >
+                    <span className="truncate" title={item.sourcePath}>
+                      {item.sourcePath}
+                    </span>
+                    <span>{item.recycleStatus ?? item.status}</span>
+                    <span className="text-right tabular-nums">
+                      {formatBytes(item.uploadedBytes)}
+                    </span>
+                    {item.error ? (
+                      <span className="col-span-3 text-[#8d2f24]">
+                        {item.error}
+                      </span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </div>
         ) : null}
         <div className="mt-3 max-h-[560px] overflow-auto">
@@ -1692,6 +1820,16 @@ function RecoverSpaceView({
             ))
           )}
         </div>
+        {hiddenCandidateCount > 0 ? (
+          <Notice
+            tone="info"
+            text={`Showing the first ${formatNumber(
+              visibleRecommendations.length
+            )} candidates in this mode; ${formatNumber(
+              hiddenCandidateCount
+            )} more are available in the scan data.`}
+          />
+        ) : null}
       </Panel>
     </div>
   )

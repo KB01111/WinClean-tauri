@@ -1207,6 +1207,199 @@ fn clear_scan_history_keeps_running_scans() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn cleanup_execution_recycles_temp_file_without_crashing_backend() {
+    let temp = tempfile::Builder::new()
+        .prefix("winclean-recycle-")
+        .tempdir_in("C:\\tmp")
+        .expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let candidate_path = root.join("old-cache.tmp");
+    fs::write(&candidate_path, vec![1_u8; 20]).expect("tmp file");
+    set_modified_time(&candidate_path, current_test_millis() - hours_ms(25));
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let plan = build_cleanup_plan(&db, summary.run_id, 50).expect("cleanup plan");
+    let candidate_id = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path.ends_with("old-cache.tmp"))
+        .expect("tmp candidate")
+        .id
+        .clone();
+
+    let result =
+        execute_cleanup_plan(&db, summary.run_id, &[candidate_id]).expect("cleanup execution");
+
+    assert_eq!(result.recycled_count, 1);
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(result.skipped_count, 0);
+    assert!(!candidate_path.exists());
+}
+
+#[test]
+fn recommendations_support_mode_filtering_and_windowed_results() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run(
+            "C:\\Data",
+            Some("NTFS"),
+            ScanMode::Recursive,
+            None,
+            None,
+            100,
+        )
+        .expect("create scan run");
+    let old_modified = current_test_millis() - hours_ms(25);
+    let entries = (0..5)
+        .map(|index| {
+            cleanup_indexed_entry(
+                &format!("C:\\Data\\cache-{index}.tmp"),
+                10,
+                Some(old_modified),
+            )
+        })
+        .collect::<Vec<_>>();
+    db.insert_file_entries(run_id, &entries)
+        .expect("insert file entries");
+
+    let first_page = build_recommendations(
+        &db,
+        run_id,
+        RecommendationFilters {
+            mode: Some("clean".to_string()),
+            min_size: None,
+            only_offload_eligible: None,
+            limit: Some(2),
+            offset: Some(0),
+        },
+    )
+    .expect("first page");
+    let second_page = build_recommendations(
+        &db,
+        run_id,
+        RecommendationFilters {
+            mode: Some("clean".to_string()),
+            min_size: None,
+            only_offload_eligible: None,
+            limit: Some(2),
+            offset: Some(2),
+        },
+    )
+    .expect("second page");
+
+    assert_eq!(first_page.total_candidate_count, 5);
+    assert_eq!(first_page.candidates.len(), 2);
+    assert_eq!(second_page.total_candidate_count, 5);
+    assert_eq!(second_page.candidates.len(), 2);
+    assert_ne!(first_page.candidates[0].id, second_page.candidates[0].id);
+}
+
+#[test]
+fn startup_finalizes_interrupted_offload_jobs() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run("C:\\", Some("NTFS"), ScanMode::Recursive, None, None, 100)
+        .expect("create scan run");
+    let job_id = db
+        .create_offload_job(winclean_lib::db::OffloadJobInsert {
+            scan_run_id: run_id,
+            status: "running".to_string(),
+            destination_label: "stale batch".to_string(),
+            total_items: 1,
+            total_bytes: 10,
+            created_at_ms: 100,
+        })
+        .expect("create offload job");
+    db.insert_offload_item(winclean_lib::db::OffloadItemInsert {
+        job_id,
+        entry_id: 1,
+        candidate_id: "scan-1:entry-1".to_string(),
+        source_path: "C:\\Data\\movie.mp4".to_string(),
+        size: 10,
+        created_at_ms: 100,
+    })
+    .expect("create offload item");
+
+    assert_eq!(db.finalize_interrupted_offload_jobs().expect("finalize"), 1);
+
+    let job = db
+        .offload_job(job_id)
+        .expect("offload job")
+        .expect("exists");
+    assert_eq!(job.status, "failed");
+    assert!(job.completed_at_ms.expect("completed timestamp") >= 100);
+    assert_eq!(
+        job.last_error.as_deref(),
+        Some("Offload was interrupted before the app closed.")
+    );
+    let items = db.offload_items(job_id).expect("offload items");
+    assert_eq!(
+        items.first().map(|item| item.status.as_str()),
+        Some("failed")
+    );
+    assert_eq!(
+        items.first().and_then(|item| item.error.as_deref()),
+        Some("Offload was interrupted before the app closed.")
+    );
+}
+
+#[test]
+fn creating_offload_job_with_items_is_transactional() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run("C:\\", Some("NTFS"), ScanMode::Recursive, None, None, 100)
+        .expect("create scan run");
+
+    let error = db
+        .create_offload_job_with_items(
+            winclean_lib::db::OffloadJobInsert {
+                scan_run_id: run_id,
+                status: "queued".to_string(),
+                destination_label: "batch".to_string(),
+                total_items: 2,
+                total_bytes: 20,
+                created_at_ms: 100,
+            },
+            &[
+                winclean_lib::db::OffloadItemInsert {
+                    job_id: 0,
+                    entry_id: 1,
+                    candidate_id: "same".to_string(),
+                    source_path: "C:\\Data\\a.mp4".to_string(),
+                    size: 10,
+                    created_at_ms: 100,
+                },
+                winclean_lib::db::OffloadItemInsert {
+                    job_id: 0,
+                    entry_id: 2,
+                    candidate_id: "same".to_string(),
+                    source_path: "C:\\Data\\b.mp4".to_string(),
+                    size: 10,
+                    created_at_ms: 100,
+                },
+            ],
+        )
+        .expect_err("duplicate candidates should roll back the whole job");
+
+    assert!(error.to_string().to_ascii_lowercase().contains("unique"));
+    assert_eq!(db.pending_offload_count().expect("pending offloads"), 0);
+}
+
 fn write_sparse_file(path: &std::path::Path, size: u64) {
     let file = File::create(path).expect("create sparse file");
     file.set_len(size).expect("set sparse file length");
