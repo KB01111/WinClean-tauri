@@ -6,6 +6,7 @@ import {
   getOffloadActionState,
   getOffloadProgress,
   selectedVisibleCandidateIds,
+  selectedVisibleCandidateStats,
 } from "./recover-space"
 
 const candidates = [
@@ -72,6 +73,15 @@ describe("Recover Space helpers", () => {
     ).toEqual(["offload"])
   })
 
+  test("summarizes only selected candidates visible in the active mode", () => {
+    expect(
+      selectedVisibleCandidateStats(
+        [candidates[1]],
+        new Set(["clean", "offload", "hidden"])
+      )
+    ).toEqual({ count: 1, bytes: 30 })
+  })
+
   test("requires Google Drive connection before offload can start", () => {
     expect(
       getOffloadActionState({
@@ -112,5 +122,18 @@ describe("Recover Space helpers", () => {
       percent: 50,
       text: "2 of 4 uploaded; 1 needs attention",
     })
+  })
+
+  test("shows terminal offload jobs as complete even with skipped bytes", () => {
+    expect(
+      getOffloadProgress({
+        totalItems: 4,
+        completedItems: 2,
+        failedItems: 2,
+        uploadedBytes: 50,
+        totalBytes: 100,
+        status: "completed_with_errors",
+      }).percent
+    ).toBe(100)
   })
 })
