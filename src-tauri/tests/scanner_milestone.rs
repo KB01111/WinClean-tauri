@@ -85,7 +85,8 @@ fn balanced_worker_count_keeps_one_logical_core_free_and_caps_pool() {
     assert_eq!(balanced_worker_count(0), 1);
     assert_eq!(balanced_worker_count(1), 1);
     assert_eq!(balanced_worker_count(4), 3);
-    assert_eq!(balanced_worker_count(64), 8);
+    assert_eq!(balanced_worker_count(16), 15);
+    assert_eq!(balanced_worker_count(64), 16);
 }
 
 #[test]

@@ -62,6 +62,24 @@ export function selectedVisibleCandidateIds<T extends RecoverCandidate>(
     .map((candidate) => candidate.id)
 }
 
+export function selectedVisibleCandidateStats<T extends RecoverCandidate>(
+  candidates: readonly T[],
+  selectedIds: ReadonlySet<string>
+): { count: number; bytes: number } {
+  return candidates.reduce(
+    (stats, candidate) => {
+      if (!selectedIds.has(candidate.id)) {
+        return stats
+      }
+      return {
+        count: stats.count + 1,
+        bytes: stats.bytes + candidate.size,
+      }
+    },
+    { count: 0, bytes: 0 }
+  )
+}
+
 export function getOffloadActionState({
   selectedCount,
   driveStatus,
@@ -106,8 +124,13 @@ export function getOffloadProgress(input: OffloadProgressInput): {
   percent: number
   text: string
 } {
+  const finished =
+    input.status === "completed" ||
+    input.status === "completed_with_errors"
   const percent =
-    input.totalBytes > 0
+    finished
+      ? 100
+      : input.totalBytes > 0
       ? Math.min(
           100,
           Math.round((input.uploadedBytes / input.totalBytes) * 100)

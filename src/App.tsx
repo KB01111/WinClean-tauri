@@ -49,6 +49,7 @@ import {
   getVisibleRecoverCandidates,
   getOffloadActionState,
   getOffloadProgress,
+  selectedVisibleCandidateStats,
   selectedVisibleCandidateIds,
   type RecoverMode,
 } from "@/lib/recover-space"
@@ -363,26 +364,16 @@ function App() {
       executableCleanIds
     )
   }, [executableCleanIds, recommendationPlan, recoverMode])
-  const selectedRecommendationBytes = useMemo(() => {
-    if (!recommendationPlan) {
-      return 0
-    }
-    return recommendationPlan.candidates
-      .filter((candidate) => selectedCleanupIds.has(candidate.id))
-      .reduce((sum, candidate) => sum + candidate.size, 0)
-  }, [recommendationPlan, selectedCleanupIds])
-  const selectedVisibleCount = useMemo(
+  const selectedVisibleStats = useMemo(
     () =>
-      visibleRecommendations.filter((candidate) =>
-        selectedCleanupIds.has(candidate.id)
-      ).length,
+      selectedVisibleCandidateStats(visibleRecommendations, selectedCleanupIds),
     [selectedCleanupIds, visibleRecommendations]
   )
   const offloadRunning =
     activeOffloadJob?.status === "queued" ||
     activeOffloadJob?.status === "running"
   const offloadActionState = getOffloadActionState({
-    selectedCount: selectedVisibleCount,
+    selectedCount: selectedVisibleStats.count,
     driveStatus,
     running: offloadRunning,
   })
@@ -1125,7 +1116,7 @@ function App() {
                 setSelectedCleanupIds(new Set())
               }}
               selectedCleanupIds={selectedCleanupIds}
-              selectedRecommendationBytes={selectedRecommendationBytes}
+              selectedRecommendationBytes={selectedVisibleStats.bytes}
               cleanupPending={cleanupPending}
               isScanning={isScanning}
               driveStatus={driveStatus}

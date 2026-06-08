@@ -19,7 +19,7 @@ const BATCH_SIZE: usize = 2_048;
 const SCAN_EVENT_BATCH_SIZE: usize = 256;
 const EVENT_QUEUE_MULTIPLIER: usize = 16;
 const PROGRESS_UPDATE_INTERVAL_MS: u64 = 200;
-const MAX_BALANCED_WORKERS: usize = 8;
+const MAX_BALANCED_WORKERS: usize = 16;
 const DIR_QUEUE_MULTIPLIER: usize = 64;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
