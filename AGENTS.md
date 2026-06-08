@@ -31,7 +31,7 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
 
 ### Rust toolchain
 
-The lockfile pulls crates that require **Rust stable ≥ 1.85** (edition 2024). If `cargo test` fails with an `edition2024` error, run `rustup default stable` once per VM.
+The lockfile pulls crates that require **Rust stable ≥ 1.85** (edition 2024). If `cargo test` fails with an `edition2024` error, run `rustup update stable` once per VM.
 
 ### Linux vs Windows behavior
 
