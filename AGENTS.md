@@ -26,7 +26,7 @@ On Debian/Ubuntu, install Tauri v2 prerequisites before `bun run tauri dev` or `
 
 ```bash
 sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
+  libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config libsoup-3.0-dev
 ```
 
 ### Rust toolchain
