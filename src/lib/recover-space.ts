@@ -126,9 +126,7 @@ export function getOffloadProgress(input: OffloadProgressInput): {
 } {
   const finished =
     input.status === "completed" ||
-    input.status === "completed_with_errors" ||
-    input.status === "failed" ||
-    input.status === "canceled"
+    input.status === "completed_with_errors"
   const percent =
     finished
       ? 100
