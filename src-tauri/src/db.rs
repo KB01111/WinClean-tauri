@@ -606,8 +606,19 @@ impl Database {
         if run.status == "running" {
             anyhow::bail!("Cannot delete a scan while it is running.");
         }
-
         let conn = self.connect()?;
+        // Deleting a scan cascades into offload_jobs/offload_items, which hold
+        // the Drive file ids needed to restore offloaded files. Keep those runs.
+        let offload_jobs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM offload_jobs WHERE scan_run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        if offload_jobs > 0 {
+            anyhow::bail!(
+                "This scan has Google Drive offload history that is needed to restore files, so it cannot be deleted."
+            );
+        }
         let deleted = conn
             .execute("DELETE FROM scan_runs WHERE id = ?1", params![run_id])
             .context("delete scan run")?;
@@ -617,7 +628,11 @@ impl Database {
     pub fn clear_scan_history(&self) -> anyhow::Result<usize> {
         let conn = self.connect()?;
         conn.execute(
-            "DELETE FROM scan_runs WHERE status IN ('completed', 'failed', 'canceled')",
+            r#"
+            DELETE FROM scan_runs
+            WHERE status IN ('completed', 'failed', 'canceled')
+              AND id NOT IN (SELECT DISTINCT scan_run_id FROM offload_jobs)
+            "#,
             [],
         )
         .context("clear scan history")
