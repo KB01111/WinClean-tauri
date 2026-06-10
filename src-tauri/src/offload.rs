@@ -460,6 +460,12 @@ enum ChunkOutcome {
     Done(DriveFile),
 }
 
+enum SessionProbe {
+    Incomplete(u64),
+    Completed(DriveFile),
+    Unknown,
+}
+
 impl GoogleDriveClient {
     pub fn configured() -> anyhow::Result<Self> {
         let client_id = google_client_id()
@@ -609,25 +615,35 @@ impl GoogleDriveClient {
     }
 
     /// Asks the resumable session how many bytes it already has, so a retry
-    /// can continue from the right offset instead of starting over.
-    fn query_session_offset(&self, token: &str, session_url: &str, total: u64) -> Option<u64> {
-        let response = self
+    /// can continue from the right offset instead of starting over. If Google
+    /// accepted the final chunk before the connection dropped, the probe
+    /// returns the completed file metadata instead of a 308.
+    fn query_session_offset(&self, token: &str, session_url: &str, total: u64) -> SessionProbe {
+        let Ok(response) = self
             .client
             .put(session_url)
             .bearer_auth(token)
             .header("Content-Length", 0_u64)
             .header("Content-Range", format!("bytes */{total}"))
             .send()
-            .ok()?;
-        if response.status().as_u16() == 308 {
-            Some(next_offset_from_range_header(
+        else {
+            return SessionProbe::Unknown;
+        };
+        let status = response.status();
+        if status.as_u16() == 308 {
+            SessionProbe::Incomplete(next_offset_from_range_header(
                 response
                     .headers()
                     .get(reqwest::header::RANGE)
                     .and_then(|value| value.to_str().ok()),
             ))
+        } else if status.is_success() {
+            match response.json::<DriveFile>() {
+                Ok(drive_file) => SessionProbe::Completed(drive_file),
+                Err(_) => SessionProbe::Unknown,
+            }
         } else {
-            None
+            SessionProbe::Unknown
         }
     }
 
@@ -720,11 +736,16 @@ impl GoogleDriveClient {
                     self.invalidate_token();
                     backoff_sleep(attempts, progress.cancel)?;
                     let token = self.access_token()?;
-                    if let Some(confirmed) =
-                        self.query_session_offset(&token, &session_url, total)
-                    {
-                        offset = confirmed.min(total);
-                        (progress.report)(offset);
+                    match self.query_session_offset(&token, &session_url, total) {
+                        SessionProbe::Completed(drive_file) => {
+                            (progress.report)(total);
+                            return Ok(drive_file);
+                        }
+                        SessionProbe::Incomplete(confirmed) => {
+                            offset = confirmed.min(total);
+                            (progress.report)(offset);
+                        }
+                        SessionProbe::Unknown => {}
                     }
                 }
             }
