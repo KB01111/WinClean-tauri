@@ -103,9 +103,12 @@ export function AiInsightsView({
               <span className="text-muted-foreground">Scan run</span>
               <select
                 value={effectiveRunId ?? ""}
-                onChange={(event) =>
+                onChange={(event) => {
                   setSelectedRunId(Number(event.target.value))
-                }
+                  setReport(null)
+                  setAnalyzedRunId(null)
+                  setError(null)
+                }}
                 className="h-9 max-w-96 rounded-md border border-input bg-card px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
               >
                 {completedRuns.map((run) => (
