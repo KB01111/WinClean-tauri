@@ -11,12 +11,15 @@ const LARGE_FILE_BYTES: u64 = 100 * 1024 * 1024;
 const LARGE_INSTALLER_OR_ARCHIVE_BYTES: u64 = 50 * 1024 * 1024;
 const DUPLICATE_REVIEW_BYTES: u64 = 10 * 1024 * 1024;
 const OLD_DOWNLOAD_DAYS: u64 = 30;
+const STALE_FILE_DAYS: u64 = 180;
+const STALE_LARGE_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendationFilters {
     pub mode: Option<String>,
     pub min_size: Option<u64>,
+    pub min_age_days: Option<u64>,
     pub only_offload_eligible: Option<bool>,
 }
 
@@ -82,6 +85,7 @@ pub fn build_recommendations(
     let duplicate_keys = duplicate_keys(&records);
     let mode = filters.mode.as_deref().map(str::to_ascii_lowercase);
     let min_size = filters.min_size.unwrap_or(0);
+    let min_age_days = filters.min_age_days.unwrap_or(0);
     let only_offload = filters.only_offload_eligible.unwrap_or(false);
 
     let mut candidates = records
@@ -89,6 +93,9 @@ pub fn build_recommendations(
         .filter_map(|record| recommendation_candidate(scan_run_id, record, &duplicate_keys))
         .filter(|candidate| {
             if candidate.size < min_size {
+                return false;
+            }
+            if min_age_days > 0 && candidate.age_days.unwrap_or(0) < min_age_days {
                 return false;
             }
             if only_offload && !candidate.eligible_for_offload {
@@ -282,6 +289,9 @@ fn offload_reason(record: &CleanupFileRecord, age_days: Option<u64>) -> Option<S
     ) && record.size >= LARGE_FILE_BYTES
     {
         return Some("Large media file that can be offloaded".to_string());
+    }
+    if record.size >= STALE_LARGE_FILE_BYTES && age_days.unwrap_or(0) >= STALE_FILE_DAYS {
+        return Some("Storage hog: large file untouched for 6+ months".to_string());
     }
     if record.size >= LARGE_FILE_BYTES {
         return Some("Large file that can be offloaded".to_string());

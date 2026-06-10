@@ -15,12 +15,14 @@ use crate::{
     cleanup::{build_cleanup_plan, execute_cleanup_plan, CleanupPlan},
     db::{
         CategorySummary, CleanupActionRecord, Database, DirectoryChild, ExtensionSummary,
-        FileSearchResult, ScanRunRecord, TopDirectory,
+        FileSearchResult, OffloadItemRecord, ScanRunRecord, TopDirectory,
     },
     offload::{
+        active_offload_job as read_active_offload_job,
         begin_google_drive_auth as begin_drive_auth, create_offload_job,
         disconnect_google_drive as disconnect_drive, google_drive_status as drive_status,
-        offload_status as read_offload_status, process_offload_job_with_client, GoogleDriveClient,
+        list_offload_jobs as read_offload_jobs, offload_status as read_offload_status,
+        process_offload_job_with_client, restore_offload_item as restore_item, GoogleDriveClient,
         GoogleDriveStatus, OffloadJobStatus, WindowsRecycleBin,
     },
     recommendations::{
@@ -325,6 +327,14 @@ pub fn start_offload(
     if candidate_ids.is_empty() {
         return Err("Select at least one offload candidate.".to_string());
     }
+    if state
+        .db
+        .latest_active_offload_job_id()
+        .map_err(to_command_error)?
+        .is_some()
+    {
+        return Err("An offload batch is already running. Wait for it to finish.".to_string());
+    }
     let plan = build_recommendations(&state.db, run_id, RecommendationFilters::default())
         .map_err(to_command_error)?;
     let candidates = resolve_offload_recommendation_candidates(&plan.candidates, &candidate_ids)
@@ -372,6 +382,113 @@ pub fn cancel_offload(state: State<'_, AppState>, job_id: i64) -> Result<Offload
         cancel.store(true, Ordering::Relaxed);
     }
     read_offload_status(&state.db, job_id).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn list_offload_jobs(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> Result<Vec<OffloadJobStatus>, String> {
+    read_offload_jobs(&state.db, limit.unwrap_or(20)).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn active_offload_job(state: State<'_, AppState>) -> Result<Option<OffloadJobStatus>, String> {
+    read_active_offload_job(&state.db).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn restore_offload_item(
+    state: State<'_, AppState>,
+    item_id: i64,
+    target_dir: Option<String>,
+) -> Result<OffloadItemRecord, String> {
+    let drive = GoogleDriveClient::configured().map_err(to_command_error)?;
+    if !drive_status().connected {
+        return Err("Connect Google Drive before restoring files.".to_string());
+    }
+    restore_item(&state.db, item_id, &drive, target_dir).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn largest_stale_files(
+    state: State<'_, AppState>,
+    run_id: Option<i64>,
+    min_size: Option<u64>,
+    min_age_days: Option<u64>,
+    limit: Option<u32>,
+) -> Result<Vec<FileSearchResult>, String> {
+    let run_id = resolve_run_id(&state.db, run_id)?;
+    let Some(run_id) = run_id else {
+        return Ok(Vec::new());
+    };
+    state
+        .db
+        .largest_stale_files(
+            run_id,
+            min_size.unwrap_or(50 * 1024 * 1024),
+            min_age_days.unwrap_or(180),
+            limit.unwrap_or(25),
+        )
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("Only https links can be opened.".to_string());
+    }
+    open::that(&url).map_err(|error| format!("failed to open link: {error}"))
+}
+
+const AI_CREDENTIAL_SERVICE: &str = "WinClean AI";
+const AI_API_KEY_USER: &str = "openai_api_key";
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiKeyStatus {
+    pub configured: bool,
+}
+
+fn ai_credential_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(AI_CREDENTIAL_SERVICE, AI_API_KEY_USER)
+        .map_err(|error| format!("open Windows Credential Manager entry: {error}"))
+}
+
+#[tauri::command]
+pub fn ai_key_status() -> Result<AiKeyStatus, String> {
+    let configured = ai_credential_entry()
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+        .is_some();
+    Ok(AiKeyStatus { configured })
+}
+
+#[tauri::command]
+pub fn set_ai_api_key(api_key: String) -> Result<AiKeyStatus, String> {
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return Err("API key cannot be empty.".to_string());
+    }
+    ai_credential_entry()?
+        .set_password(trimmed)
+        .map_err(|error| format!("store AI API key: {error}"))?;
+    ai_key_status()
+}
+
+#[tauri::command]
+pub fn clear_ai_api_key() -> Result<AiKeyStatus, String> {
+    if let Ok(entry) = ai_credential_entry() {
+        let _ = entry.delete_credential();
+    }
+    ai_key_status()
+}
+
+#[tauri::command]
+pub fn get_ai_api_key() -> Result<Option<String>, String> {
+    Ok(ai_credential_entry()
+        .ok()
+        .and_then(|entry| entry.get_password().ok()))
 }
 
 #[tauri::command]

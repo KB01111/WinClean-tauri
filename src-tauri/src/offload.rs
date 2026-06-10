@@ -1,8 +1,8 @@
 use std::{
     fs::File,
-    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
     net::{TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
@@ -26,18 +26,24 @@ use crate::{
     recommendations::RecommendationCandidate,
 };
 
-const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
+const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file openid email";
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
 const ROOT_FOLDER_NAME: &str = "WinClean Offloads";
 const CREDENTIAL_SERVICE: &str = "WinClean Google Drive";
 const REFRESH_TOKEN_USER: &str = "refresh_token";
-const DRIVE_UPLOAD_TIMEOUT_SECS: u64 = 30 * 60;
+const ACCOUNT_EMAIL_USER: &str = "account_email";
+const DRIVE_REQUEST_TIMEOUT_SECS: u64 = 10 * 60;
 const AUTH_CALLBACK_TIMEOUT_SECS: u64 = 120;
 const AUTH_REQUEST_LINE_LIMIT: usize = 8 * 1024;
 const TOKEN_EXPIRY_SKEW_SECS: u64 = 60;
+const UPLOAD_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const UPLOAD_MAX_ATTEMPTS: u32 = 4;
+const RETRY_BASE_DELAY_MS: u64 = 500;
+pub const OFFLOAD_CANCELED_MESSAGE: &str = "Offload was canceled";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +88,21 @@ pub struct DriveUploadResult {
     pub md5_checksum: Option<String>,
 }
 
+/// Progress reporting and cancellation hooks shared with upload implementations.
+pub struct UploadProgress<'a> {
+    pub report: &'a (dyn Fn(u64) + Send + Sync),
+    pub cancel: &'a AtomicBool,
+}
+
+impl<'a> UploadProgress<'a> {
+    pub fn noop(cancel: &'a AtomicBool) -> Self {
+        Self {
+            report: &|_| {},
+            cancel,
+        }
+    }
+}
+
 pub trait DriveUploader: Send + Sync {
     fn ensure_batch_folder(&self, batch_name: &str) -> anyhow::Result<DriveFolder>;
 
@@ -89,7 +110,18 @@ pub trait DriveUploader: Send + Sync {
         &self,
         folder_id: &str,
         candidate: &RecommendationCandidate,
+        progress: &UploadProgress<'_>,
     ) -> anyhow::Result<DriveUploadResult>;
+
+    fn delete_file(&self, file_id: &str) -> anyhow::Result<()> {
+        let _ = file_id;
+        Ok(())
+    }
+
+    fn download_file(&self, file_id: &str, destination: &Path) -> anyhow::Result<u64> {
+        let _ = (file_id, destination);
+        anyhow::bail!("Drive download is not supported by this client")
+    }
 }
 
 pub trait FileRecycler: Send + Sync {
@@ -110,7 +142,7 @@ pub fn google_drive_status() -> GoogleDriveStatus {
     GoogleDriveStatus {
         configured,
         connected,
-        account_email: None,
+        account_email: connected.then(stored_account_email).flatten(),
         error: (!configured)
             .then_some("Set WINCLEAN_GOOGLE_CLIENT_ID to enable Google Drive offload.".to_string()),
     }
@@ -131,15 +163,26 @@ pub fn begin_google_drive_auth() -> anyhow::Result<GoogleDriveStatus> {
     open::that(&auth_url).map_err(|error| anyhow::anyhow!("open browser: {error}"))?;
     let code = wait_for_auth_code(listener, &state)?;
     let token = exchange_auth_code(&client_id, &redirect_uri, &verifier, &code)?;
-    if let Some(refresh_token) = token.refresh_token {
-        store_refresh_token(&refresh_token)?;
+    let Some(refresh_token) = token.refresh_token else {
+        anyhow::bail!(
+            "Google did not return a refresh token. Remove WinClean from your Google account's \
+             third-party access list and connect again."
+        );
+    };
+    store_refresh_token(&refresh_token)?;
+    if let Ok(Some(email)) = fetch_account_email(&token.access_token) {
+        let _ = store_account_email(&email);
     }
     Ok(google_drive_status())
 }
 
 pub fn disconnect_google_drive() -> anyhow::Result<GoogleDriveStatus> {
-    let entry = credential_entry()?;
-    let _ = entry.delete_credential();
+    if let Ok(entry) = credential_entry(REFRESH_TOKEN_USER) {
+        let _ = entry.delete_credential();
+    }
+    if let Ok(entry) = credential_entry(ACCOUNT_EMAIL_USER) {
+        let _ = entry.delete_credential();
+    }
     Ok(google_drive_status())
 }
 
@@ -242,7 +285,11 @@ pub fn process_offload_job_with_client(
             db.update_offload_job(job_id, "canceled", None, None, Some(unix_millis()), None)?;
             return Ok(());
         }
-        process_item(db, item, candidate, &folder, drive, recycler)?;
+        process_item(db, item, candidate, &folder, drive, recycler, cancel)?;
+        if cancel.load(Ordering::Relaxed) {
+            db.update_offload_job(job_id, "canceled", None, None, Some(unix_millis()), None)?;
+            return Ok(());
+        }
     }
 
     let final_status = offload_status(db, job_id)?;
@@ -260,6 +307,101 @@ pub fn offload_status(db: &Database, job_id: i64) -> anyhow::Result<OffloadJobSt
         .ok_or_else(|| anyhow::anyhow!("offload job {job_id} was not found"))?;
     let items = db.offload_items(job_id)?;
     Ok(status_from_records(job, items))
+}
+
+pub fn list_offload_jobs(db: &Database, limit: u32) -> anyhow::Result<Vec<OffloadJobStatus>> {
+    let jobs = db.list_offload_jobs(limit)?;
+    let mut statuses = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let items = db.offload_items(job.id)?;
+        statuses.push(status_from_records(job, items));
+    }
+    Ok(statuses)
+}
+
+pub fn active_offload_job(db: &Database) -> anyhow::Result<Option<OffloadJobStatus>> {
+    let Some(job_id) = db.latest_active_offload_job_id()? else {
+        return Ok(None);
+    };
+    offload_status(db, job_id).map(Some)
+}
+
+/// Downloads a previously offloaded file back from Google Drive, verifies it,
+/// and restores it to its original location (or a caller-provided directory).
+pub fn restore_offload_item(
+    db: &Database,
+    item_id: i64,
+    drive: &dyn DriveUploader,
+    target_dir: Option<String>,
+) -> anyhow::Result<OffloadItemRecord> {
+    let item = db
+        .offload_item(item_id)?
+        .ok_or_else(|| anyhow::anyhow!("offload item {item_id} was not found"))?;
+    let drive_file_id = item
+        .drive_file_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("This item was never uploaded to Google Drive"))?;
+
+    let destination = match target_dir {
+        Some(dir) => {
+            let file_name = Path::new(&item.source_path)
+                .file_name()
+                .map(|name| name.to_owned())
+                .ok_or_else(|| anyhow::anyhow!("offload item has no file name"))?;
+            PathBuf::from(dir).join(file_name)
+        }
+        None => PathBuf::from(&item.source_path),
+    };
+    if destination.exists() {
+        anyhow::bail!(
+            "A file already exists at {}. Move it aside before restoring.",
+            destination.display()
+        );
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let temp_path = destination.with_extension("winclean-restore-tmp");
+    let downloaded_bytes = match drive.download_file(&drive_file_id, &temp_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    if downloaded_bytes != item.size {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::bail!(
+            "Restored file size mismatch: expected {} bytes, got {} bytes",
+            item.size,
+            downloaded_bytes
+        );
+    }
+    if let Some(expected_md5) = item.md5_checksum.as_deref() {
+        let actual_md5 = md5_for_file(&temp_path)?;
+        if !actual_md5.eq_ignore_ascii_case(expected_md5) {
+            let _ = std::fs::remove_file(&temp_path);
+            anyhow::bail!("Restored file checksum mismatch; the local copy was discarded");
+        }
+    }
+    std::fs::rename(&temp_path, &destination)?;
+
+    db.record_cleanup_action(CleanupActionInsert {
+        action_type: "drive_restore".to_string(),
+        status: "completed".to_string(),
+        target_path: destination.display().to_string(),
+        original_path: Some(item.source_path.clone()),
+        destination_path: Some(destination.display().to_string()),
+        scan_run_id: None,
+        explanation: Some("Restored from Google Drive offload".to_string()),
+        created_at_ms: unix_millis(),
+        completed_at_ms: Some(unix_millis()),
+        undo_token: item.drive_web_url.clone(),
+    })?;
+    db.set_offload_item_recycle_status(item.id, "restored")?;
+    db.offload_item(item.id)?
+        .ok_or_else(|| anyhow::anyhow!("offload item {item_id} was not found after restore"))
 }
 
 pub struct GoogleDriveClient {
@@ -297,13 +439,18 @@ fn usable_cached_token(cache: &Option<CachedAccessToken>, now: Instant) -> Optio
         .map(|token| token.value.clone())
 }
 
+enum ChunkOutcome {
+    Incomplete(u64),
+    Done(DriveFile),
+}
+
 impl GoogleDriveClient {
     pub fn configured() -> anyhow::Result<Self> {
         let client_id = google_client_id()
             .ok_or_else(|| anyhow::anyhow!("Set WINCLEAN_GOOGLE_CLIENT_ID before uploading"))?;
         Ok(Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(DRIVE_UPLOAD_TIMEOUT_SECS))
+                .timeout(Duration::from_secs(DRIVE_REQUEST_TIMEOUT_SECS))
                 .build()?,
             client_id,
             cached_token: Mutex::new(None),
@@ -330,6 +477,12 @@ impl GoogleDriveClient {
             .map_err(|_| anyhow::anyhow!("Google Drive token cache lock is poisoned"))?;
         *cached_token = Some(token);
         Ok(token_value)
+    }
+
+    fn invalidate_token(&self) {
+        if let Ok(mut cached_token) = self.cached_token.lock() {
+            *cached_token = None;
+        }
     }
 
     fn find_folder(
@@ -405,6 +558,190 @@ impl GoogleDriveClient {
         }
         self.create_folder(token, name, parent_id)
     }
+
+    fn initiate_resumable_session(
+        &self,
+        token: &str,
+        folder_id: &str,
+        candidate: &RecommendationCandidate,
+    ) -> anyhow::Result<String> {
+        let metadata = serde_json::json!({
+            "name": candidate.name,
+            "parents": [folder_id],
+            "description": format!("Offloaded by WinClean from {}", candidate.path)
+        });
+        let initiate = self
+            .client
+            .post(format!("{DRIVE_UPLOAD_API}/files"))
+            .bearer_auth(token)
+            .query(&[
+                ("uploadType", "resumable"),
+                ("fields", "id,name,size,md5Checksum,webViewLink"),
+            ])
+            .header("Content-Type", "application/json; charset=UTF-8")
+            .header("X-Upload-Content-Type", "application/octet-stream")
+            .header("X-Upload-Content-Length", candidate.size)
+            .json(&metadata)
+            .send()?
+            .error_for_status()?;
+        initiate
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Google Drive did not return a resumable upload URL"))
+    }
+
+    /// Asks the resumable session how many bytes it already has, so a retry
+    /// can continue from the right offset instead of starting over.
+    fn query_session_offset(&self, token: &str, session_url: &str, total: u64) -> Option<u64> {
+        let response = self
+            .client
+            .put(session_url)
+            .bearer_auth(token)
+            .header("Content-Length", 0_u64)
+            .header("Content-Range", format!("bytes */{total}"))
+            .send()
+            .ok()?;
+        if response.status().as_u16() == 308 {
+            Some(next_offset_from_range_header(
+                response
+                    .headers()
+                    .get(reqwest::header::RANGE)
+                    .and_then(|value| value.to_str().ok()),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn send_chunk(
+        &self,
+        token: &str,
+        session_url: &str,
+        chunk: &[u8],
+        offset: u64,
+        total: u64,
+    ) -> anyhow::Result<ChunkOutcome> {
+        let end = offset + chunk.len() as u64 - 1;
+        let response = self
+            .client
+            .put(session_url)
+            .bearer_auth(token)
+            .header("Content-Length", chunk.len() as u64)
+            .header("Content-Range", format!("bytes {offset}-{end}/{total}"))
+            .body(chunk.to_vec())
+            .send()?;
+        let status = response.status();
+        if status.as_u16() == 308 {
+            let next = next_offset_from_range_header(
+                response
+                    .headers()
+                    .get(reqwest::header::RANGE)
+                    .and_then(|value| value.to_str().ok()),
+            );
+            return Ok(ChunkOutcome::Incomplete(next));
+        }
+        if status.is_success() {
+            return Ok(ChunkOutcome::Done(response.json::<DriveFile>()?));
+        }
+        let retryable = status.as_u16() == 429 || status.is_server_error();
+        let message = format!("Google Drive chunk upload failed with status {status}");
+        if retryable {
+            Err(RetryableUploadError(message).into())
+        } else {
+            anyhow::bail!(message)
+        }
+    }
+
+    fn upload_chunked(
+        &self,
+        folder_id: &str,
+        candidate: &RecommendationCandidate,
+        progress: &UploadProgress<'_>,
+    ) -> anyhow::Result<DriveFile> {
+        let token = self.access_token()?;
+        let session_url = self.initiate_resumable_session(&token, folder_id, candidate)?;
+        let total = candidate.size;
+        let mut file = File::open(&candidate.path)?;
+        let mut offset = 0_u64;
+        let mut attempts = 0_u32;
+
+        loop {
+            if progress.cancel.load(Ordering::Relaxed) {
+                anyhow::bail!(OFFLOAD_CANCELED_MESSAGE);
+            }
+            let chunk_len = (total - offset).min(UPLOAD_CHUNK_BYTES) as usize;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut chunk = vec![0_u8; chunk_len];
+            file.read_exact(&mut chunk)?;
+
+            let token = self.access_token()?;
+            match self.send_chunk(&token, &session_url, &chunk, offset, total) {
+                Ok(ChunkOutcome::Done(drive_file)) => {
+                    (progress.report)(total);
+                    return Ok(drive_file);
+                }
+                Ok(ChunkOutcome::Incomplete(next_offset)) => {
+                    attempts = 0;
+                    offset = next_offset.min(total);
+                    (progress.report)(offset);
+                }
+                Err(error) => {
+                    let transient = error.downcast_ref::<RetryableUploadError>().is_some()
+                        || error.downcast_ref::<reqwest::Error>().is_some_and(|err| {
+                            err.is_timeout() || err.is_connect() || err.is_request()
+                        });
+                    if !transient {
+                        return Err(error);
+                    }
+                    attempts += 1;
+                    if attempts >= UPLOAD_MAX_ATTEMPTS {
+                        return Err(error.context(format!(
+                            "upload failed after {UPLOAD_MAX_ATTEMPTS} attempts"
+                        )));
+                    }
+                    self.invalidate_token();
+                    backoff_sleep(attempts, progress.cancel)?;
+                    let token = self.access_token()?;
+                    if let Some(confirmed) =
+                        self.query_session_offset(&token, &session_url, total)
+                    {
+                        offset = confirmed.min(total);
+                        (progress.report)(offset);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct RetryableUploadError(String);
+
+fn backoff_sleep(attempt: u32, cancel: &AtomicBool) -> anyhow::Result<()> {
+    let exponent = attempt.saturating_sub(1).min(6);
+    let base = RETRY_BASE_DELAY_MS.saturating_mul(1_u64 << exponent);
+    let jitter = unix_millis().unsigned_abs() % (base / 2 + 1);
+    let total = Duration::from_millis(base + jitter);
+    let slept_until = Instant::now() + total;
+    while Instant::now() < slept_until {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!(OFFLOAD_CANCELED_MESSAGE);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+fn next_offset_from_range_header(range: Option<&str>) -> u64 {
+    // Header form: "bytes=0-12345" — the next byte to send is 12346.
+    range
+        .and_then(|value| value.rsplit('-').next())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|last_byte| last_byte + 1)
+        .unwrap_or(0)
 }
 
 impl DriveUploader for GoogleDriveClient {
@@ -418,46 +755,10 @@ impl DriveUploader for GoogleDriveClient {
         &self,
         folder_id: &str,
         candidate: &RecommendationCandidate,
+        progress: &UploadProgress<'_>,
     ) -> anyhow::Result<DriveUploadResult> {
-        let token = self.access_token()?;
         let local_md5 = md5_for_file(Path::new(&candidate.path))?;
-        let metadata = serde_json::json!({
-            "name": candidate.name,
-            "parents": [folder_id],
-            "description": format!("Offloaded by WinClean from {}", candidate.path)
-        });
-        let initiate = self
-            .client
-            .post(format!("{DRIVE_UPLOAD_API}/files"))
-            .bearer_auth(&token)
-            .query(&[
-                ("uploadType", "resumable"),
-                ("fields", "id,name,size,md5Checksum,webViewLink"),
-            ])
-            .header("Content-Type", "application/json; charset=UTF-8")
-            .header("X-Upload-Content-Type", "application/octet-stream")
-            .header("X-Upload-Content-Length", candidate.size)
-            .json(&metadata)
-            .send()?
-            .error_for_status()?;
-        let location = initiate
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| anyhow::anyhow!("Google Drive did not return a resumable upload URL"))?
-            .to_string();
-
-        let file = File::open(&candidate.path)?;
-        let uploaded = self
-            .client
-            .put(location)
-            .bearer_auth(&token)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", candidate.size)
-            .body(reqwest::blocking::Body::new(file))
-            .send()?
-            .error_for_status()?
-            .json::<DriveFile>()?;
+        let uploaded = self.upload_chunked(folder_id, candidate, progress)?;
         let uploaded_size = uploaded
             .size
             .as_deref()
@@ -466,15 +767,20 @@ impl DriveUploader for GoogleDriveClient {
                 anyhow::anyhow!("Google Drive did not return file size for verification")
             })?;
         if uploaded_size != candidate.size {
+            let _ = self.delete_file(&uploaded.id);
             anyhow::bail!(
-                "Google Drive upload size mismatch: expected {} bytes, got {} bytes",
+                "Google Drive upload size mismatch: expected {} bytes, got {} bytes. \
+                 The incomplete Drive copy was removed.",
                 candidate.size,
                 uploaded_size
             );
         }
         if let Some(remote_md5) = uploaded.md5_checksum.as_deref() {
             if !remote_md5.eq_ignore_ascii_case(&local_md5) {
-                anyhow::bail!("Google Drive upload checksum mismatch");
+                let _ = self.delete_file(&uploaded.id);
+                anyhow::bail!(
+                    "Google Drive upload checksum mismatch. The corrupt Drive copy was removed."
+                );
             }
         }
         Ok(DriveUploadResult {
@@ -483,6 +789,31 @@ impl DriveUploader for GoogleDriveClient {
             size: uploaded_size,
             md5_checksum: Some(local_md5),
         })
+    }
+
+    fn delete_file(&self, file_id: &str) -> anyhow::Result<()> {
+        let token = self.access_token()?;
+        self.client
+            .delete(format!("{DRIVE_API}/files/{file_id}"))
+            .bearer_auth(token)
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    fn download_file(&self, file_id: &str, destination: &Path) -> anyhow::Result<u64> {
+        let token = self.access_token()?;
+        let mut response = self
+            .client
+            .get(format!("{DRIVE_API}/files/{file_id}"))
+            .bearer_auth(token)
+            .query(&[("alt", "media")])
+            .send()?
+            .error_for_status()?;
+        let mut file = File::create(destination)?;
+        let bytes = std::io::copy(&mut response, &mut file)?;
+        file.sync_all()?;
+        Ok(bytes)
     }
 }
 
@@ -493,6 +824,7 @@ fn process_item(
     folder: &DriveFolder,
     drive: &dyn DriveUploader,
     recycler: &dyn FileRecycler,
+    cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
     db.update_offload_item(item.id, "validating", None, None, 0, None, None, None, None)?;
 
@@ -503,12 +835,28 @@ fn process_item(
     }
 
     db.update_offload_item(item.id, "uploading", None, None, 0, None, None, None, None)?;
-    let upload = match drive.upload_file(&folder.id, &candidate) {
+    let item_id = item.id;
+    let report = move |uploaded: u64| {
+        let _ = db.update_offload_item_progress(item_id, uploaded);
+    };
+    let progress = UploadProgress {
+        report: &report,
+        cancel,
+    };
+    let upload = match drive.upload_file(&folder.id, &candidate, &progress) {
         Ok(upload) => upload,
-        Err(error) => return mark_item_failed(db, item.id, "failed", 0, &error.to_string()),
+        Err(error) => {
+            let status = if cancel.load(Ordering::Relaxed) {
+                "canceled"
+            } else {
+                "failed"
+            };
+            return mark_item_failed(db, item.id, status, 0, &error.to_string());
+        }
     };
 
     if upload.size != candidate.size {
+        let _ = drive.delete_file(&upload.file_id);
         return mark_item_failed(
             db,
             item.id,
@@ -559,12 +907,14 @@ fn process_item(
         }
         Err(error) => db.update_offload_item(
             item.id,
-            "failed",
+            "uploaded_recycle_failed",
             Some(&upload.file_id),
             upload.web_url.as_deref(),
             upload.size,
             upload.md5_checksum.as_deref(),
-            Some(&format!("uploaded but recycle failed: {error}")),
+            Some(&format!(
+                "Uploaded to Drive, but moving the local file to the Recycle Bin failed: {error}"
+            )),
             Some("failed"),
             Some(unix_millis()),
         ),
@@ -747,21 +1097,37 @@ fn exchange_auth_code(
         .json::<TokenResponse>()?)
 }
 
+fn fetch_account_email(access_token: &str) -> anyhow::Result<Option<String>> {
+    let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
+    let info = client
+        .get(USERINFO_URL)
+        .bearer_auth(access_token)
+        .send()?
+        .error_for_status()?
+        .json::<UserInfoResponse>()?;
+    Ok(info.email)
+}
+
 fn refresh_access_token(
     client: &Client,
     client_id: &str,
     refresh_token: &str,
 ) -> anyhow::Result<CachedAccessToken> {
-    let token = client
+    let response = client
         .post(TOKEN_URL)
         .form(&[
             ("client_id", client_id),
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ])
-        .send()?
-        .error_for_status()?
-        .json::<TokenResponse>()?;
+        .send()?;
+    if response.status().is_client_error() {
+        anyhow::bail!(
+            "Google Drive session expired or access was revoked. Disconnect and connect Google \
+             Drive again."
+        );
+    }
+    let token = response.error_for_status()?.json::<TokenResponse>()?;
     Ok(CachedAccessToken::new(
         token.access_token,
         token.expires_in,
@@ -791,19 +1157,29 @@ fn google_client_id() -> Option<String> {
         })
 }
 
-fn credential_entry() -> anyhow::Result<keyring::Entry> {
-    keyring::Entry::new(CREDENTIAL_SERVICE, REFRESH_TOKEN_USER)
+fn credential_entry(user: &str) -> anyhow::Result<keyring::Entry> {
+    keyring::Entry::new(CREDENTIAL_SERVICE, user)
         .map_err(|error| anyhow::anyhow!("open Windows Credential Manager entry: {error}"))
 }
 
 fn refresh_token() -> Option<String> {
-    credential_entry().ok()?.get_password().ok()
+    credential_entry(REFRESH_TOKEN_USER).ok()?.get_password().ok()
 }
 
 fn store_refresh_token(refresh_token: &str) -> anyhow::Result<()> {
-    credential_entry()?
+    credential_entry(REFRESH_TOKEN_USER)?
         .set_password(refresh_token)
         .map_err(|error| anyhow::anyhow!("store Google Drive refresh token: {error}"))
+}
+
+fn stored_account_email() -> Option<String> {
+    credential_entry(ACCOUNT_EMAIL_USER).ok()?.get_password().ok()
+}
+
+fn store_account_email(email: &str) -> anyhow::Result<()> {
+    credential_entry(ACCOUNT_EMAIL_USER)?
+        .set_password(email)
+        .map_err(|error| anyhow::anyhow!("store Google Drive account email: {error}"))
 }
 
 fn batch_folder_name() -> String {
@@ -843,6 +1219,11 @@ struct TokenResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct UserInfoResponse {
+    email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DriveListResponse {
     files: Vec<DriveFile>,
 }
@@ -875,5 +1256,12 @@ mod tests {
 
         let unknown_expiry = CachedAccessToken::new("unknown-expiry-token".to_string(), None, now);
         assert!(usable_cached_token(&Some(unknown_expiry), now).is_none());
+    }
+
+    #[test]
+    fn next_offset_parses_google_range_header() {
+        assert_eq!(next_offset_from_range_header(Some("bytes=0-1048575")), 1048576);
+        assert_eq!(next_offset_from_range_header(None), 0);
+        assert_eq!(next_offset_from_range_header(Some("garbage")), 0);
     }
 }
