@@ -875,15 +875,25 @@ fn interrupted_offload_jobs_are_finalized_on_startup() {
     let run_id = db
         .create_scan_run("C:\\Data", Some("NTFS"), ScanMode::Recursive, None, None, 1)
         .expect("scan run");
-    db.create_offload_job(winclean_lib::db::OffloadJobInsert {
-        scan_run_id: run_id,
-        status: "running".to_string(),
-        destination_label: "test".to_string(),
-        total_items: 0,
-        total_bytes: 0,
+    let job_id = db
+        .create_offload_job(winclean_lib::db::OffloadJobInsert {
+            scan_run_id: run_id,
+            status: "running".to_string(),
+            destination_label: "test".to_string(),
+            total_items: 1,
+            total_bytes: 64,
+            created_at_ms: 1,
+        })
+        .expect("offload job");
+    db.insert_offload_item(winclean_lib::db::OffloadItemInsert {
+        job_id,
+        entry_id: 1,
+        candidate_id: "scan-1:entry-1".to_string(),
+        source_path: "C:\\Data\\stuck.bin".to_string(),
+        size: 64,
         created_at_ms: 1,
     })
-    .expect("offload job");
+    .expect("offload item");
 
     assert!(db
         .latest_active_offload_job_id()
@@ -899,6 +909,9 @@ fn interrupted_offload_jobs_are_finalized_on_startup() {
         .is_none());
     let jobs = db.list_offload_jobs(10).expect("list jobs");
     assert_eq!(jobs[0].status, "interrupted");
+    assert_eq!(jobs[0].failed_items, 1, "aggregates are recalculated");
+    let items = db.offload_items(job_id).expect("job items");
+    assert_eq!(items[0].status, "interrupted");
 }
 
 #[test]

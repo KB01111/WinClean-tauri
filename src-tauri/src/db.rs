@@ -1160,6 +1160,10 @@ impl Database {
 
     pub fn finalize_interrupted_offload_jobs(&self) -> anyhow::Result<usize> {
         let conn = self.connect()?;
+        let interrupted_job_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM offload_jobs WHERE status IN ('queued', 'running')")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
         conn.execute(
             r#"
             UPDATE offload_items
@@ -1171,17 +1175,23 @@ impl Database {
             "#,
             params![unix_millis()],
         )?;
-        conn.execute(
-            r#"
-            UPDATE offload_jobs
-            SET status = 'interrupted',
-                completed_at_ms = COALESCE(completed_at_ms, ?1),
-                last_error = COALESCE(last_error, 'Offload was interrupted before the app closed.')
-            WHERE status IN ('queued', 'running')
-            "#,
-            params![unix_millis()],
-        )
-        .context("finalize interrupted offload jobs")
+        let updated = conn
+            .execute(
+                r#"
+                UPDATE offload_jobs
+                SET status = 'interrupted',
+                    completed_at_ms = COALESCE(completed_at_ms, ?1),
+                    last_error = COALESCE(last_error, 'Offload was interrupted before the app closed.')
+                WHERE status IN ('queued', 'running')
+                "#,
+                params![unix_millis()],
+            )
+            .context("finalize interrupted offload jobs")?;
+        drop(conn);
+        for job_id in interrupted_job_ids {
+            self.recalculate_offload_job(job_id)?;
+        }
+        Ok(updated)
     }
 
     pub fn offload_item(&self, item_id: i64) -> anyhow::Result<Option<OffloadItemRecord>> {
