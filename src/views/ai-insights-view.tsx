@@ -19,7 +19,11 @@ export function AiInsightsView({
   scanRuns: ScanRunRecord[]
   activeRun: ScanRunRecord | null
   aiKeyConfigured: boolean
-  onApplySuggestion: (mode: RecoverMode, candidateIds: string[]) => void
+  onApplySuggestion: (
+    runId: number,
+    mode: RecoverMode,
+    candidateIds: string[]
+  ) => void
   onGoToSettings: () => void
 }) {
   const completedRuns = scanRuns.filter((run) => run.status === "completed")
@@ -177,12 +181,15 @@ export function AiInsightsView({
                           suggestion.candidateIds.length === 0 ||
                           analyzedRunId === null
                         }
-                        onClick={() =>
-                          onApplySuggestion(
-                            suggestion.action,
-                            suggestion.candidateIds
-                          )
-                        }
+                        onClick={() => {
+                          if (analyzedRunId !== null) {
+                            onApplySuggestion(
+                              analyzedRunId,
+                              suggestion.action,
+                              suggestion.candidateIds
+                            )
+                          }
+                        }}
                       >
                         Add to selection
                         <ArrowRight className="size-4" aria-hidden="true" />

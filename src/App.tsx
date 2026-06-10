@@ -680,7 +680,21 @@ function App() {
     }
   }
 
-  function applyAiSuggestion(mode: RecoverMode, candidateIds: string[]) {
+  async function applyAiSuggestion(
+    runId: number,
+    mode: RecoverMode,
+    candidateIds: string[]
+  ) {
+    // Candidate ids are scoped to the analyzed run, so make it the active run
+    // before applying the selection.
+    if (runId !== activeRun?.id) {
+      const analyzedRun = scanRuns.find((run) => run.id === runId)
+      if (!analyzedRun) {
+        toast.error("The analyzed scan run is no longer available.")
+        return
+      }
+      await selectRun(analyzedRun)
+    }
     setRecoverMode(mode)
     setSelectedCleanupIds(new Set(candidateIds))
     setView("cleanup")
