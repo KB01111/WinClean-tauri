@@ -362,7 +362,20 @@ pub fn restore_offload_item(
         std::fs::create_dir_all(parent)?;
     }
 
-    let temp_path = destination.with_extension("winclean-restore-tmp");
+    let temp_file_name = format!(
+        "{}.winclean-restore-tmp",
+        destination
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("offload-item-{item_id}"))
+    );
+    let temp_path = destination.with_file_name(temp_file_name);
+    if temp_path.exists() {
+        anyhow::bail!(
+            "A file already exists at the temporary restore path {}. Move it aside before restoring.",
+            temp_path.display()
+        );
+    }
     let downloaded_bytes = match drive.download_file(&drive_file_id, &temp_path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -623,7 +636,7 @@ impl GoogleDriveClient {
         offset: u64,
         total: u64,
     ) -> anyhow::Result<ChunkOutcome> {
-        let end = offset + chunk.len() as u64 - 1;
+        let end = offset + (chunk.len() as u64).saturating_sub(1);
         let response = self
             .client
             .put(session_url)

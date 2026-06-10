@@ -341,7 +341,7 @@ export function OffloadItemRow({
   onRestore?: (itemId: number) => void
   restorePending?: boolean
 }) {
-  const fileName = item.sourcePath.split("\\").pop() ?? item.sourcePath
+  const fileName = item.sourcePath.split(/[\\/]/).pop() ?? item.sourcePath
   const uploading = item.status === "uploading"
   const percent =
     item.size > 0 ? Math.round((item.uploadedBytes / item.size) * 100) : 0

@@ -258,6 +258,11 @@ function AiSettingsPanel({
             type="password"
             value={keyInput}
             onChange={(event) => setKeyInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && keyInput.trim() && !pending) {
+                void saveKey()
+              }
+            }}
             placeholder={configured ? "Key configured — enter to replace" : "sk-..."}
             className="max-w-80 flex-1"
             autoComplete="off"
