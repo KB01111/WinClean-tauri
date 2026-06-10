@@ -107,6 +107,7 @@ export function AiInsightsView({
               <span className="text-muted-foreground">Scan run</span>
               <select
                 value={effectiveRunId ?? ""}
+                disabled={analyzing}
                 onChange={(event) => {
                   setSelectedRunId(Number(event.target.value))
                   setReport(null)
