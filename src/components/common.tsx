@@ -143,8 +143,8 @@ export function DataTable({
             </td>
           </tr>
         ) : (
-          rows.map((row) => (
-            <tr key={row.join("|")} className="border-b border-border/60">
+          rows.map((row, rowIndex) => (
+            <tr key={rowIndex} className="border-b border-border/60">
               {row.map((cell, index) => (
                 <td
                   key={`${cell}-${index}`}

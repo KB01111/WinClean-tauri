@@ -816,8 +816,13 @@ impl DriveUploader for GoogleDriveClient {
 
     fn download_file(&self, file_id: &str, destination: &Path) -> anyhow::Result<u64> {
         let token = self.access_token()?;
-        let mut response = self
-            .client
+        // Restores stream the whole file in one request, so the per-request
+        // timeout used for API calls would abort large downloads. Use a
+        // dedicated client with only a connect timeout.
+        let download_client = Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .build()?;
+        let mut response = download_client
             .get(format!("{DRIVE_API}/files/{file_id}"))
             .bearer_auth(token)
             .query(&[("alt", "media")])
@@ -877,6 +882,13 @@ fn process_item(
             upload.size,
             "Google Drive upload verification failed",
         );
+    }
+
+    // The cancel flag may have been set while the final chunk was in flight;
+    // never recycle the local original for a canceled batch.
+    if cancel.load(Ordering::Relaxed) {
+        let _ = drive.delete_file(&upload.file_id);
+        return mark_item_failed(db, item.id, "canceled", 0, OFFLOAD_CANCELED_MESSAGE);
     }
 
     db.record_cleanup_action(CleanupActionInsert {

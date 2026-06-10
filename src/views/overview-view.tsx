@@ -49,6 +49,14 @@ export function OverviewView({
   onExportReport: () => void
   reportPending: boolean
 }) {
+  // Show live counts while a scan runs (even when they are legitimately 0)
+  // or when the progress snapshot belongs to the selected run; otherwise show
+  // the selected run's stored totals.
+  const showLiveProgress =
+    progress.state === "running" ||
+    (progress.state !== "idle" &&
+      progress.runId != null &&
+      progress.runId === activeRun?.id)
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
       <div className="space-y-4">
@@ -56,25 +64,33 @@ export function OverviewView({
           <Metric
             label="Files"
             value={formatNumber(
-              progress.filesIndexed || activeRun?.filesIndexed || 0
+              showLiveProgress
+                ? progress.filesIndexed
+                : (activeRun?.filesIndexed ?? 0)
             )}
           />
           <Metric
             label="Folders"
             value={formatNumber(
-              progress.directoriesIndexed || activeRun?.directoriesIndexed || 0
+              showLiveProgress
+                ? progress.directoriesIndexed
+                : (activeRun?.directoriesIndexed ?? 0)
             )}
           />
           <Metric
             label="Indexed"
             value={formatBytes(
-              progress.bytesIndexed || activeRun?.bytesIndexed || 0
+              showLiveProgress
+                ? progress.bytesIndexed
+                : (activeRun?.bytesIndexed ?? 0)
             )}
           />
           <Metric
             label="Denied"
             value={formatNumber(
-              progress.accessDeniedCount || activeRun?.accessDeniedCount || 0
+              showLiveProgress
+                ? progress.accessDeniedCount
+                : (activeRun?.accessDeniedCount ?? 0)
             )}
           />
           <Metric
