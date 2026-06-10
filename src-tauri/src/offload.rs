@@ -398,7 +398,10 @@ pub fn restore_offload_item(
             anyhow::bail!("Restored file checksum mismatch; the local copy was discarded");
         }
     }
-    std::fs::rename(&temp_path, &destination)?;
+    if let Err(error) = std::fs::rename(&temp_path, &destination) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
 
     db.record_cleanup_action(CleanupActionInsert {
         action_type: "drive_restore".to_string(),

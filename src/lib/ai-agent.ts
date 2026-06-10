@@ -80,15 +80,15 @@ function buildTools(runId: number) {
         api.categorySummary(runId),
         api.extensionSummary(runId, 15),
       ])
-      const run = runs.find((record) => record.id === runId)
+      const matchedRun = runs.find((record) => record.id === runId)
       return JSON.stringify({
-        run: run
+        run: matchedRun
           ? {
-              rootPath: run.rootPath,
-              filesIndexed: run.filesIndexed,
-              directoriesIndexed: run.directoriesIndexed,
-              totalMb: toMb(run.bytesIndexed),
-              finishedAtMs: run.finishedAtMs,
+              rootPath: matchedRun.rootPath,
+              filesIndexed: matchedRun.filesIndexed,
+              directoriesIndexed: matchedRun.directoriesIndexed,
+              totalMb: toMb(matchedRun.bytesIndexed),
+              finishedAtMs: matchedRun.finishedAtMs,
             }
           : null,
         categories: categories.map((category) => ({
