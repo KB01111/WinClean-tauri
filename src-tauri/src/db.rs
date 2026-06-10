@@ -606,8 +606,19 @@ impl Database {
         if run.status == "running" {
             anyhow::bail!("Cannot delete a scan while it is running.");
         }
-
         let conn = self.connect()?;
+        // Deleting a scan cascades into offload_jobs/offload_items, which hold
+        // the Drive file ids needed to restore offloaded files. Keep those runs.
+        let offload_jobs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM offload_jobs WHERE scan_run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        if offload_jobs > 0 {
+            anyhow::bail!(
+                "This scan has Google Drive offload history that is needed to restore files, so it cannot be deleted."
+            );
+        }
         let deleted = conn
             .execute("DELETE FROM scan_runs WHERE id = ?1", params![run_id])
             .context("delete scan run")?;
@@ -617,7 +628,11 @@ impl Database {
     pub fn clear_scan_history(&self) -> anyhow::Result<usize> {
         let conn = self.connect()?;
         conn.execute(
-            "DELETE FROM scan_runs WHERE status IN ('completed', 'failed', 'canceled')",
+            r#"
+            DELETE FROM scan_runs
+            WHERE status IN ('completed', 'failed', 'canceled')
+              AND id NOT IN (SELECT DISTINCT scan_run_id FROM offload_jobs)
+            "#,
             [],
         )
         .context("clear scan history")
@@ -1125,6 +1140,167 @@ impl Database {
         .context("read offload job")
     }
 
+    pub fn list_offload_jobs(&self, limit: u32) -> anyhow::Result<Vec<OffloadJobRecord>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, scan_run_id, status, destination_label, drive_folder_id,
+                   total_items, completed_items, failed_items, total_bytes,
+                   uploaded_bytes, created_at_ms, started_at_ms, completed_at_ms, last_error
+            FROM offload_jobs
+            ORDER BY created_at_ms DESC, id DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit.clamp(1, 200)], offload_job_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("list offload jobs")
+    }
+
+    pub fn latest_active_offload_job_id(&self) -> anyhow::Result<Option<i64>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id FROM offload_jobs
+            WHERE status IN ('queued', 'running')
+            ORDER BY created_at_ms DESC, id DESC
+            LIMIT 1
+            "#,
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .context("read active offload job")
+    }
+
+    pub fn finalize_interrupted_offload_jobs(&self) -> anyhow::Result<usize> {
+        let conn = self.connect()?;
+        let interrupted_job_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM offload_jobs WHERE status IN ('queued', 'running')")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        conn.execute(
+            r#"
+            UPDATE offload_items
+            SET status = 'interrupted',
+                error = COALESCE(error, 'Offload was interrupted before the app closed.'),
+                completed_at_ms = COALESCE(completed_at_ms, ?1)
+            WHERE status IN ('queued', 'validating', 'uploading')
+              AND job_id IN (SELECT id FROM offload_jobs WHERE status IN ('queued', 'running'))
+            "#,
+            params![unix_millis()],
+        )?;
+        let updated = conn
+            .execute(
+                r#"
+                UPDATE offload_jobs
+                SET status = 'interrupted',
+                    completed_at_ms = COALESCE(completed_at_ms, ?1),
+                    last_error = COALESCE(last_error, 'Offload was interrupted before the app closed.')
+                WHERE status IN ('queued', 'running')
+                "#,
+                params![unix_millis()],
+            )
+            .context("finalize interrupted offload jobs")?;
+        drop(conn);
+        for job_id in interrupted_job_ids {
+            self.recalculate_offload_job(job_id)?;
+        }
+        Ok(updated)
+    }
+
+    pub fn offload_item(&self, item_id: i64) -> anyhow::Result<Option<OffloadItemRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, job_id, entry_id, candidate_id, source_path, size, status,
+                   drive_file_id, drive_web_url, uploaded_bytes, md5_checksum,
+                   error, recycle_status, created_at_ms, completed_at_ms
+            FROM offload_items
+            WHERE id = ?1
+            "#,
+            params![item_id],
+            offload_item_from_row,
+        )
+        .optional()
+        .context("read offload item")
+    }
+
+    pub fn update_offload_item_progress(
+        &self,
+        item_id: i64,
+        uploaded_bytes: u64,
+    ) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE offload_items SET uploaded_bytes = ?2 WHERE id = ?1",
+            params![item_id, uploaded_bytes as i64],
+        )?;
+        let job_id = conn.query_row(
+            "SELECT job_id FROM offload_items WHERE id = ?1",
+            params![item_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.recalculate_offload_job(job_id)
+    }
+
+    pub fn set_offload_item_recycle_status(
+        &self,
+        item_id: i64,
+        recycle_status: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE offload_items SET recycle_status = ?2 WHERE id = ?1",
+            params![item_id, recycle_status],
+        )?;
+        Ok(())
+    }
+
+    pub fn largest_stale_files(
+        &self,
+        run_id: i64,
+        min_size: u64,
+        min_age_days: u64,
+        limit: u32,
+    ) -> anyhow::Result<Vec<FileSearchResult>> {
+        let cutoff_ms = unix_millis() - (min_age_days as i64) * 86_400_000;
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, path, parent_path, name, extension, size, modified_at_ms,
+                   is_reparse_point, is_placeholder, is_system
+            FROM file_entries
+            WHERE scan_run_id = ?1
+              AND is_directory = 0
+              AND size >= ?2
+              AND modified_at_ms IS NOT NULL
+              AND modified_at_ms <= ?3
+            ORDER BY size DESC, path ASC
+            LIMIT ?4
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![run_id, min_size as i64, cutoff_ms, limit.clamp(1, 500)],
+            |row| {
+                Ok(FileSearchResult {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    parent_path: row.get(2)?,
+                    name: row.get(3)?,
+                    extension: row.get(4)?,
+                    size: row.get::<_, i64>(5)? as u64,
+                    modified_at_ms: row.get(6)?,
+                    is_reparse_point: row.get::<_, bool>(7)?,
+                    is_placeholder: row.get::<_, bool>(8)?,
+                    is_system: row.get::<_, bool>(9)?,
+                })
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read largest stale files")
+    }
+
     pub fn offload_items(&self, job_id: i64) -> anyhow::Result<Vec<OffloadItemRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -1163,7 +1339,8 @@ impl Database {
                 ),
                 failed_items = (
                     SELECT COUNT(*) FROM offload_items
-                    WHERE job_id = ?1 AND status IN ('failed', 'skipped')
+                    WHERE job_id = ?1
+                      AND status IN ('failed', 'skipped', 'uploaded_recycle_failed', 'interrupted')
                 ),
                 uploaded_bytes = (
                     SELECT COALESCE(SUM(uploaded_bytes), 0) FROM offload_items

@@ -18,6 +18,7 @@ pub fn run() {
             let database = db::Database::open(app_data_dir.join("winclean.sqlite3"))?;
             database.migrate()?;
             database.finalize_interrupted_scan_runs()?;
+            database.finalize_interrupted_offload_jobs()?;
             app.manage(commands::AppState::new(database, app_data_dir));
             Ok(())
         })
@@ -44,6 +45,15 @@ pub fn run() {
             commands::start_offload,
             commands::offload_status,
             commands::cancel_offload,
+            commands::list_offload_jobs,
+            commands::active_offload_job,
+            commands::restore_offload_item,
+            commands::largest_stale_files,
+            commands::open_url,
+            commands::ai_key_status,
+            commands::set_ai_api_key,
+            commands::clear_ai_api_key,
+            commands::get_ai_api_key,
             commands::export_report,
             commands::export_diagnostics,
             commands::app_health,

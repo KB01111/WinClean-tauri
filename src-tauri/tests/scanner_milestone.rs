@@ -11,8 +11,9 @@ use std::collections::HashMap;
 
 use winclean_lib::db::Database;
 use winclean_lib::offload::{
-    create_offload_job, process_offload_job_with_client, run_offload_job_with_client, DriveFolder,
-    DriveUploadResult, DriveUploader, FileRecycler,
+    active_offload_job, create_offload_job, list_offload_jobs, process_offload_job_with_client,
+    restore_offload_item, run_offload_job_with_client, DriveFolder, DriveUploadResult,
+    DriveUploader, FileRecycler, UploadProgress,
 };
 use winclean_lib::recommendations::{
     build_recommendations, resolve_offload_recommendation_candidates, RecommendationFilters,
@@ -756,6 +757,164 @@ fn offload_job_can_be_cancelled_before_side_effects() {
 }
 
 #[test]
+fn offload_job_records_failed_uploads_and_history_listing() {
+    let temp = safe_tempdir();
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    let file_path = root.join("movie.mp4");
+    write_sparse_file(&file_path, 120 * 1024 * 1024);
+    set_modified_time(&file_path, current_test_millis() - hours_ms(25));
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let candidate = recommendations
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.path.ends_with("movie.mp4"))
+        .expect("movie offload candidate");
+    let drive = FakeDrive::default();
+    drive.fail_first_uploads.store(1, Ordering::Relaxed);
+    let recycler = FakeRecycler::default();
+    let cancel = AtomicBool::new(false);
+
+    let status = run_offload_job_with_client(
+        &db,
+        summary.run_id,
+        vec![candidate],
+        &drive,
+        &recycler,
+        &cancel,
+    )
+    .expect("offload job");
+
+    assert_eq!(status.status, "completed_with_errors");
+    assert_eq!(status.failed_items, 1);
+    assert_eq!(status.items[0].status, "failed");
+    assert!(status.items[0]
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("simulated transient upload failure"));
+
+    let jobs = list_offload_jobs(&db, 10).expect("list offload jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, status.id);
+    assert_eq!(jobs[0].items.len(), 1);
+    assert!(active_offload_job(&db)
+        .expect("active offload job")
+        .is_none());
+}
+
+#[test]
+fn offload_item_can_be_restored_from_drive_with_verification() {
+    let temp = safe_tempdir();
+    let root = temp.path().join("fixture");
+    let downloads = root.join("Downloads");
+    fs::create_dir_all(&downloads).expect("fixture dir");
+    let file_path = downloads.join("movie.mp4");
+    let payload = vec![7_u8; 64 * 1024];
+    fs::write(&file_path, &payload).expect("write payload");
+    set_modified_time(&file_path, current_test_millis() - hours_ms(31 * 24));
+
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let summary = run_recursive_scan(&db, root.as_path(), None).expect("scan");
+    let recommendations =
+        build_recommendations(&db, summary.run_id, RecommendationFilters::default())
+            .expect("recommendations");
+    let candidate = recommendations
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.path.ends_with("movie.mp4"))
+        .expect("movie offload candidate");
+    let drive = FakeDrive::default();
+    *drive.download_payload.lock().expect("payload lock") = Some(payload.clone());
+    let recycler = DeletingRecycler;
+    let cancel = AtomicBool::new(false);
+
+    let status = run_offload_job_with_client(
+        &db,
+        summary.run_id,
+        vec![candidate],
+        &drive,
+        &recycler,
+        &cancel,
+    )
+    .expect("offload job");
+    assert_eq!(status.status, "completed");
+    assert!(!file_path.exists());
+
+    let restored = restore_offload_item(&db, status.items[0].id, &drive, None).expect("restore");
+    assert_eq!(restored.recycle_status.as_deref(), Some("restored"));
+    assert!(file_path.exists());
+    assert_eq!(
+        fs::metadata(&file_path).expect("restored metadata").len(),
+        payload.len() as u64
+    );
+
+    let history = db.cleanup_history(20).expect("history");
+    assert!(history
+        .iter()
+        .any(|action| action.action_type == "drive_restore" && action.status == "completed"));
+}
+
+#[test]
+fn interrupted_offload_jobs_are_finalized_on_startup() {
+    let temp = safe_tempdir();
+    let db_path = temp.path().join("index.sqlite3");
+    let db = Database::open(&db_path).expect("open db");
+    db.migrate().expect("migrate db");
+    let run_id = db
+        .create_scan_run("C:\\Data", Some("NTFS"), ScanMode::Recursive, None, None, 1)
+        .expect("scan run");
+    let job_id = db
+        .create_offload_job(winclean_lib::db::OffloadJobInsert {
+            scan_run_id: run_id,
+            status: "running".to_string(),
+            destination_label: "test".to_string(),
+            total_items: 1,
+            total_bytes: 64,
+            created_at_ms: 1,
+        })
+        .expect("offload job");
+    db.insert_offload_item(winclean_lib::db::OffloadItemInsert {
+        job_id,
+        entry_id: 1,
+        candidate_id: "scan-1:entry-1".to_string(),
+        source_path: "C:\\Data\\stuck.bin".to_string(),
+        size: 64,
+        created_at_ms: 1,
+    })
+    .expect("offload item");
+
+    assert!(db
+        .latest_active_offload_job_id()
+        .expect("active id")
+        .is_some());
+    let finalized = db
+        .finalize_interrupted_offload_jobs()
+        .expect("finalize interrupted offload jobs");
+    assert_eq!(finalized, 1);
+    assert!(db
+        .latest_active_offload_job_id()
+        .expect("active id")
+        .is_none());
+    let jobs = db.list_offload_jobs(10).expect("list jobs");
+    assert_eq!(jobs[0].status, "interrupted");
+    assert_eq!(jobs[0].failed_items, 1, "aggregates are recalculated");
+    let items = db.offload_items(job_id).expect("job items");
+    assert_eq!(items[0].status, "interrupted");
+}
+
+#[test]
 fn cleanup_candidate_resolution_dedupes_and_rejects_stale_ids_before_cleanup() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("index.sqlite3");
@@ -1238,6 +1397,9 @@ fn safe_tempdir() -> tempfile::TempDir {
 #[derive(Default)]
 struct FakeDrive {
     upload_count: std::sync::atomic::AtomicUsize,
+    delete_count: std::sync::atomic::AtomicUsize,
+    fail_first_uploads: std::sync::atomic::AtomicUsize,
+    download_payload: Mutex<Option<Vec<u8>>>,
 }
 
 impl DriveUploader for FakeDrive {
@@ -1252,14 +1414,57 @@ impl DriveUploader for FakeDrive {
         &self,
         _folder_id: &str,
         candidate: &winclean_lib::recommendations::RecommendationCandidate,
+        progress: &UploadProgress<'_>,
     ) -> anyhow::Result<DriveUploadResult> {
+        if self
+            .fail_first_uploads
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                (remaining > 0).then(|| remaining - 1)
+            })
+            .is_ok()
+        {
+            anyhow::bail!("simulated transient upload failure");
+        }
         self.upload_count.fetch_add(1, Ordering::Relaxed);
+        (progress.report)(candidate.size / 2);
+        (progress.report)(candidate.size);
         Ok(DriveUploadResult {
             file_id: "drive-file-1".to_string(),
             web_url: Some("https://drive.google.com/file/d/drive-file-1/view".to_string()),
             size: candidate.size,
             md5_checksum: None,
         })
+    }
+
+    fn delete_file(&self, _file_id: &str) -> anyhow::Result<()> {
+        self.delete_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn download_file(
+        &self,
+        _file_id: &str,
+        destination: &std::path::Path,
+    ) -> anyhow::Result<u64> {
+        let payload = self
+            .download_payload
+            .lock()
+            .expect("download payload lock")
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no download payload configured"))?;
+        fs::write(destination, &payload)?;
+        Ok(payload.len() as u64)
+    }
+}
+
+/// Recycler stand-in that actually removes the file so restore flows can be
+/// exercised end to end in tests.
+struct DeletingRecycler;
+
+impl FileRecycler for DeletingRecycler {
+    fn recycle_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        fs::remove_file(path)?;
+        Ok(())
     }
 }
 
