@@ -76,7 +76,7 @@ function buildTools(runId: number) {
     parameters: z.object({}),
     execute: async () => {
       const [runs, categories, extensions] = await Promise.all([
-        api.scanRuns(50),
+        api.scanRuns(500),
         api.categorySummary(runId),
         api.extensionSummary(runId, 15),
       ])

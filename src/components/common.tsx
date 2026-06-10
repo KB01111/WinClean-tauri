@@ -230,7 +230,7 @@ export function ProgressBar({
         className
       )}
       role="progressbar"
-      aria-valuenow={percent}
+      aria-valuenow={Math.min(100, Math.max(0, percent))}
       aria-valuemin={0}
       aria-valuemax={100}
     >

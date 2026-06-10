@@ -70,6 +70,13 @@ export function useOffload({ onJobSettled }: { onJobSettled: () => void }) {
         if (consecutiveFailures >= 3) {
           window.clearInterval(timer)
           toast.error(formatError(error))
+          // Don't leave the controls stuck on a stale "running" job: try to
+          // rehydrate the real state, and clear it if that also fails.
+          try {
+            setActiveJob(await api.activeOffloadJob())
+          } catch {
+            setActiveJob(null)
+          }
         }
       }
     }, 1200)
