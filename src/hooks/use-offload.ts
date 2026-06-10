@@ -39,9 +39,11 @@ export function useOffload({ onJobSettled }: { onJobSettled: () => void }) {
       return
     }
     const jobId = activeJob.id
+    let consecutiveFailures = 0
     const timer = window.setInterval(async () => {
       try {
         const nextJob = await api.offloadStatus(jobId)
+        consecutiveFailures = 0
         setActiveJob(nextJob)
         if (nextJob.status !== "queued" && nextJob.status !== "running") {
           if (nextJob.status === "completed") {
@@ -62,7 +64,13 @@ export function useOffload({ onJobSettled }: { onJobSettled: () => void }) {
           onJobSettledRef.current()
         }
       } catch (error) {
-        toast.error(formatError(error))
+        // Tolerate transient hiccups, but stop polling (and the toast spam)
+        // if the status endpoint keeps failing.
+        consecutiveFailures += 1
+        if (consecutiveFailures >= 3) {
+          window.clearInterval(timer)
+          toast.error(formatError(error))
+        }
       }
     }, 1200)
     return () => window.clearInterval(timer)
