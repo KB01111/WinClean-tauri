@@ -44,7 +44,7 @@ export function HistoryView({
   ).length
 
   return (
-    <div className="grid gap-4 xl:grid-cols-2">
+    <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
       <div className="space-y-4">
         <Panel title="Offload batches">
           {offloadJobs.length === 0 ? (
@@ -93,6 +93,14 @@ export function HistoryView({
                     <StatusBadge status={action.status} />
                     <span>{formatDateTime(action.createdAtMs)}</span>
                   </div>
+                  {action.explanation ? (
+                    <div
+                      className="mt-0.5 truncate text-xs text-muted-foreground"
+                      title={action.explanation}
+                    >
+                      {action.explanation}
+                    </div>
+                  ) : null}
                 </div>
               </div>
             ))
@@ -106,6 +114,7 @@ export function HistoryView({
           <Button
             variant="outline"
             size="sm"
+            aria-label="Clear completed scans"
             disabled={historyPending || clearableScanCount === 0}
             onClick={onClearScanHistory}
           >
@@ -171,6 +180,7 @@ function OffloadHistoryCard({
     <div className="rounded-lg border border-border bg-card">
       <button
         type="button"
+        aria-expanded={expanded}
         onClick={() => setExpanded((value) => !value)}
         className="flex w-full items-center justify-between gap-3 p-3 text-left text-sm"
       >
@@ -184,6 +194,9 @@ function OffloadHistoryCard({
             Batch {job.id} · {job.destinationLabel}
           </span>
           <StatusBadge status={job.status} />
+          <span className="inline-flex shrink-0 items-center rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground tabular-nums">
+            {progress.percent}%
+          </span>
         </span>
         <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
           {job.completedItems}/{job.totalItems} ·{" "}

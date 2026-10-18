@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -353,6 +353,35 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_offload_items_job
                 ON offload_items(job_id, status);
+
+            CREATE TABLE IF NOT EXISTS optimizer_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                target TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                rolled_back_at_ms INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS optimizer_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                target TEXT NOT NULL,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detail TEXT,
+                snapshot_id INTEGER,
+                created_at_ms INTEGER NOT NULL,
+                completed_at_ms INTEGER,
+                FOREIGN KEY (snapshot_id) REFERENCES optimizer_snapshots(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS power_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at_ms INTEGER NOT NULL,
+                percent INTEGER NOT NULL,
+                on_ac INTEGER NOT NULL
+            );
             "#,
         )?;
         conn.execute(
@@ -371,6 +400,87 @@ impl Database {
         )
         .optional()
         .context("read schema version")
+    }
+
+    // --- WinClean 2.0 optimizer persistence ---
+
+    pub fn insert_optimizer_snapshot(&self, kind: &str, target: &str, payload_json: &str) -> anyhow::Result<i64> {
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO optimizer_snapshots (kind, target, payload_json, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![kind, target, payload_json, unix_millis()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_optimizer_snapshot(&self, id: i64) -> anyhow::Result<Option<crate::optimizer::OptimizationSnapshot>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, kind, target, payload_json, created_at_ms, rolled_back_at_ms FROM optimizer_snapshots WHERE id = ?1",
+            params![id],
+            |row| Ok(crate::optimizer::OptimizationSnapshot {
+                id: row.get(0)?, kind: row.get(1)?, target: row.get(2)?,
+                payload_json: row.get(3)?, created_at_ms: row.get(4)?, rolled_back_at_ms: row.get(5)?,
+            }),
+        ).optional().context("read optimizer snapshot")
+    }
+
+    pub fn mark_snapshot_rolled_back(&self, id: i64) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute("UPDATE optimizer_snapshots SET rolled_back_at_ms = ?2 WHERE id = ?1", params![id, unix_millis()])?;
+        Ok(())
+    }
+
+    pub fn insert_optimizer_audit(&self, kind: &str, target: &str, action: &str, status: &str, detail: Option<&str>, snapshot_id: Option<i64>) -> anyhow::Result<i64> {
+        let conn = self.connect()?;
+        let done = if status == "pending" { None } else { Some(unix_millis()) };
+        conn.execute(
+            "INSERT INTO optimizer_audit (kind, target, action, status, detail, snapshot_id, created_at_ms, completed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![kind, target, action, status, detail, snapshot_id, unix_millis(), done],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_optimizer_audit(&self, limit: u32) -> anyhow::Result<Vec<crate::optimizer::OptimizationAudit>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, target, action, status, detail, snapshot_id, created_at_ms, completed_at_ms FROM optimizer_audit ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| Ok(crate::optimizer::OptimizationAudit {
+            id: row.get(0)?, kind: row.get(1)?, target: row.get(2)?, action: row.get(3)?,
+            status: row.get(4)?, detail: row.get(5)?, snapshot_id: row.get(6)?,
+            created_at_ms: row.get(7)?, completed_at_ms: row.get(8)?,
+        }))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("list optimizer audit")
+    }
+
+    pub fn list_optimizer_snapshots(&self, limit: u32) -> anyhow::Result<Vec<crate::optimizer::OptimizationSnapshot>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, target, payload_json, created_at_ms, rolled_back_at_ms FROM optimizer_snapshots ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| Ok(crate::optimizer::OptimizationSnapshot {
+            id: row.get(0)?, kind: row.get(1)?, target: row.get(2)?,
+            payload_json: row.get(3)?, created_at_ms: row.get(4)?, rolled_back_at_ms: row.get(5)?,
+        }))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("list optimizer snapshots")
+    }
+
+    pub fn record_power_sample(&self, percent: u8, on_ac: bool) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute("INSERT INTO power_history (at_ms, percent, on_ac) VALUES (?1, ?2, ?3)", params![unix_millis(), percent as i64, on_ac as i64])?;
+        // Keep the table bounded: last 2000 samples.
+        conn.execute("DELETE FROM power_history WHERE id NOT IN (SELECT id FROM power_history ORDER BY id DESC LIMIT 2000)", [])?;
+        Ok(())
+    }
+
+    pub fn power_history(&self, limit: u32) -> anyhow::Result<Vec<crate::optimizer::power::PowerSample>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare("SELECT at_ms, percent, on_ac FROM power_history ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit], |row| Ok(crate::optimizer::power::PowerSample {
+            at_ms: row.get(0)?, percent: row.get::<_, i64>(1)? as u8, on_ac: row.get::<_, i64>(2)? != 0,
+        }))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read power history")
     }
 
     pub fn table_names(&self) -> anyhow::Result<Vec<String>> {
@@ -805,28 +915,40 @@ impl Database {
     }
 
     pub fn category_summary(&self, run_id: i64) -> anyhow::Result<Vec<CategorySummary>> {
-        let extensions = self.extension_summary(run_id, 500)?;
-        let mut categories: HashMap<String, CategorySummary> = HashMap::new();
-        for extension in extensions {
-            let category = category_for_extension(extension.extension.as_deref()).to_string();
-            let entry = categories
-                .entry(category.clone())
-                .or_insert(CategorySummary {
-                    category,
-                    file_count: 0,
-                    total_size: 0,
-                });
-            entry.file_count += extension.file_count;
-            entry.total_size += extension.total_size;
-        }
-        let mut rows = categories.into_values().collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
-            right
-                .total_size
-                .cmp(&left.total_size)
-                .then_with(|| left.category.cmp(&right.category))
-        });
-        Ok(rows)
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT CASE
+                       WHEN ext IS NULL THEN 'No extension'
+                       WHEN ext IN ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'tif', 'tiff') THEN 'Images'
+                       WHEN ext IN ('mp4', 'mov', 'mkv', 'avi', 'wmv', 'webm') THEN 'Videos'
+                       WHEN ext IN ('mp3', 'wav', 'flac', 'aac', 'm4a', 'ogg') THEN 'Audio'
+                       WHEN ext IN ('pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'md', 'rtf', 'csv') THEN 'Documents'
+                       WHEN ext IN ('zip', '7z', 'rar', 'tar', 'gz', 'iso') THEN 'Archives'
+                       WHEN ext IN ('exe', 'msi', 'dll', 'sys', 'com') THEN 'Applications'
+                       WHEN ext IN ('tmp', 'temp', 'log', 'bak', 'old', 'dmp') THEN 'Cleanup candidates'
+                       ELSE 'Other'
+                   END AS category,
+                   COUNT(*) AS file_count,
+                   COALESCE(SUM(size), 0) AS total_size
+            FROM (
+                SELECT NULLIF(LOWER(COALESCE(extension, '')), '') AS ext, size
+                FROM file_entries
+                WHERE scan_run_id = ?1 AND is_directory = 0
+            )
+            GROUP BY category
+            ORDER BY total_size DESC, category ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(CategorySummary {
+                category: row.get(0)?,
+                file_count: row.get::<_, i64>(1)? as u64,
+                total_size: row.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read category summary")
     }
 
     pub fn cleanup_file_records(
@@ -874,10 +996,11 @@ impl Database {
     pub fn recommendation_file_records(
         &self,
         run_id: i64,
+        min_size: u64,
+        min_age_days: u64,
         limit: u32,
     ) -> anyhow::Result<Vec<CleanupFileRecord>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             r#"
             SELECT id, path, name, extension, size, modified_at_ms,
                    is_reparse_point, is_placeholder, is_system
@@ -885,11 +1008,29 @@ impl Database {
             WHERE scan_run_id = ?1
               AND is_directory = 0
               AND size > 0
-            ORDER BY size DESC, path ASC
-            LIMIT ?2
             "#,
-        )?;
-        let rows = stmt.query_map(params![run_id, limit.clamp(1, 20_000)], |row| {
+        );
+        let mut bindings = vec![run_id];
+        if min_size > 0 {
+            sql.push_str(&format!(" AND size >= ?{}", bindings.len() + 1));
+            bindings.push(min_size as i64);
+        }
+        if min_age_days > 0 {
+            sql.push_str(&format!(
+                " AND (modified_at_ms IS NULL OR modified_at_ms <= ?{})",
+                bindings.len() + 1
+            ));
+            bindings.push(unix_millis() - (min_age_days as i64) * 86_400_000);
+        }
+        sql.push_str(&format!(
+            " ORDER BY size DESC, path ASC LIMIT ?{}",
+            bindings.len() + 1
+        ));
+        bindings.push(i64::from(limit.clamp(1, 20_000)));
+
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bindings), |row| {
             Ok(CleanupFileRecord {
                 id: row.get(0)?,
                 path: row.get(1)?,
@@ -904,6 +1045,30 @@ impl Database {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("read recommendation files")
+    }
+
+    pub fn duplicate_name_size_keys(
+        &self,
+        run_id: i64,
+        min_size: u64,
+    ) -> anyhow::Result<HashSet<(String, u64)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT LOWER(name), size
+            FROM file_entries
+            WHERE scan_run_id = ?1
+              AND is_directory = 0
+              AND size >= ?2
+            GROUP BY LOWER(name), size
+            HAVING COUNT(*) > 1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![run_id, min_size as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        rows.collect::<rusqlite::Result<HashSet<_>>>()
+            .context("read duplicate name/size keys")
     }
 
     pub fn record_cleanup_action(&self, action: CleanupActionInsert) -> anyhow::Result<i64> {
@@ -1454,22 +1619,6 @@ fn offload_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OffloadIte
         created_at_ms: row.get(13)?,
         completed_at_ms: row.get(14)?,
     })
-}
-
-fn category_for_extension(extension: Option<&str>) -> &'static str {
-    match extension.unwrap_or_default().to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "tif" | "tiff" => "Images",
-        "mp4" | "mov" | "mkv" | "avi" | "wmv" | "webm" => "Videos",
-        "mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg" => "Audio",
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "rtf" | "csv" => {
-            "Documents"
-        }
-        "zip" | "7z" | "rar" | "tar" | "gz" | "iso" => "Archives",
-        "exe" | "msi" | "dll" | "sys" | "com" => "Applications",
-        "tmp" | "temp" | "log" | "bak" | "old" | "dmp" => "Cleanup candidates",
-        "" => "No extension",
-        _ => "Other",
-    }
 }
 
 fn unix_millis() -> i64 {

@@ -3,6 +3,7 @@ import {
   Cloud,
   Database,
   Download,
+  FolderOpen,
   KeyRound,
   Loader2,
   Monitor,
@@ -20,6 +21,24 @@ import { api, formatError, type AppHealth, type GoogleDriveStatus } from "@/lib/
 import { formatNumber } from "@/lib/format"
 import { AI_MODELS, getStoredAiModel, setStoredAiModel } from "@/lib/ai-agent"
 import { cn } from "@/lib/utils"
+
+const SCAN_STATE_LABELS: Record<string, string> = {
+  idle: "Idle",
+  running: "Scanning…",
+  completed: "Completed",
+  failed: "Failed",
+  canceled: "Canceled",
+}
+
+function databaseFolderName(path: string) {
+  const segments = path.split(/[\\/]/).filter(Boolean)
+  segments.pop()
+  return segments[segments.length - 1] ?? path
+}
+
+function databaseParentPath(path: string) {
+  return path.split(/[\\/]/).slice(0, -1).join("\\")
+}
 
 export function SettingsView({
   health,
@@ -135,11 +154,17 @@ export function SettingsView({
         <SummaryList
           rows={[
             ["Version", health?.appVersion ?? "unknown"],
-            ["Active scan", health?.activeScanState ?? "unknown"],
+            [
+              "Active scan",
+              health
+                ? (SCAN_STATE_LABELS[health.activeScanState] ??
+                  health.activeScanState)
+                : "unknown",
+            ],
             [
               "Latest run",
               health?.latestCompletedRunId
-                ? String(health.latestCompletedRunId)
+                ? `Scan #${health.latestCompletedRunId}`
                 : "none",
             ],
             ["Pending actions", formatNumber(health?.pendingActionCount ?? 0)],
@@ -147,9 +172,34 @@ export function SettingsView({
               "Pending offloads",
               formatNumber(health?.pendingOffloadCount ?? 0),
             ],
-            ["Database", health?.databasePath ?? "unknown"],
+            [
+              "Data folder",
+              health?.databasePath
+                ? databaseFolderName(health.databasePath)
+                : "unknown",
+            ],
           ]}
         />
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-3"
+          disabled={!health?.databasePath}
+          onClick={() => {
+            const databasePath = health?.databasePath
+            if (!databasePath) {
+              return
+            }
+            api.revealInExplorer(databaseParentPath(databasePath)).catch(
+              (error) => {
+                toast.error(formatError(error))
+              }
+            )
+          }}
+        >
+          <FolderOpen className="size-4" aria-hidden="true" />
+          Open data folder
+        </Button>
       </Panel>
     </div>
   )

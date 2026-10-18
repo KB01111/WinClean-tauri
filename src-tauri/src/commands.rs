@@ -9,7 +9,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     cleanup::{build_cleanup_plan, execute_cleanup_plan, CleanupPlan},
@@ -22,7 +22,7 @@ use crate::{
         begin_google_drive_auth as begin_drive_auth, create_offload_job,
         disconnect_google_drive as disconnect_drive, google_drive_status as drive_status,
         list_offload_jobs as read_offload_jobs, offload_status as read_offload_status,
-        process_offload_job_with_client, restore_offload_item as restore_item, GoogleDriveClient,
+        process_offload_job_with_sink, restore_offload_item as restore_item, GoogleDriveClient,
         GoogleDriveStatus, OffloadJobStatus, WindowsRecycleBin,
     },
     recommendations::{
@@ -86,6 +86,7 @@ pub fn scan_status(state: State<'_, AppState>) -> Result<ScanProgress, String> {
 
 #[tauri::command]
 pub fn start_scan(
+    app: AppHandle,
     state: State<'_, AppState>,
     root_path: String,
     file_system: Option<String>,
@@ -102,14 +103,19 @@ pub fn start_scan(
     let progress = Arc::clone(&state.progress);
     let cancel = Arc::clone(&state.cancel);
     let scan_root = PathBuf::from(root_path);
+    let handle = app.clone();
 
     thread::spawn(move || {
+        let sink_handle = handle.clone();
         let options = ScanRunOptions {
             file_system: trusted_file_system,
             attempted_mode: plan.attempted_mode,
             fallback_reason: plan.fallback_reason,
             cancel: Some(cancel),
             progress: Some(Arc::clone(&progress)),
+            progress_sink: Some(Arc::new(move |progress: &ScanProgress| {
+                let _ = sink_handle.emit("scan:progress", progress);
+            })),
         };
 
         if let Err(error) = run_recursive_scan(&db, &scan_root, Some(options)) {
@@ -117,6 +123,7 @@ pub fn start_scan(
                 progress.state = ScanState::Failed;
                 progress.last_error = Some(error.to_string());
                 progress.phase = Some("failed".to_string());
+                let _ = handle.emit("scan:progress", &*progress);
             }
         }
     });
@@ -320,6 +327,7 @@ pub fn disconnect_google_drive() -> Result<GoogleDriveStatus, String> {
 
 #[tauri::command]
 pub fn start_offload(
+    app: AppHandle,
     state: State<'_, AppState>,
     run_id: i64,
     candidate_ids: Vec<String>,
@@ -356,9 +364,19 @@ pub fn start_offload(
     let db = state.db.clone();
     let cancels = Arc::clone(&state.offload_cancels);
     let job_id = initial.id;
+    let handle = app.clone();
     thread::spawn(move || {
-        let _ =
-            process_offload_job_with_client(&db, job_id, candidates, &drive, &recycler, &cancel);
+        let _ = process_offload_job_with_sink(
+            &db,
+            job_id,
+            candidates,
+            &drive,
+            &recycler,
+            &cancel,
+            Some(Arc::new(move |status: &OffloadJobStatus| {
+                let _ = handle.emit("offload:progress", status);
+            })),
+        );
         if let Ok(mut cancels) = cancels.lock() {
             cancels.remove(&job_id);
         }
@@ -579,6 +597,203 @@ pub fn app_health(state: State<'_, AppState>) -> Result<AppHealth, String> {
         google_drive_configured: drive.configured,
         google_drive_connected: drive.connected,
     })
+}
+
+// --- WinClean 2.0 optimizer commands ---
+// Every mutation: policy check -> snapshot -> pending audit -> apply ->
+// verify by re-read -> completed audit. Failures keep the audit row.
+
+use crate::optimizer::{
+    capabilities::capability_report,
+    hardware::hardware_info,
+    policy::{classify_service, is_protected_service, ServiceRisk},
+    power::{battery_status, list_profiles, set_active_scheme},
+    processes::{list_processes, set_process_ecoqos},
+    services::{list_services, set_service_start_type, snapshot_payload, start_type_from_snapshot, StartType},
+    OptimizationAudit, OptimizationSnapshot,
+};
+
+#[tauri::command]
+pub fn optimizer_list_services() -> Result<Vec<crate::optimizer::services::ServiceInfo>, String> {
+    list_services()
+}
+
+#[tauri::command]
+pub fn optimizer_set_service_start_type(
+    state: State<'_, AppState>,
+    name: String,
+    display_name: String,
+    start_type: String,
+) -> Result<crate::optimizer::services::ServiceInfo, String> {
+    if is_protected_service(&name, &display_name) {
+        return Err(format!("'{display_name}' is protected (essential Windows/security/driver service) and cannot be changed by WinClean."));
+    }
+    let target = StartType::parse(&start_type).ok_or_else(|| format!("unknown start type: {start_type}"))?;
+    let current = list_services()?.into_iter().find(|s| s.name == name)
+        .ok_or_else(|| format!("service not found: {name}"))?;
+    if classify_service(&current.name, &current.display_name).risk == ServiceRisk::Protected {
+        return Err("protected service".into());
+    }
+    let snapshot_id = state.db.insert_optimizer_snapshot("service", &name, &snapshot_payload(&current).to_string()).map_err(to_command_error)?;
+    state.db.insert_optimizer_audit("service", &name, &format!("setStartType:{start_type}"), "pending", None, Some(snapshot_id)).map_err(to_command_error)?;
+    match set_service_start_type(&name, target) {
+        Ok(updated) => {
+            // Verify by re-reading from SCM.
+            let verified = list_services().ok().and_then(|all| all.into_iter().find(|s| s.name == name));
+            let detail = match &verified {
+                Some(v) if v.start_type == updated.start_type => format!("verified startType={}", v.start_type),
+                Some(v) => format!("applied; SCM now reports startType={}", v.start_type),
+                None => "applied; verification re-read unavailable".to_string(),
+            };
+            let _ = state.db.insert_optimizer_audit("service", &name, &format!("setStartType:{start_type}"), "completed", Some(&detail), Some(snapshot_id));
+            Ok(verified.unwrap_or(updated))
+        }
+        Err(e) => {
+            let _ = state.db.insert_optimizer_audit("service", &name, &format!("setStartType:{start_type}"), "failed", Some(&e), Some(snapshot_id));
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn optimizer_list_processes() -> Result<Vec<crate::optimizer::processes::ProcessInfo>, String> {
+    list_processes()
+}
+
+#[tauri::command]
+pub fn optimizer_set_process_ecoqos(
+    state: State<'_, AppState>,
+    pid: u32,
+    name: String,
+    enable: bool,
+) -> Result<(), String> {
+    use crate::optimizer::policy::{classify_process_for_ecoqos, EcoQosDecision};
+    if enable {
+        let decision = classify_process_for_ecoqos(&name, false, 0.0);
+        if decision == EcoQosDecision::Protected {
+            return Err(format!("'{name}' is protected (editor/compiler/foreground-class workload) and will not be throttled."));
+        }
+    }
+    let action = if enable { "ecoqos:on" } else { "ecoqos:off" };
+    state.db.insert_optimizer_audit("process", &format!("{name} ({pid})"), action, "pending", None, None).map_err(to_command_error)?;
+    match set_process_ecoqos(pid, enable) {
+        Ok(()) => {
+            let _ = state.db.insert_optimizer_audit("process", &format!("{name} ({pid})"), action, "completed", None, None);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = state.db.insert_optimizer_audit("process", &format!("{name} ({pid})"), action, "failed", Some(&e), None);
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn optimizer_battery_status(state: State<'_, AppState>) -> Result<crate::optimizer::power::BatteryStatus, String> {
+    let status = battery_status()?;
+    if let Some(p) = status.percent {
+        let _ = state.db.record_power_sample(p, status.on_ac);
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn optimizer_power_history(state: State<'_, AppState>, limit: Option<u32>) -> Result<Vec<crate::optimizer::power::PowerSample>, String> {
+    state.db.power_history(limit.unwrap_or(200).clamp(1, 2000)).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn optimizer_apply_power_profile(state: State<'_, AppState>, profile_id: String) -> Result<String, String> {
+    let profiles = list_profiles();
+    let profile = profiles.iter().find(|p| format!("{:?}", p.id).eq_ignore_ascii_case(&profile_id)
+        || p.label.eq_ignore_ascii_case(&profile_id))
+        .ok_or_else(|| format!("unknown power profile: {profile_id}"))?;
+    let guid = profile.scheme_guid.clone().ok_or("profile has no Windows scheme GUID")?;
+    // Snapshot the currently active scheme for rollback.
+    let before = battery_status().ok();
+    let payload = serde_json::json!({
+        "profileId": format!("{:?}", profile.id),
+        "schemeGuid": before.as_ref().and_then(|b| b.active_scheme_guid.clone()),
+        "schemeName": before.as_ref().and_then(|b| b.active_scheme_name.clone()),
+    });
+    let snapshot_id = state.db.insert_optimizer_snapshot("powerScheme", &profile.label, &payload.to_string()).map_err(to_command_error)?;
+    let _ = state.db.insert_optimizer_audit("power", &profile.label, "applyProfile", "pending", None, Some(snapshot_id));
+    match set_active_scheme(&guid) {
+        Ok(()) => {
+            let after = battery_status().map_err(|e| e)?;
+            let verified = after.active_scheme_guid.as_deref() == Some(guid.as_str());
+            let detail = format!("active scheme now {} ({})", after.active_scheme_name.clone().unwrap_or_default(), if verified { "verified" } else { "differs from requested GUID" });
+            let _ = state.db.insert_optimizer_audit("power", &profile.label, "applyProfile", "completed", Some(&detail), Some(snapshot_id));
+            Ok(detail)
+        }
+        Err(e) => {
+            let _ = state.db.insert_optimizer_audit("power", &profile.label, "applyProfile", "failed", Some(&e), Some(snapshot_id));
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn optimizer_hardware_info() -> Result<crate::optimizer::hardware::HardwareInfo, String> {
+    hardware_info()
+}
+
+#[tauri::command]
+pub fn optimizer_capabilities() -> Result<crate::optimizer::capabilities::CapabilityReport, String> {
+    let hw = hardware_info().ok();
+    let npu_present = hw.as_ref().map(|h| h.npu.present).unwrap_or(false);
+    let igpu = hw.as_ref().map(|h| h.adapters.iter().any(|a| a.kind == "igpu")).unwrap_or(false);
+    Ok(capability_report(npu_present, igpu))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizerHistory {
+    pub audit: Vec<OptimizationAudit>,
+    pub snapshots: Vec<OptimizationSnapshot>,
+    pub profiles: Vec<crate::optimizer::power::PowerProfile>,
+}
+
+#[tauri::command]
+pub fn optimizer_history(state: State<'_, AppState>, limit: Option<u32>) -> Result<OptimizerHistory, String> {
+    let limit = limit.unwrap_or(100).clamp(1, 500);
+    Ok(OptimizerHistory {
+        audit: state.db.list_optimizer_audit(limit).map_err(to_command_error)?,
+        snapshots: state.db.list_optimizer_snapshots(limit).map_err(to_command_error)?,
+        profiles: list_profiles(),
+    })
+}
+
+#[tauri::command]
+pub fn optimizer_rollback(state: State<'_, AppState>, snapshot_id: i64) -> Result<String, String> {
+    let snapshot = state.db.get_optimizer_snapshot(snapshot_id).map_err(to_command_error)?
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    if snapshot.rolled_back_at_ms.is_some() {
+        return Err("snapshot was already rolled back".into());
+    }
+    let payload: serde_json::Value = serde_json::from_str(&snapshot.payload_json).map_err(|e| e.to_string())?;
+    let result = match snapshot.kind.as_str() {
+        "service" => {
+            let target = start_type_from_snapshot(&payload).ok_or("snapshot has no restorable start type")?;
+            set_service_start_type(&snapshot.target, target).map(|s| format!("{} restored to {}", s.display_name, s.start_type))
+        }
+        "powerScheme" => {
+            let guid = payload.get("schemeGuid").and_then(|v| v.as_str()).ok_or("snapshot has no previous scheme GUID")?;
+            set_active_scheme(guid).map(|_| format!("power scheme restored to {guid}"))
+        }
+        other => Err(format!("rollback is not supported for snapshot kind '{other}'")),
+    };
+    match result {
+        Ok(msg) => {
+            state.db.mark_snapshot_rolled_back(snapshot_id).map_err(to_command_error)?;
+            let _ = state.db.insert_optimizer_audit(&snapshot.kind, &snapshot.target, "rollback", "completed", Some(&msg), Some(snapshot_id));
+            Ok(msg)
+        }
+        Err(e) => {
+            let _ = state.db.insert_optimizer_audit(&snapshot.kind, &snapshot.target, "rollback", "failed", Some(&e), Some(snapshot_id));
+            Err(e)
+        }
+    }
 }
 
 fn resolve_run_id(db: &Database, run_id: Option<i64>) -> Result<Option<i64>, String> {

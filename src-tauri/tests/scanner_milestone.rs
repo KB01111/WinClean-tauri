@@ -212,6 +212,7 @@ fn recursive_scan_reports_multicore_worker_count_in_progress() {
             fallback_reason: None,
             cancel: None,
             progress: Some(std::sync::Arc::clone(&progress)),
+            progress_sink: None,
         }),
     )
     .expect("scan");
@@ -248,6 +249,7 @@ fn missing_scan_root_is_persisted_as_failed() {
             fallback_reason: None,
             cancel: None,
             progress: Some(std::sync::Arc::clone(&progress)),
+            progress_sink: None,
         }),
     )
     .expect_err("missing root should fail");

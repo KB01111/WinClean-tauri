@@ -1,5 +1,6 @@
 import { AlertTriangle, Info } from "lucide-react"
 
+import { formatBytes } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 export function NavButton({
@@ -242,6 +243,126 @@ export function ProgressBar({
   )
 }
 
+export function CapacityBar({
+  used,
+  total,
+  label,
+  className,
+}: {
+  used: number
+  total: number
+  label?: string
+  className?: string
+}) {
+  const ratio = total > 0 ? Math.min(1, Math.max(0, used / total)) : 0
+  const percent = Math.round(ratio * 100)
+  const fillClass =
+    ratio >= 0.9
+      ? "bg-destructive"
+      : ratio >= 0.75
+        ? "bg-amber-500"
+        : "bg-chart-1"
+  return (
+    <div className={className}>
+      <div
+        className="h-2 overflow-hidden rounded-full bg-muted"
+        role="progressbar"
+        aria-valuenow={percent}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label={label}
+      >
+        <div
+          className={cn(
+            "h-full rounded-full transition-[width] duration-300",
+            fillClass
+          )}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+      <span className="sr-only">
+        {percent}% used of {formatBytes(total)}
+      </span>
+    </div>
+  )
+}
+
+export type DistributionSegment = {
+  label: string
+  value: number
+  className: string
+}
+
+export function DistributionBar({
+  segments,
+  className,
+}: {
+  segments: DistributionSegment[]
+  className?: string
+}) {
+  const visible = segments.filter((segment) => segment.value > 0)
+  const total = visible.reduce((sum, segment) => sum + segment.value, 0)
+  if (total <= 0) {
+    return <EmptyState text="No distribution data yet" />
+  }
+  return (
+    <div className={className}>
+      <div
+        className="flex h-2.5 overflow-hidden rounded-full"
+        role="img"
+        aria-label={visible
+          .map(
+            (segment) =>
+              `${segment.label} ${Math.round((segment.value / total) * 100)}%`
+          )
+          .join(", ")}
+      >
+        {visible.map((segment) => (
+          <div
+            key={segment.label}
+            className={segment.className}
+            style={{
+              flexBasis: `${(segment.value / total) * 100}%`,
+              minWidth: 2,
+            }}
+            title={`${segment.label}: ${formatBytes(segment.value)}`}
+          />
+        ))}
+      </div>
+      <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5">
+        {visible.map((segment) => (
+          <div
+            key={segment.label}
+            className="flex items-center gap-1.5 text-xs"
+          >
+            <span
+              className={cn("size-2 shrink-0 rounded-full", segment.className)}
+              aria-hidden="true"
+            />
+            <span className="truncate text-muted-foreground" title={segment.label}>
+              {segment.label}
+            </span>
+            <span className="shrink-0 font-medium tabular-nums">
+              {formatBytes(segment.value)}
+            </span>
+            <span className="shrink-0 text-muted-foreground tabular-nums">
+              {Math.round((segment.value / total) * 100)}%
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+export function SkeletonRow({ className }: { className?: string }) {
+  return (
+    <div
+      className={cn("h-12 w-full animate-pulse rounded-md bg-muted", className)}
+    />
+  )
+}
+
 const STATUS_TONES: Record<string, string> = {
   completed: "bg-primary/15 text-primary",
   recycled: "bg-primary/15 text-primary",
@@ -259,14 +380,16 @@ const STATUS_TONES: Record<string, string> = {
 }
 
 export function StatusBadge({ status }: { status: string }) {
+  const text = status.replaceAll("_", " ")
   return (
     <span
+      title={text}
       className={cn(
         "inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-xs font-medium whitespace-nowrap",
         STATUS_TONES[status] ?? "bg-muted text-muted-foreground"
       )}
     >
-      {status.replaceAll("_", " ")}
+      {text}
     </span>
   )
 }

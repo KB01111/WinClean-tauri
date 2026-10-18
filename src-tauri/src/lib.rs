@@ -1,4 +1,5 @@
 pub mod cleanup;
+pub mod optimizer;
 pub mod commands;
 pub mod db;
 pub mod offload;
@@ -57,7 +58,18 @@ pub fn run() {
             commands::export_report,
             commands::export_diagnostics,
             commands::app_health,
-            commands::cancel_scan
+            commands::cancel_scan,
+            commands::optimizer_list_services,
+            commands::optimizer_set_service_start_type,
+            commands::optimizer_list_processes,
+            commands::optimizer_set_process_ecoqos,
+            commands::optimizer_battery_status,
+            commands::optimizer_power_history,
+            commands::optimizer_apply_power_profile,
+            commands::optimizer_hardware_info,
+            commands::optimizer_capabilities,
+            commands::optimizer_history,
+            commands::optimizer_rollback
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

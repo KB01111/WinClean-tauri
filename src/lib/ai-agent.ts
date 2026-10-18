@@ -204,9 +204,77 @@ function buildTools(runId: number) {
     getLargestFiles,
     getStaleLargeFiles,
     getRecommendations,
+    // WinClean 2.0 read-only optimizer tools (defined below via buildOptimizerTools)
+    ...buildOptimizerTools(),
   ]
 }
 
+function buildOptimizerTools() {
+  const getServices = tool({
+    name: "get_services",
+    description:
+      "READ-ONLY. Windows services with start type, state, risk and recommendation. Protected services must never be suggested for change.",
+    parameters: z.object({}),
+    execute: async () => {
+      const services = await api.optimizerListServices()
+      return JSON.stringify(
+        services.slice(0, 300).map((s) => ({
+          name: s.name,
+          displayName: s.displayName,
+          state: s.state,
+          startType: s.startType,
+          risk: s.classification.risk,
+          recommendation: s.classification.recommendation,
+        }))
+      )
+    },
+  })
+  const getProcesses = tool({
+    name: "get_processes",
+    description:
+      "READ-ONLY. Top processes by memory with CPU %, foreground flag and EcoQoS decision.",
+    parameters: z.object({}),
+    execute: async () => {
+      const processes = await api.optimizerListProcesses()
+      return JSON.stringify(
+        processes.slice(0, 60).map((p) => ({
+          pid: p.pid,
+          name: p.name,
+          workingSetMb: p.workingSetMb,
+          cpuPercent: p.cpuPercentRecent,
+          ecoDecision: p.ecoDecision,
+        }))
+      )
+    },
+  })
+  const getPowerStatus = tool({
+    name: "get_power_status",
+    description:
+      "READ-ONLY. Battery percent, AC/DC state, active power scheme, power-history sample count.",
+    parameters: z.object({}),
+    execute: async () => {
+      const [battery, history] = await Promise.all([
+        api.optimizerBatteryStatus(),
+        api.optimizerPowerHistory(50),
+      ])
+      return JSON.stringify({ battery, samples: history.length })
+    },
+  })
+  const getHardware = tool({
+    name: "get_hardware",
+    description:
+      "READ-ONLY. CPU, display adapters (registry-only, never wakes the RTX 4070), NPU and Windows ML / MCP capabilities.",
+    parameters: z.object({}),
+    execute: async () => {
+      const [hardware, capabilities] = await Promise.all([
+        api.optimizerHardwareInfo(),
+        api.optimizerCapabilities(),
+      ])
+      return JSON.stringify({ hardware, capabilities })
+    },
+  })
+  return [getServices, getProcesses, getPowerStatus, getHardware]
+}
 const INSTRUCTIONS = `You are WinClean's storage analyst. You help Windows users understand what is
 using their disk space and what they can safely clean up or offload to Google Drive.
 
@@ -215,6 +283,10 @@ Process:
 2. Call get_recommendations to see the actionable candidates and their ids.
 3. Optionally call get_largest_files / get_stale_large_files for extra context.
 4. Produce a short, friendly summary and 2-6 concrete suggestions.
+
+Optimizer rules:
+- get_services / get_processes / get_power_status / get_hardware are READ-ONLY. You cannot change services, processes or power schemes.
+- Never suggest changing a protected service or throttling a protected/foreground process. Any service suggestion must name a service returned by get_services and is validated deterministically before the user can approve it.
 
 Rules:
 - Suggestions must only reference candidate ids returned by get_recommendations.

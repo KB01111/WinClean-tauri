@@ -295,6 +295,8 @@ export const api = {
   cleanupHistory: (limit = 50) =>
     invoke<CleanupActionRecord[]>("cleanup_history", { limit }),
   openRecycleBin: () => invoke("open_recycle_bin"),
+  revealInExplorer: (path: string) =>
+    invoke("reveal_in_explorer", { path }),
   deleteScanRun: (runId: number) => invoke<boolean>("delete_scan_run", { runId }),
   clearScanHistory: () => invoke<number>("clear_scan_history"),
   googleDriveStatus: () => invoke<GoogleDriveStatus>("google_drive_status"),
@@ -333,6 +335,40 @@ export const api = {
     invoke<ExportArtifact | null>("export_report", { runId }),
   exportDiagnostics: () => invoke<ExportArtifact>("export_diagnostics"),
   appHealth: () => invoke<AppHealth>("app_health"),
+  // WinClean 2.0 optimizer (types in src/lib/optimizer.ts)
+  optimizerListServices: () =>
+    invoke<import("./optimizer").ServiceInfo[]>("optimizer_list_services"),
+  optimizerSetServiceStartType: (
+    name: string,
+    displayName: string,
+    startType: string
+  ) =>
+    invoke<import("./optimizer").ServiceInfo>(
+      "optimizer_set_service_start_type",
+      { name, displayName, startType }
+    ),
+  optimizerListProcesses: () =>
+    invoke<import("./optimizer").ProcessInfo[]>("optimizer_list_processes"),
+  optimizerSetProcessEcoQos: (pid: number, name: string, enable: boolean) =>
+    invoke<void>("optimizer_set_process_ecoqos", { pid, name, enable }),
+  optimizerBatteryStatus: () =>
+    invoke<import("./optimizer").BatteryStatus>("optimizer_battery_status"),
+  optimizerPowerHistory: (limit = 200) =>
+    invoke<import("./optimizer").PowerSample[]>("optimizer_power_history", {
+      limit,
+    }),
+  optimizerApplyPowerProfile: (profileId: string) =>
+    invoke<string>("optimizer_apply_power_profile", { profileId }),
+  optimizerHardwareInfo: () =>
+    invoke<import("./optimizer").HardwareInfo>("optimizer_hardware_info"),
+  optimizerCapabilities: () =>
+    invoke<import("./optimizer").CapabilityReport>("optimizer_capabilities"),
+  optimizerHistory: (limit = 100) =>
+    invoke<import("./optimizer").OptimizerHistory>("optimizer_history", {
+      limit,
+    }),
+  optimizerRollback: (snapshotId: number) =>
+    invoke<string>("optimizer_rollback", { snapshotId }),
 }
 
 export function formatError(error: unknown) {
