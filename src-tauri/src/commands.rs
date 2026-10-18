@@ -84,6 +84,8 @@ pub fn scan_status(state: State<'_, AppState>) -> Result<ScanProgress, String> {
         .map_err(|_| "scan status lock is poisoned".to_string())
 }
 
+/// Start a scan of a validated local volume on a worker thread and emit progress events.
+/// Return the initial progress, or an error if the root or scan state is invalid.
 #[tauri::command]
 pub fn start_scan(
     app: AppHandle,
@@ -325,6 +327,8 @@ pub fn disconnect_google_drive() -> Result<GoogleDriveStatus, String> {
     disconnect_drive().map_err(to_command_error)
 }
 
+/// Validate selected recommendations and start a Google Drive offload worker.
+/// Return the queued job; the worker emits progress and removes its cancel handle on exit.
 #[tauri::command]
 pub fn start_offload(
     app: AppHandle,
@@ -613,11 +617,14 @@ use crate::optimizer::{
     OptimizationAudit, OptimizationSnapshot,
 };
 
+/// List Windows services with their current configuration and policy classification.
 #[tauri::command]
 pub fn optimizer_list_services() -> Result<Vec<crate::optimizer::services::ServiceInfo>, String> {
     list_services()
 }
 
+/// Reject protected services, snapshot the current configuration, and apply a start type.
+/// Audit the outcome and attempt a fresh SCM read to describe the resulting state.
 #[tauri::command]
 pub fn optimizer_set_service_start_type(
     state: State<'_, AppState>,
@@ -655,11 +662,14 @@ pub fn optimizer_set_service_start_type(
     }
 }
 
+/// List Windows processes with memory, recent CPU usage, and EcoQoS eligibility.
 #[tauri::command]
 pub fn optimizer_list_processes() -> Result<Vec<crate::optimizer::processes::ProcessInfo>, String> {
     list_processes()
 }
 
+/// Apply or restore EcoQoS for a PID and audit the outcome.
+/// When enabling, reject names classified as protected by the process policy.
 #[tauri::command]
 pub fn optimizer_set_process_ecoqos(
     state: State<'_, AppState>,
@@ -688,6 +698,7 @@ pub fn optimizer_set_process_ecoqos(
     }
 }
 
+/// Read battery and power-scheme telemetry, attempting to persist a sample if a percentage is available.
 #[tauri::command]
 pub fn optimizer_battery_status(state: State<'_, AppState>) -> Result<crate::optimizer::power::BatteryStatus, String> {
     let status = battery_status()?;
@@ -697,11 +708,14 @@ pub fn optimizer_battery_status(state: State<'_, AppState>) -> Result<crate::opt
     Ok(status)
 }
 
+/// Return recent power samples, newest first, with a limit clamped to 1–2000.
 #[tauri::command]
 pub fn optimizer_power_history(state: State<'_, AppState>, limit: Option<u32>) -> Result<Vec<crate::optimizer::power::PowerSample>, String> {
     state.db.power_history(limit.unwrap_or(200).clamp(1, 2000)).map_err(to_command_error)
 }
 
+/// Snapshot the active scheme, apply a built-in profile, and audit the outcome.
+/// Return a description of the subsequent scheme read, including whether its GUID matches.
 #[tauri::command]
 pub fn optimizer_apply_power_profile(state: State<'_, AppState>, profile_id: String) -> Result<String, String> {
     let profiles = list_profiles();
@@ -733,11 +747,14 @@ pub fn optimizer_apply_power_profile(state: State<'_, AppState>, profile_id: Str
     }
 }
 
+/// Read CPU, memory, and registry-based adapter and NPU information on Windows.
 #[tauri::command]
 pub fn optimizer_hardware_info() -> Result<crate::optimizer::hardware::HardwareInfo, String> {
     hardware_info()
 }
 
+/// Report Windows ML and MCP discovery using any available hardware information.
+/// Keep NPU inference unverified and exclude the discrete GPU from the proposed route.
 #[tauri::command]
 pub fn optimizer_capabilities() -> Result<crate::optimizer::capabilities::CapabilityReport, String> {
     let hw = hardware_info().ok();
@@ -754,6 +771,7 @@ pub struct OptimizerHistory {
     pub profiles: Vec<crate::optimizer::power::PowerProfile>,
 }
 
+/// Return recent audit entries, snapshots, and built-in profiles, clamping the limit to 1–500.
 #[tauri::command]
 pub fn optimizer_history(state: State<'_, AppState>, limit: Option<u32>) -> Result<OptimizerHistory, String> {
     let limit = limit.unwrap_or(100).clamp(1, 500);
@@ -764,6 +782,8 @@ pub fn optimizer_history(state: State<'_, AppState>, limit: Option<u32>) -> Resu
     })
 }
 
+/// Restore a service start type or power scheme from an unused snapshot and audit the result.
+/// Reject missing, previously restored, malformed, or unsupported snapshots.
 #[tauri::command]
 pub fn optimizer_rollback(state: State<'_, AppState>, snapshot_id: i64) -> Result<String, String> {
     let snapshot = state.db.get_optimizer_snapshot(snapshot_id).map_err(to_command_error)?

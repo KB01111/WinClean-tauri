@@ -7,6 +7,7 @@ import { EmptyState, Notice, Panel } from "@/components/common"
 import { api, formatError } from "@/lib/api"
 import type { ProcessInfo } from "@/lib/optimizer"
 
+/** Display process resource usage and EcoQoS actions, tracking changes applied during this view’s lifetime. */
 export function ProcessesView() {
   const [processes, setProcesses] = useState<ProcessInfo[]>([])
   const [applied, setApplied] = useState<Set<number>>(new Set())
@@ -14,6 +15,7 @@ export function ProcessesView() {
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<number | null>(null)
 
+  /** Refresh process telemetry and eligibility decisions, updating loading and error state. */
   const load = useCallback(async () => {
     setLoading(true)
     try {
@@ -28,6 +30,7 @@ export function ProcessesView() {
 
   useEffect(() => { void load() }, [load])
 
+  /** Apply or restore EcoQoS for a process and track the PID locally after a successful request. */
   async function toggle(proc: ProcessInfo) {
     const enable = !applied.has(proc.pid)
     setBusy(proc.pid)
@@ -47,6 +50,7 @@ export function ProcessesView() {
     }
   }
 
+  /** Attempt EcoQoS for each eligible process not already tracked as applied, continuing after individual failures. */
   async function applyEligible() {
     const eligible = processes.filter((p) => p.ecoDecision === "eligible" && !applied.has(p.pid))
     for (const proc of eligible) {

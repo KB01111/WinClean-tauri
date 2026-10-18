@@ -8,6 +8,7 @@ import { api, formatError } from "@/lib/api"
 import type { BatteryStatus, OptimizerHistory, PowerSample } from "@/lib/optimizer"
 import { suggestProfile } from "@/lib/optimizer"
 
+/** Display battery telemetry, recorded samples, and built-in power-profile actions. */
 export function PowerView() {
   const [battery, setBattery] = useState<BatteryStatus | null>(null)
   const [history, setHistory] = useState<PowerSample[]>([])
@@ -16,6 +17,7 @@ export function PowerView() {
   const [busy, setBusy] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
+  /** Refresh battery telemetry, recent samples, and available profiles, updating loading and error state. */
   const load = useCallback(async () => {
     setLoading(true)
     try {
@@ -37,6 +39,7 @@ export function PowerView() {
 
   useEffect(() => { void load() }, [load])
 
+  /** Apply a power profile through the backend, report its outcome, and reload telemetry on success. */
   async function apply(profileId: string, label: string) {
     setBusy(profileId)
     try {

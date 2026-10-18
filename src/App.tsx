@@ -56,6 +56,7 @@ import { PowerView } from "@/views/power-view"
 import { HardwareView } from "@/views/hardware-view"
 import { OptimizerHistoryView } from "@/views/optimizer-history-view"
 
+/** Coordinate scan, cleanup, offload, and optimizer views with shared application state. */
 function App() {
   const [view, setView] = useState<View>("overview")
   const [volumes, setVolumes] = useState<VolumeInfo[]>([])
@@ -896,6 +897,7 @@ function App() {
   )
 }
 
+/** Return the page heading for a navigation view identifier. */
 function viewTitle(view: View) {
   if (view === "explorer") {
     return "Explorer"

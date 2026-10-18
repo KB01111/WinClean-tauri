@@ -70,6 +70,7 @@ export function useRunData({
   const runDataRequestId = useRef(0)
   const cleanupPlanRunId = useRef<number | null>(null)
 
+  /** Resolve the selected scan run, falling back to the first completed run. */
   const activeRun = useMemo(
     () =>
       scanRuns.find((run) => run.id === selectedRunId) ??
@@ -77,11 +78,13 @@ export function useRunData({
       null,
     [scanRuns, selectedRunId]
   )
+  /** Collect the candidate IDs that the current cleanup plan can execute. */
   const executableCleanIds = useMemo(
     () =>
       new Set(cleanupPlan?.candidates.map((candidate) => candidate.id) ?? []),
     [cleanupPlan]
   )
+  /** Filter recommendations for the active recovery mode and executable cleanup IDs. */
   const visibleRecommendations = useMemo(() => {
     if (!recommendationPlan) {
       return []
@@ -92,20 +95,27 @@ export function useRunData({
       executableCleanIds
     )
   }, [executableCleanIds, recommendationPlan, recoverMode])
+  /** Sum the count and bytes of selected candidates visible in the active recovery mode. */
   const selectedVisibleStats = useMemo(
     () =>
       selectedVisibleCandidateStats(visibleRecommendations, selectedCleanupIds),
     [selectedCleanupIds, visibleRecommendations]
   )
+  /** Build breadcrumbs from the active scan root to the current directory. */
   const explorerBreadcrumbs = useMemo(
     () => directoryBreadcrumbs(activeRun?.rootPath, currentDirectory),
     [activeRun?.rootPath, currentDirectory]
   )
+  /** Resolve the parent directory without navigating above the active scan root. */
   const explorerParentDirectory = useMemo(
     () => parentDirectoryPath(currentDirectory, activeRun?.rootPath),
     [activeRun?.rootPath, currentDirectory]
   )
 
+  /**
+   * Refresh all run-scoped collections using the current filters, committing only the latest response.
+   * Return whether a refresh was committed; clear collections when no run is available.
+   */
   const refreshRunData = useCallback(
     async (
       runId?: number | null,
@@ -262,6 +272,7 @@ export function useRunData({
     refreshRunData,
   ])
 
+  /** Clear directory and file results, recovery plans, and cleanup selection. */
   function clearRunData() {
     setTopDirectories([])
     setDirectoryChildren([])
@@ -272,6 +283,7 @@ export function useRunData({
     setSelectedCleanupIds(new Set())
   }
 
+  /** Toggle a candidate ID in the cleanup selection without mutating the current set. */
   function toggleCleanupCandidate(id: string) {
     setSelectedCleanupIds((current) => {
       const next = new Set(current)
@@ -284,6 +296,7 @@ export function useRunData({
     })
   }
 
+  /** Select or deselect visible recommendations while preserving selections outside the view. */
   function toggleAllVisible(select: boolean) {
     setSelectedCleanupIds((current) => {
       const next = new Set(current)

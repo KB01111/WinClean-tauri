@@ -76,6 +76,8 @@ pub struct RecommendationCandidate {
     pub modified_at_ms: Option<i64>,
 }
 
+/// Build filtered cleanup, offload, and review recommendations from a scan run.
+/// Use database-wide filename and size matches to identify possible duplicates for review.
 pub fn build_recommendations(
     db: &Database,
     scan_run_id: i64,

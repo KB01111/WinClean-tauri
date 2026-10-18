@@ -68,6 +68,7 @@ function toMb(bytes: number) {
   return Math.round((bytes / (1024 * 1024)) * 10) / 10
 }
 
+/** Build scan-scoped storage tools and read-only optimizer tools for the AI analyst. */
 function buildTools(runId: number) {
   const getScanSummary = tool({
     name: "get_scan_summary",
@@ -209,12 +210,14 @@ function buildTools(runId: number) {
   ]
 }
 
+/** Build read-only service, process, power, and hardware tools for the AI analyst. */
 function buildOptimizerTools() {
   const getServices = tool({
     name: "get_services",
     description:
       "READ-ONLY. Windows services with start type, state, risk and recommendation. Protected services must never be suggested for change.",
     parameters: z.object({}),
+    /** Serialize up to 300 services with their current state and risk recommendations. */
     execute: async () => {
       const services = await api.optimizerListServices()
       return JSON.stringify(
@@ -234,6 +237,7 @@ function buildOptimizerTools() {
     description:
       "READ-ONLY. Top processes by memory with CPU %, foreground flag and EcoQoS decision.",
     parameters: z.object({}),
+    /** Serialize resource usage and EcoQoS decisions for the first 60 processes returned by the backend. */
     execute: async () => {
       const processes = await api.optimizerListProcesses()
       return JSON.stringify(
@@ -252,6 +256,7 @@ function buildOptimizerTools() {
     description:
       "READ-ONLY. Battery percent, AC/DC state, active power scheme, power-history sample count.",
     parameters: z.object({}),
+    /** Serialize battery telemetry and the number of recent power samples returned by the backend. */
     execute: async () => {
       const [battery, history] = await Promise.all([
         api.optimizerBatteryStatus(),
@@ -265,6 +270,7 @@ function buildOptimizerTools() {
     description:
       "READ-ONLY. CPU, display adapters (registry-only, never wakes the RTX 4070), NPU and Windows ML / MCP capabilities.",
     parameters: z.object({}),
+    /** Serialize hardware discovery and Windows ML and MCP capability information. */
     execute: async () => {
       const [hardware, capabilities] = await Promise.all([
         api.optimizerHardwareInfo(),

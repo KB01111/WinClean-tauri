@@ -30,16 +30,19 @@ const SCAN_STATE_LABELS: Record<string, string> = {
   canceled: "Canceled",
 }
 
+/** Return the containing folder name for a database path, falling back to the original path. */
 function databaseFolderName(path: string) {
   const segments = path.split(/[\\/]/).filter(Boolean)
   segments.pop()
   return segments[segments.length - 1] ?? path
 }
 
+/** Return a database path’s parent using Windows path separators. */
 function databaseParentPath(path: string) {
   return path.split(/[\\/]/).slice(0, -1).join("\\")
 }
 
+/** Render appearance, Drive, AI, diagnostics, and database health settings and actions. */
 export function SettingsView({
   health,
   driveStatus,

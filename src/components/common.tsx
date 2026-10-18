@@ -243,6 +243,7 @@ export function ProgressBar({
   )
 }
 
+/** Render used bytes as a clamped percentage of total capacity, highlighting high usage. */
 export function CapacityBar({
   used,
   total,
@@ -293,6 +294,7 @@ export type DistributionSegment = {
   className: string
 }
 
+/** Render positive byte totals as proportional segments with an accessible label and legend. */
 export function DistributionBar({
   segments,
   className,
@@ -355,6 +357,7 @@ export function DistributionBar({
   )
 }
 
+/** Render a pulsing placeholder while a row of data is loading. */
 export function SkeletonRow({ className }: { className?: string }) {
   return (
     <div
@@ -379,6 +382,7 @@ const STATUS_TONES: Record<string, string> = {
   failed: "bg-destructive/15 text-destructive",
 }
 
+/** Render a status with readable spacing and a matching tone, defaulting to a neutral style. */
 export function StatusBadge({ status }: { status: string }) {
   const text = status.replaceAll("_", " ")
   return (

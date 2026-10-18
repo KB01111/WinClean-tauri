@@ -8,12 +8,14 @@ import { formatDateTime } from "@/lib/format"
 import { api, formatError } from "@/lib/api"
 import type { OptimizerHistory } from "@/lib/optimizer"
 
+/** Display the optimizer audit trail and snapshots with rollback controls. */
 export function OptimizerHistoryView() {
   const [history, setHistory] = useState<OptimizerHistory | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<number | null>(null)
 
+  /** Refresh the latest 100 optimizer audit entries and snapshots, updating loading and error state. */
   const load = useCallback(async () => {
     setLoading(true)
     try {
@@ -28,6 +30,7 @@ export function OptimizerHistoryView() {
 
   useEffect(() => { void load() }, [load])
 
+  /** Restore a snapshot through the backend, report its outcome, and refresh history on success. */
   async function rollback(id: number) {
     setBusy(id)
     try {

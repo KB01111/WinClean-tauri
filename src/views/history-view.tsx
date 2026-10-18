@@ -18,6 +18,7 @@ const ACTION_LABELS: Record<string, string> = {
   drive_restore: "Drive restore",
 }
 
+/** Display cleanup and offload history with batch progress and file restoration actions. */
 export function HistoryView({
   cleanupHistory,
   offloadJobs,
@@ -164,6 +165,7 @@ export function HistoryView({
   )
 }
 
+/** Render an expandable offload batch with progress, status, and per-item restore controls. */
 function OffloadHistoryCard({
   job,
   restorePendingItemId,

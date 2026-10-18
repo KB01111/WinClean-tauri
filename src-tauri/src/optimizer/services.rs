@@ -28,6 +28,7 @@ pub enum StartType {
 }
 
 impl StartType {
+    /// Return the API spelling of this service start type.
     pub fn as_str(&self) -> &'static str {
         match self {
             StartType::Automatic => "automatic",
@@ -36,6 +37,7 @@ impl StartType {
             StartType::Disabled => "disabled",
         }
     }
+    /// Parse an API start-type string, returning `None` for unsupported values.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "automatic" => Some(StartType::Automatic),
@@ -45,6 +47,7 @@ impl StartType {
             _ => None,
         }
     }
+    /// Map the start type to its SCM constant; delayed automatic start uses the automatic constant.
     #[cfg(windows)]
     fn scm_value(&self) -> u32 {
         // SERVICE_AUTO_START=2, SERVICE_DEMAND_START=3, SERVICE_DISABLED=4
@@ -64,13 +67,16 @@ mod win {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, HANDLE};
     use windows_sys::Win32::System::Services::*;
 
+    /// Decode a UTF-16 slice up to its first null terminator, replacing invalid sequences.
     fn wide(bytes: &[u16]) -> String {
         let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
         OsString::from_wide(&bytes[..end]).to_string_lossy().into_owned()
     }
+    /// Map an SCM service-state constant to its API label, falling back to unknown.
     fn state_str(v: u32) -> String {
         match v { 1 => "stopped", 2 => "startPending", 3 => "stopPending", 4 => "running", 5 => "continuePending", 6 => "pausePending", 7 => "paused", _ => "unknown" }.to_string()
     }
+    /// Map an SCM start-type constant to its API label, falling back to unknown.
     fn start_str(v: u32) -> &'static str {
         match v { 0 => "boot", 1 => "system", 2 => "automatic", 3 => "manual", 4 => "disabled", _ => "unknown" }
     }
@@ -78,11 +84,13 @@ mod win {
     struct Scm(HANDLE);
     impl Drop for Scm { fn drop(&mut self) { unsafe { CloseServiceHandle(self.0); } } }
 
+    /// Open the local Service Control Manager with the requested access rights.
     fn open_scm(access: u32) -> Result<Scm, String> {
         let h = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), access) };
         if h.is_null() { return Err(format!("OpenSCManager failed ({}). Reading services needs no elevation; changing them needs an elevated WinClean.", std::io::Error::last_os_error())); }
         Ok(Scm(h))
     }
+    /// Open a named service through an SCM handle with the requested access rights.
     fn open_service(scm: &Scm, name: &str, access: u32) -> Result<Scm, String> {
         let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
         let h = unsafe { OpenServiceW(scm.0, w.as_ptr(), access) };
@@ -90,6 +98,8 @@ mod win {
         Ok(Scm(h))
     }
 
+    /// Read a service’s start type, delayed-start flag, and dependencies.
+    /// Configuration-read failures return an unknown start type and empty dependencies.
     fn query_config(svc: &Scm) -> (String, bool, Vec<String>) {
         let mut needed = 0u32;
         unsafe { QueryServiceConfigW(svc.0, std::ptr::null_mut(), 0, &mut needed); }
@@ -119,6 +129,7 @@ mod win {
         (start_str(cfg.dwStartType).to_string(), delayed, deps)
     }
 
+    /// Enumerate Windows services with configuration and risk classifications, sorted by display name.
     pub fn list_services_impl() -> Result<Vec<ServiceInfo>, String> {
         let scm = open_scm(SC_MANAGER_ENUMERATE_SERVICE | SC_MANAGER_CONNECT)?;
         let mut bytes_needed = 0u32;
@@ -162,6 +173,8 @@ mod win {
         Ok(out)
     }
 
+    /// Change the SCM start type and attempt to update its delayed-start flag, then re-read configuration.
+    /// The caller must enforce protection policy and persist snapshots and audit entries.
     pub fn set_start_type_impl(name: &str, target: StartType) -> Result<ServiceInfo, String> {
         let scm = open_scm(SC_MANAGER_CONNECT)?;
         let svc = open_service(&scm, name, SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)?;
@@ -193,17 +206,21 @@ mod win {
     }
 }
 
+/// Return Windows services with configuration and policy classifications.
 #[cfg(windows)]
 pub fn list_services() -> Result<Vec<ServiceInfo>, String> { win::list_services_impl() }
+/// Report that service optimization is unavailable outside Windows.
 #[cfg(not(windows))]
 pub fn list_services() -> Result<Vec<ServiceInfo>, String> {
     Err("Windows Service optimization is only available on Windows.".into())
 }
 
+/// Change a Windows service’s start type; the caller must enforce policy and save rollback state.
 #[cfg(windows)]
 pub fn set_service_start_type(name: &str, target: StartType) -> Result<ServiceInfo, String> {
     win::set_start_type_impl(name, target)
 }
+/// Report that service optimization is unavailable outside Windows.
 #[cfg(not(windows))]
 pub fn set_service_start_type(_name: &str, _target: StartType) -> Result<ServiceInfo, String> {
     Err("Windows Service optimization is only available on Windows.".into())
@@ -218,6 +235,8 @@ pub fn snapshot_payload(s: &ServiceInfo) -> serde_json::Value {
     })
 }
 
+/// Decode a restorable start type and delayed-start flag from a service snapshot.
+/// Return `None` if the stored start type is missing or unsupported.
 pub fn start_type_from_snapshot(v: &serde_json::Value) -> Option<StartType> {
     let delayed = v.get("delayedAutoStart").and_then(|x| x.as_bool()).unwrap_or(false);
     match v.get("startType").and_then(|x| x.as_str())? {

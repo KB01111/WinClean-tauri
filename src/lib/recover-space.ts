@@ -94,6 +94,7 @@ export type CleanupConfirmCopy = {
   cancelLabel: string
 }
 
+/** Build Recycle Bin confirmation text from the selected item count and byte total. */
 export function cleanupConfirmCopy({
   count,
   bytes,
@@ -114,6 +115,7 @@ export type ReviewRevealState = {
   hint: string | null
 }
 
+/** Enable the review reveal action only when at least one candidate is selected. */
 export function getReviewRevealState(selectedCount: number): ReviewRevealState {
   if (selectedCount <= 0) {
     return {

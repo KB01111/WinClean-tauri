@@ -39,12 +39,14 @@ export type RecoverFilterState = {
 
 const CANDIDATE_PAGE_SIZE = 100
 
+/** Reveal a recovery candidate in Windows Explorer and report request failures in a toast. */
 function revealCandidateInExplorer(path: string) {
   void api
     .revealInExplorer(path)
     .catch((error) => toast.error(formatError(error)))
 }
 
+/** Render the cleanup confirmation dialog with keyboard cancellation and button focus cycling. */
 function CleanupConfirmDialog({
   labelledById,
   copy,
@@ -58,6 +60,7 @@ function CleanupConfirmDialog({
 }) {
   const panelRef = useRef<HTMLDivElement>(null)
 
+  /** Cancel on Escape and cycle focus between dialog buttons on Tab or Shift+Tab. */
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Escape") {
       event.stopPropagation()
@@ -125,6 +128,7 @@ function CleanupConfirmDialog({
   )
 }
 
+/** Render recovery filters, candidate selection, cleanup confirmation, and Google Drive offload controls. */
 export function RecoverSpaceView({
   recommendationPlan,
   cleanupWarnings,
@@ -531,6 +535,7 @@ export function OffloadJobCard({
   )
 }
 
+/** Render an offload item’s status, upload progress, Drive link, and optional restore action. */
 export function OffloadItemRow({
   item,
   onRestore,

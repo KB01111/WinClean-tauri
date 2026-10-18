@@ -6,12 +6,14 @@ import { EmptyState, Metric, Notice, Panel, SummaryList } from "@/components/com
 import { api, formatError } from "@/lib/api"
 import type { CapabilityReport, HardwareInfo } from "@/lib/optimizer"
 
+/** Display hardware discovery, NPU verification status, and Windows ML and MCP capabilities. */
 export function HardwareView() {
   const [hw, setHw] = useState<HardwareInfo | null>(null)
   const [caps, setCaps] = useState<CapabilityReport | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
+  /** Refresh hardware and capability data together, updating loading and error state. */
   const load = useCallback(async () => {
     setLoading(true)
     try {

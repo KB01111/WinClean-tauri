@@ -34,6 +34,7 @@ mod win {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
+    /// Return the foreground window’s process ID, or zero when no foreground window exists.
     fn foreground_pid() -> u32 {
         unsafe {
             let hwnd = GetForegroundWindow();
@@ -44,10 +45,13 @@ mod win {
         }
     }
 
+    /// Combine a Windows FILETIME into a 64-bit count of 100-nanosecond ticks.
     fn filetime_ticks(ft: &FILETIME) -> u64 {
         ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
     }
 
+    /// Sample Windows processes for memory and recent CPU usage, then classify EcoQoS eligibility.
+    /// Return at most 300 entries ordered by working-set size; inaccessible metrics remain zero.
     pub fn list_processes_impl() -> Result<Vec<ProcessInfo>, String> {
         let fg = foreground_pid();
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -123,6 +127,8 @@ mod win {
         Ok(out)
     }
 
+    /// Set or release process execution-speed throttling through SetProcessInformation.
+    /// Return access or Windows API failures; policy checks belong to the command layer.
     pub fn set_ecoqos_impl(pid: u32, enable: bool) -> Result<(), String> {
         // PROCESS_SET_INFORMATION = 0x0200, PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         let access: PROCESS_ACCESS_RIGHTS = 0x0200 | 0x1000;
@@ -144,15 +150,19 @@ mod win {
     }
 }
 
+/// Return sampled Windows processes with resource usage and EcoQoS classification.
 #[cfg(windows)]
 pub fn list_processes() -> Result<Vec<ProcessInfo>, String> { win::list_processes_impl() }
+/// Report that process monitoring is unavailable outside Windows.
 #[cfg(not(windows))]
 pub fn list_processes() -> Result<Vec<ProcessInfo>, String> {
     Err("Process monitoring is only available on Windows.".into())
 }
 
+/// Set or release EcoQoS for a Windows PID; the caller must enforce eligibility policy.
 #[cfg(windows)]
 pub fn set_process_ecoqos(pid: u32, enable: bool) -> Result<(), String> { win::set_ecoqos_impl(pid, enable) }
+/// Report that EcoQoS is unavailable outside Windows.
 #[cfg(not(windows))]
 pub fn set_process_ecoqos(_pid: u32, _enable: bool) -> Result<(), String> {
     Err("EcoQoS is only available on Windows.".into())

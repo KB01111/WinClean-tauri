@@ -131,6 +131,7 @@ pub struct ScanRunOptions {
 }
 
 impl std::fmt::Debug for ScanRunOptions {
+    /// Format scan options while representing the optional progress callback by its presence only.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScanRunOptions")
             .field("file_system", &self.file_system)
@@ -260,6 +261,8 @@ pub fn choose_scan_plan(_root_path: &str, file_system: Option<&str>) -> ScanPlan
     }
 }
 
+/// Persist a recursive scan using parallel workers and optional cancellation and progress reporting.
+/// Finalize the stored run as completed, canceled, or failed according to the scan outcome.
 pub fn run_recursive_scan(
     db: &Database,
     root: &Path,
@@ -383,6 +386,8 @@ pub fn run_recursive_scan(
     }
 }
 
+/// Coordinate directory workers, persist batches of entries, and accumulate directory rollups.
+/// Publish progress while honoring cancellation and propagating worker or database errors.
 fn collect_parallel_scan(
     db: &Database,
     run_id: i64,
@@ -612,6 +617,7 @@ fn pump_pending_dirs(
     }
 }
 
+/// Publish a scan snapshot only after the configured progress interval has elapsed.
 fn maybe_update_progress(
     progress: &Option<Arc<Mutex<ScanProgress>>>,
     progress_sink: &Option<ScanProgressSink>,
@@ -638,6 +644,7 @@ fn maybe_update_progress(
     *last_progress_update = Instant::now();
 }
 
+/// Persist a failed scan and update shared progress without worker details or a progress callback.
 pub fn finalize_failed_scan_run(
     db: &Database,
     summary: &mut ScanSummary,
@@ -647,6 +654,7 @@ pub fn finalize_failed_scan_run(
     finalize_failed_scan_run_with_details(db, summary, progress, last_error, None, None)
 }
 
+/// Persist a failed scan, then publish its terminal snapshot with optional worker details.
 fn finalize_failed_scan_run_with_details(
     db: &Database,
     summary: &mut ScanSummary,
@@ -940,6 +948,7 @@ fn record_io_error_counts(
     }
 }
 
+/// Build a scan snapshot, update shared progress when its lock is available, and notify the optional sink.
 fn update_progress(
     progress: &Option<Arc<Mutex<ScanProgress>>>,
     progress_sink: &Option<ScanProgressSink>,

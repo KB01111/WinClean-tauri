@@ -132,12 +132,14 @@ export function validateAiServiceSuggestions(
   return { accepted, rejected }
 }
 
+/** Return the PIDs marked as having EcoQoS applied so their settings can be restored. */
 export function ecoQosRestorePids(
   processes: { pid: number; ecoQosApplied: boolean }[]
 ): number[] {
   return processes.filter((p) => p.ecoQosApplied).map((p) => p.pid)
 }
 
+/** Suggest gaming when requested, battery saver at 20% or less on battery, or balanced otherwise. */
 export function suggestProfile(input: {
   onAc: boolean
   percent: number | null

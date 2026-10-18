@@ -38,6 +38,8 @@ pub fn discharge_watts(prev: &PowerSample, next: &PowerSample, design_capacity_m
     if w.is_finite() && w > 0.0 { Some((w * 10.0).round() / 10.0) } else { None }
 }
 
+/// Estimate remaining minutes from charge percentage, watts, and design capacity in mWh.
+/// Return `None` when discharge power or design capacity is nonpositive.
 pub fn estimated_runtime_minutes(percent: u8, discharge_w: f64, design_capacity_mwh: f64) -> Option<f64> {
     if discharge_w <= 0.0 || design_capacity_mwh <= 0.0 { return None; }
     Some((percent as f64 / 100.0 * design_capacity_mwh / 1000.0) / discharge_w * 60.0)
@@ -51,11 +53,13 @@ mod win {
     };
     use windows_sys::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_READ};
 
+    /// Format a Windows GUID as a lowercase, hyphen-separated string.
     fn guid_string(g: &windows_sys::core::GUID) -> String {
         format!("{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             g.data1, g.data2, g.data3, g.data4[0], g.data4[1], g.data4[2], g.data4[3], g.data4[4], g.data4[5], g.data4[6], g.data4[7])
     }
 
+    /// Read a power scheme’s friendly name, returning `None` if Windows cannot supply it.
     fn scheme_name(guid: &windows_sys::core::GUID) -> Option<String> {
         let mut size = 0u32;
         unsafe { PowerReadFriendlyName(std::ptr::null_mut(), guid, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), &mut size); }
@@ -67,6 +71,7 @@ mod win {
         Some(String::from_utf16_lossy(&buf[..end]))
     }
 
+    /// Read Windows battery telemetry and the active power scheme, preserving unknown values as `None`.
     pub fn battery_status_impl() -> Result<BatteryStatus, String> {
         let mut st = SYSTEM_POWER_STATUS { ACLineStatus: 0, BatteryFlag: 0, BatteryLifePercent: 0, SystemStatusFlag: 0, BatteryLifeTime: 0, BatteryFullLifeTime: 0 };
         if unsafe { GetSystemPowerStatus(&mut st) } == 0 {
@@ -90,6 +95,7 @@ mod win {
         })
     }
 
+    /// Parse a scheme GUID and activate it with PowrProf, returning Windows errors to the caller.
     pub fn set_active_scheme_impl(guid_str: &str) -> Result<(), String> {
         let guid = parse_guid(guid_str)?;
         let rc = unsafe { windows_sys::Win32::System::Power::PowerSetActiveScheme(std::ptr::null_mut(), &guid) };
@@ -99,6 +105,7 @@ mod win {
         Ok(())
     }
 
+    /// Parse a hyphen-separated scheme identifier, optionally enclosed in braces, into a Windows GUID.
     fn parse_guid(s: &str) -> Result<windows_sys::core::GUID, String> {
         let parts: Vec<&str> = s.trim_matches(|c| c == '{' || c == '}').split('-').collect();
         if parts.len() != 5 { return Err(format!("invalid scheme GUID: {s}")); }
@@ -114,20 +121,25 @@ mod win {
     }
 }
 
+/// Return battery telemetry and active power-scheme information from Windows.
 #[cfg(windows)]
 pub fn battery_status() -> Result<BatteryStatus, String> { win::battery_status_impl() }
+/// Report that battery telemetry is unavailable outside Windows.
 #[cfg(not(windows))]
 pub fn battery_status() -> Result<BatteryStatus, String> {
     Err("Battery telemetry is only available on Windows.".into())
 }
 
+/// Activate the requested Windows power scheme, returning parse or PowrProf errors.
 #[cfg(windows)]
 pub fn set_active_scheme(guid: &str) -> Result<(), String> { win::set_active_scheme_impl(guid) }
+/// Report that changing power schemes is unavailable outside Windows.
 #[cfg(not(windows))]
 pub fn set_active_scheme(_guid: &str) -> Result<(), String> {
     Err("Power schemes are only available on Windows.".into())
 }
 
+/// Return the built-in power profiles exposed to the optimizer UI.
 pub fn list_profiles() -> Vec<PowerProfile> { builtin_profiles() }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ import type { ServiceInfo, StartType } from "@/lib/optimizer"
 
 const START_TYPES: StartType[] = ["automatic", "automaticDelayed", "manual", "disabled"]
 
+/** Display filterable Windows services with policy classifications and guarded start-type controls. */
 export function ServicesView() {
   const [services, setServices] = useState<ServiceInfo[]>([])
   const [query, setQuery] = useState("")
@@ -16,6 +17,7 @@ export function ServicesView() {
   const [busy, setBusy] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
+  /** Refresh native service configurations and policy classifications, updating loading and error state. */
   const load = useCallback(async () => {
     setLoading(true)
     try {
@@ -30,6 +32,7 @@ export function ServicesView() {
 
   useEffect(() => { void load() }, [load])
 
+  /** Request a service start-type change, replace its row on success, and report the outcome. */
   async function change(svc: ServiceInfo, startType: string) {
     setBusy(svc.name)
     try {

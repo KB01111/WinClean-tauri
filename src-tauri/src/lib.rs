@@ -10,6 +10,7 @@ pub mod volume;
 
 use tauri::Manager;
 
+/// Initialize app storage, finalize interrupted jobs, and run Tauri with registered commands.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()

@@ -16,6 +16,7 @@ import { api, formatError } from "@/lib/api"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
 import type { DirectoryChild, FileSearchResult, ScanRunRecord } from "@/lib/api"
 
+/** Render scan directory navigation, file filters, results, and Explorer reveal actions. */
 export function ExplorerView({
   activeRun,
   currentDirectory,
@@ -218,6 +219,7 @@ export function ExplorerView({
   )
 }
 
+/** Reveal a path in Windows Explorer without triggering its parent row’s click action. */
 function RevealButton({ path, name }: { path: string; name: string }) {
   return (
     <button

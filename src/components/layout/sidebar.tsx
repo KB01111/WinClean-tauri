@@ -46,6 +46,7 @@ const NAV_ITEMS: { view: View; label: string; icon: typeof BarChart3 }[] = [
   { view: "settings", label: "Settings", icon: Settings },
 ]
 
+/** Render navigation, volume selection, capacity details, and scan controls for the application. */
 export function Sidebar({
   view,
   onViewChange,

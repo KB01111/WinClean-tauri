@@ -28,6 +28,7 @@ pub struct ExecutionProvider {
     pub detail: String,
 }
 
+/// Check relative DLL hints and Windows System32 for a provider without loading or verifying it.
 fn ep(name: &str, dll_hints: &[&str]) -> ExecutionProvider {
     // Presence of the provider DLL next to the app or in System32 counts as
     // "present but unverified": a real model+session test is still required.
@@ -46,6 +47,8 @@ fn ep(name: &str, dll_hints: &[&str]) -> ExecutionProvider {
     }
 }
 
+/// Discover Windows build, agent paths, and provider DLLs without enabling inference.
+/// Propose a route with the NPU unverified and the discrete GPU unavailable.
 pub fn capability_report(npu_present: bool, igpu_available: bool) -> CapabilityReport {
     // On-device Agent Registry: %LOCALAPPDATA%\Microsoft\Windows\Agents and
     // the packaged-app agent manifests. Existence check only, no execution.
@@ -80,6 +83,7 @@ pub fn capability_report(npu_present: bool, igpu_available: bool) -> CapabilityR
     }
 }
 
+/// Read the Windows build number from the registry, returning `None` on read or parse failure.
 #[cfg(windows)]
 fn windows_build() -> Option<u32> {
     // RtlGetVersion via ntdll would need an extra binding; the registry
@@ -99,5 +103,6 @@ fn windows_build() -> Option<u32> {
     String::from_utf16_lossy(&buf[..end]).trim().parse().ok()
 }
 
+/// Return no Windows build number on unsupported platforms.
 #[cfg(not(windows))]
 fn windows_build() -> Option<u32> { None }

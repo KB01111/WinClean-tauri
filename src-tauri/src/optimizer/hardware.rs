@@ -38,6 +38,7 @@ pub struct NpuInfo {
     pub note: String,
 }
 
+/// Classify a display-adapter name as integrated, discrete, or other using known name patterns.
 pub fn classify_adapter(name: &str) -> &'static str {
     let n = name.to_ascii_lowercase();
     if n.contains("radeon 890m") || n.contains("radeon(tm) graphics") || (n.contains("amd radeon") && !n.contains("rx ")) {
@@ -49,6 +50,7 @@ pub fn classify_adapter(name: &str) -> &'static str {
     }
 }
 
+/// Describe a CPU model string, recognizing Ryzen AI and the expected G16 processor.
 pub fn cpu_note(name: &str) -> String {
     let n = name.to_ascii_lowercase();
     if n.contains("ryzen ai 9 hx 370") {
@@ -73,6 +75,7 @@ mod win {
         GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
     };
 
+    /// Read a UTF-16 registry value, returning `None` if the key or value cannot be read.
     fn reg_get_string(root: HKEY, sub: &str, value: &str) -> Option<String> {
         let subw: Vec<u16> = sub.encode_utf16().chain([0]).collect();
         let valw: Vec<u16> = value.encode_utf16().chain([0]).collect();
@@ -94,6 +97,7 @@ mod win {
         out
     }
 
+    /// Read adapter names and driver versions from the Display registry class without GPU polling.
     fn display_adapters() -> Vec<DisplayAdapter> {
         // HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\NNNN
         let base = "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}";
@@ -129,6 +133,8 @@ mod win {
         out
     }
 
+    /// Discover a matching NPU description in the ComputeAccelerator registry class.
+    /// Device presence does not mark inference as verified.
     fn npu_info(adapters_note: &[DisplayAdapter]) -> NpuInfo {
         // NPU appears under the ComputeAccelerator class; scan both class keys by name match.
         let mut found: Option<String> = None;
@@ -171,6 +177,7 @@ mod win {
         }
     }
 
+    /// Collect Windows CPU, memory, adapter, NPU, and G-Helper presence information without GPU polling.
     pub fn hardware_impl() -> Result<HardwareInfo, String> {
         let cpu_name = reg_get_string(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString")
             .or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok())
@@ -202,8 +209,10 @@ mod win {
     }
 }
 
+/// Return Windows hardware discovery without activating GPU inference APIs.
 #[cfg(windows)]
 pub fn hardware_info() -> Result<HardwareInfo, String> { win::hardware_impl() }
+/// Report that hardware discovery is unavailable outside Windows.
 #[cfg(not(windows))]
 pub fn hardware_info() -> Result<HardwareInfo, String> {
     Err("Hardware discovery is only available on Windows.".into())

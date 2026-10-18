@@ -85,6 +85,7 @@ struct OffloadProgressEmitter<'a> {
 }
 
 impl<'a> OffloadProgressEmitter<'a> {
+    /// Create an optional job-progress emitter whose first byte-progress update can fire immediately.
     fn new(db: &'a Database, job_id: i64, sink: Option<OffloadProgressSink>) -> Self {
         Self {
             db,
@@ -98,6 +99,7 @@ impl<'a> OffloadProgressEmitter<'a> {
         }
     }
 
+    /// Read and publish the current job status when a sink exists, ignoring status-read failures.
     fn emit_now(&self) {
         let Some(sink) = &self.sink else {
             return;
@@ -107,6 +109,7 @@ impl<'a> OffloadProgressEmitter<'a> {
         }
     }
 
+    /// Publish byte progress at most once per configured interval when a sink exists.
     fn emit_byte_progress(&self) {
         if self.sink.is_none() {
             return;
@@ -283,6 +286,7 @@ pub fn run_offload_job_with_client(
     offload_status(db, status.id)
 }
 
+/// Process an offload job with the supplied uploader and recycler without a progress sink.
 pub fn process_offload_job_with_client(
     db: &Database,
     job_id: i64,
@@ -294,6 +298,8 @@ pub fn process_offload_job_with_client(
     process_offload_job_with_sink(db, job_id, candidates, drive, recycler, cancel, None)
 }
 
+/// Process an offload batch, persisting job state and optionally publishing progress.
+/// Honor cancellation between items and publish the final job status when processing completes.
 pub fn process_offload_job_with_sink(
     db: &Database,
     job_id: i64,
@@ -936,6 +942,8 @@ impl DriveUploader for GoogleDriveClient {
     }
 }
 
+/// Validate and upload one candidate, verify its size, then recycle the local original.
+/// Persist item outcomes and publish progress; skip recycling if validation, upload, or cancellation prevents it.
 fn process_item(
     db: &Database,
     item: OffloadItemRecord,

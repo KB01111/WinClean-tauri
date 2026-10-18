@@ -21,6 +21,7 @@ import type {
   TopDirectory,
 } from "@/lib/api"
 
+/** Display scan totals, large files and directories, scan history, and file-type distributions. */
 export function OverviewView({
   progress,
   scanRuns,
@@ -228,6 +229,7 @@ const CHART_SEGMENT_CLASSES = [
   "bg-chart-5",
 ]
 
+/** Build chart segments for the five largest categories, grouping any remaining bytes as Other. */
 function fileMixSegments(categories: CategorySummary[]) {
   const sorted = [...categories].sort((a, b) => b.totalSize - a.totalSize)
   const segments = sorted.slice(0, 5).map((row, index) => ({
@@ -248,6 +250,7 @@ function fileMixSegments(categories: CategorySummary[]) {
   return segments
 }
 
+/** Render directory-size bars relative to the first directory, with navigation and indexed-byte shares. */
 function StorageHogBars({
   directories,
   bytesIndexed,
