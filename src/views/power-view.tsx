@@ -53,7 +53,8 @@ export function PowerView() {
     }
   }
 
-  const suggested = battery
+  const acKnown = battery?.acKnown ?? false
+  const suggested = battery && acKnown
     ? suggestProfile({ onAc: battery.onAc, percent: battery.percent })
     : "balanced"
   const runtime =
@@ -64,10 +65,10 @@ export function PowerView() {
   return (
     <div className="space-y-4">
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Metric label="Battery" value={battery?.present ? `${battery.percent ?? "—"}%` : "No battery"} hint={battery?.onAc ? "On AC power" : "On battery"} />
+        <Metric label="Battery" value={battery?.present ? `${battery.percent ?? "—"}%` : "No battery"} hint={!acKnown ? "AC status unknown" : battery?.onAc ? "On AC power" : "On battery"} />
         <Metric label="Active scheme" value={battery?.activeSchemeName ?? "—"} hint={battery?.activeSchemeGuid ?? ""} />
         <Metric label="Estimated runtime" value={runtime} hint="From GetSystemPowerStatus" />
-        <Metric label="Suggested profile" value={suggested} hint="Deterministic AC/DC + level policy" />
+        <Metric label="Suggested profile" value={acKnown ? suggested : "-"} hint={acKnown ? "Deterministic AC/DC + level policy" : "AC status unknown - no DC rules applied"} />
       </div>
 
       <Panel
@@ -88,7 +89,9 @@ export function PowerView() {
           <EmptyState text="No power samples yet — refresh on battery to start history" />
         ) : (
           <p className="mt-2 text-xs text-muted-foreground">
-            {history.length} sample(s) stored. Latest: {history[0]?.percent}% {history[0]?.onAc ? "(AC)" : "(DC)"}.
+{history.length} sample(s) stored. Latest: {history[0]?.percent}% {history[0]?.onAc ? "(AC)" : "(DC)"}.
+            Discharge watts need at least two on-battery samples plus the battery design capacity, which Windows does not expose to this build - so no watt figure is shown rather than estimated.
+            Recent: {history.slice(0, 8).map((s) => `${s.percent}%${s.onAc ? " AC" : " DC"}`).join(" | ")}
           </p>
         )}
       </Panel>

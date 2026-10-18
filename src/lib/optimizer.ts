@@ -14,7 +14,7 @@ export type ServiceInfo = {
   pid: number | null
   dependencies: string[]
   canChange: boolean
-  classification: { risk: ServiceRisk; reason: string; recommendation: string }
+  classification: { risk: ServiceRisk; known: boolean; reason: string; recommendation: string }
 }
 
 export type ProcessInfo = {
@@ -32,6 +32,7 @@ export type BatteryStatus = {
   onAc: boolean
   percent: number | null
   secondsRemaining: number | null
+  acKnown: boolean
   activeSchemeGuid: string | null
   activeSchemeName: string | null
 }

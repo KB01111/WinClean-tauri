@@ -7,15 +7,16 @@ import { EmptyState, Notice, Panel } from "@/components/common"
 import { api, formatError } from "@/lib/api"
 import type { ProcessInfo } from "@/lib/optimizer"
 
-/** Display process resource usage and EcoQoS actions, tracking changes applied during this view’s lifetime. */
 export function ProcessesView() {
   const [processes, setProcesses] = useState<ProcessInfo[]>([])
-  const [applied, setApplied] = useState<Set<number>>(new Set())
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<number | null>(null)
 
-  /** Refresh process telemetry and eligibility decisions, updating loading and error state. */
+  // EcoQoS state comes from the backend on every listing
+  // (GetProcessInformation), so it survives view navigation and the
+  // Restore action is always available for throttled processes —
+  // including ones that have since become foreground.
   const load = useCallback(async () => {
     setLoading(true)
     try {
@@ -30,19 +31,13 @@ export function ProcessesView() {
 
   useEffect(() => { void load() }, [load])
 
-  /** Apply or restore EcoQoS for a process and track the PID locally after a successful request. */
   async function toggle(proc: ProcessInfo) {
-    const enable = !applied.has(proc.pid)
+    const enable = !proc.ecoQosApplied
     setBusy(proc.pid)
     try {
       await api.optimizerSetProcessEcoQos(proc.pid, proc.name, enable)
-      setApplied((cur) => {
-        const next = new Set(cur)
-        if (enable) next.add(proc.pid)
-        else next.delete(proc.pid)
-        return next
-      })
       toast.success(`EcoQoS ${enable ? "enabled" : "restored"} for ${proc.name}. Fully reversible.`)
+      await load()
     } catch (e) {
       toast.error(formatError(e))
     } finally {
@@ -50,18 +45,18 @@ export function ProcessesView() {
     }
   }
 
-  /** Attempt EcoQoS for each eligible process not already tracked as applied, continuing after individual failures. */
   async function applyEligible() {
-    const eligible = processes.filter((p) => p.ecoDecision === "eligible" && !applied.has(p.pid))
+    const eligible = processes.filter((p) => p.ecoDecision === "eligible" && !p.ecoQosApplied)
+    let failed = 0
     for (const proc of eligible) {
       try {
         await api.optimizerSetProcessEcoQos(proc.pid, proc.name, true)
-        setApplied((cur) => new Set(cur).add(proc.pid))
       } catch {
-        // Per-process failures are audited in the backend; continue with the rest.
+        failed += 1 // per-process failures are audited in the backend
       }
     }
-    toast.success(`EcoQoS applied to eligible background processes (${eligible.length} candidates). Editors, compilers, games and inference were excluded.`)
+    toast.success(`EcoQoS applied to eligible background processes (${eligible.length - failed}/${eligible.length}). Editors, compilers, games and inference were excluded.`)
+    await load()
   }
 
   return (
@@ -80,11 +75,11 @@ export function ProcessesView() {
       }
     >
       <p className="mb-3 text-sm text-muted-foreground">
-        WinClean never terminates processes. EcoQoS only lowers efficiency-mode priority for clearly eligible background work (updaters, indexers, telemetry). VS Code, Cursor, Codex, Claude Code, OpenCode, compilers, games and AI inference are protected, as is the foreground app.
+        WinClean never terminates processes. EcoQoS only lowers efficiency-mode priority for clearly eligible background work (updaters, indexers, telemetry). VS Code, Cursor, Codex, Claude Code, OpenCode, compilers, games and AI inference are protected, as is the foreground app. The backend revalidates each PID's real process before enabling, and reports live EcoQoS state on every refresh.
       </p>
       {error ? <Notice tone="danger" text={error} /> : null}
       {loading ? (
-        <EmptyState text="Sampling processes (two 250 ms CPU samples)…" />
+        <EmptyState text="Sampling processes (two samples over ~250 ms)…" />
       ) : (
         <div className="max-h-[60vh] overflow-auto">
           {processes.map((proc) => (
@@ -92,17 +87,18 @@ export function ProcessesView() {
               <div className="min-w-0">
                 <span className="font-medium">{proc.name}</span>{" "}
                 <span className="text-xs text-muted-foreground">
-                  PID {proc.pid} · {proc.workingSetMb.toFixed(1)} MB · CPU {proc.cpuPercentRecent.toFixed(1)}%
+                  PID {proc.pid} · {proc.workingSetMb.toFixed(1)} MB · CPU {proc.cpuPercentRecent < 0 ? "n/a" : `${proc.cpuPercentRecent.toFixed(1)}%`}
                   {proc.isForeground ? " · foreground" : ""} · {proc.ecoDecision}
+                  {proc.ecoQosApplied ? " · EcoQoS on" : ""}
                 </span>
               </div>
               <Button
                 size="sm"
-                variant={applied.has(proc.pid) ? "default" : "outline"}
-                disabled={proc.ecoDecision === "protected" || proc.ecoDecision === "foreground" || busy === proc.pid}
-                onClick={() => void toggle({ ...proc, ecoQosApplied: applied.has(proc.pid) })}
+                variant={proc.ecoQosApplied ? "default" : "outline"}
+                disabled={(!proc.ecoQosApplied && (proc.ecoDecision === "protected" || proc.ecoDecision === "foreground")) || busy === proc.pid}
+                onClick={() => void toggle(proc)}
               >
-                {applied.has(proc.pid) ? "Restore" : "EcoQoS"}
+                {proc.ecoQosApplied ? "Restore" : "EcoQoS"}
               </Button>
             </div>
           ))}

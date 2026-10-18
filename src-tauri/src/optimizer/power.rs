@@ -12,6 +12,8 @@ pub use super::policy::{PowerProfile, PowerProfileId};
 pub struct BatteryStatus {
     pub present: bool,
     pub on_ac: bool,
+    /// False when Windows reports ACLineStatus=255 (unknown): on_ac is then meaningless and must not drive DC rules.
+    pub ac_known: bool,
     pub percent: Option<u8>,
     pub seconds_remaining: Option<i32>,
     pub active_scheme_guid: Option<String>,
@@ -64,7 +66,7 @@ mod win {
         let mut size = 0u32;
         unsafe { PowerReadFriendlyName(std::ptr::null_mut(), guid, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), &mut size); }
         if size == 0 { return None; }
-        let mut buf = vec![0u16; (size as usize / 2).max(1)];
+        let mut buf = vec![0u16; ((size as usize + 1) / 2).max(1)];
         let rc = unsafe { PowerReadFriendlyName(std::ptr::null_mut(), guid, std::ptr::null(), std::ptr::null(), buf.as_mut_ptr() as *mut u8, &mut size) };
         if rc != 0 { return None; }
         let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -88,6 +90,7 @@ mod win {
         Ok(BatteryStatus {
             present: st.BatteryFlag != 128, // BATTERY_FLAG_NO_BATTERY
             on_ac: st.ACLineStatus == 1,
+            ac_known: st.ACLineStatus != 255,
             percent: if st.BatteryLifePercent == 255 { None } else { Some(st.BatteryLifePercent) },
             seconds_remaining: if st.BatteryLifeTime == u32::MAX { None } else { Some(st.BatteryLifeTime as i32) },
             active_scheme_guid: guid,
@@ -114,7 +117,9 @@ mod win {
         let d3 = u16::from_str_radix(parts[2], 16).map_err(|_| "bad GUID".to_string())?;
         let mut d4 = [0u8; 8];
         let p3: Vec<u8> = (0..4).map(|i| u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
-        let p4: Vec<u8> = (0..12).map(|i| u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
+        // Tail is exactly 6 bytes (12 hex chars); reading beyond that panics.
+        if parts[3].len() != 4 || parts[4].len() != 12 { return Err(format!("invalid scheme GUID: {s}")); }
+        let p4: Vec<u8> = (0..6).map(|i| u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
         d4[0] = p3[0]; d4[1] = p3[1];
         for i in 0..6 { d4[2 + i] = p4[i]; }
         Ok(windows_sys::core::GUID { data1: d1, data2: d2, data3: d3, data4: d4 })

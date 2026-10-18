@@ -28,7 +28,6 @@ pub struct ExecutionProvider {
     pub detail: String,
 }
 
-/// Check relative DLL hints and Windows System32 for a provider without loading or verifying it.
 fn ep(name: &str, dll_hints: &[&str]) -> ExecutionProvider {
     // Presence of the provider DLL next to the app or in System32 counts as
     // "present but unverified": a real model+session test is still required.
@@ -47,9 +46,7 @@ fn ep(name: &str, dll_hints: &[&str]) -> ExecutionProvider {
     }
 }
 
-/// Discover Windows build, agent paths, and provider DLLs without enabling inference.
-/// Propose a route with the NPU unverified and the discrete GPU unavailable.
-pub fn capability_report(npu_present: bool, igpu_available: bool) -> CapabilityReport {
+pub fn capability_report(_npu_present: bool, igpu_available: bool) -> CapabilityReport {
     // On-device Agent Registry: %LOCALAPPDATA%\Microsoft\Windows\Agents and
     // the packaged-app agent manifests. Existence check only, no execution.
     let local = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
@@ -69,7 +66,9 @@ pub fn capability_report(npu_present: bool, igpu_available: bool) -> CapabilityR
     ];
     CapabilityReport {
         windows_build: build,
-        copilot_plus_capable: npu_present && build.map(|b| b >= 26100).unwrap_or(false),
+        // Presence + build is NOT proof of the 40+ TOPS Copilot+ requirement;
+        // throughput cannot be verified registry-only, so never claim it.
+        copilot_plus_capable: false,
         mcp_agent_registry_found: !paths.is_empty(),
         mcp_registry_paths: paths,
         file_explorer_mcp: "Discovery only. File Explorer MCP requires the connector app registered in the On-device Agent Registry and per-file user consent in Explorer. WinClean keeps its native scanner and never reads files through MCP without that consent.".into(),
@@ -78,12 +77,12 @@ pub fn capability_report(npu_present: bool, igpu_available: bool) -> CapabilityR
         npu_verified_for_inference: false,
         notes: vec![
             "NPU inference stays disabled until a Windows ML session test with a real model passes on this device (see docs/winclean-2.0.md).".into(),
+            "Copilot+ capability is reported as unverified: registry-only discovery cannot measure the required 40+ TOPS NPU throughput.".into(),
             "Microsoft Learn MCP is a development-time documentation server; it is not bundled into the shipped app.".into(),
         ],
     }
 }
 
-/// Read the Windows build number from the registry, returning `None` on read or parse failure.
 #[cfg(windows)]
 fn windows_build() -> Option<u32> {
     // RtlGetVersion via ntdll would need an extra binding; the registry
@@ -103,6 +102,5 @@ fn windows_build() -> Option<u32> {
     String::from_utf16_lossy(&buf[..end]).trim().parse().ok()
 }
 
-/// Return no Windows build number on unsupported platforms.
 #[cfg(not(windows))]
 fn windows_build() -> Option<u32> { None }

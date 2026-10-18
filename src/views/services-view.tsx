@@ -14,7 +14,7 @@ export function ServicesView() {
   const [services, setServices] = useState<ServiceInfo[]>([])
   const [query, setQuery] = useState("")
   const [error, setError] = useState<string | null>(null)
-  const [busy, setBusy] = useState<string | null>(null)
+  const [busy, setBusy] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
 
   /** Refresh native service configurations and policy classifications, updating loading and error state. */
@@ -34,7 +34,7 @@ export function ServicesView() {
 
   /** Request a service start-type change, replace its row on success, and report the outcome. */
   async function change(svc: ServiceInfo, startType: string) {
-    setBusy(svc.name)
+    setBusy((cur) => new Set(cur).add(svc.name))
     try {
       const updated = await api.optimizerSetServiceStartType(svc.name, svc.displayName, startType)
       setServices((cur) => cur.map((s) => (s.name === updated.name ? updated : s)))
@@ -42,7 +42,7 @@ export function ServicesView() {
     } catch (e) {
       toast.error(formatError(e))
     } finally {
-      setBusy(null)
+      setBusy((cur) => { const next = new Set(cur); next.delete(svc.name); return next })
     }
   }
 
@@ -95,11 +95,11 @@ export function ServicesView() {
                 <select
                   aria-label={`Start type for ${svc.displayName}`}
                   value={svc.startType}
-                  disabled={!svc.canChange || busy === svc.name}
+                  disabled={!svc.canChange || busy.has(svc.name)}
                   onChange={(e) => void change(svc, e.target.value)}
                   className="h-9 rounded-md border border-input bg-card px-2 text-sm disabled:opacity-50"
                 >
-                  {START_TYPES.map((t) => (
+                  {START_TYPES.filter((t) => t !== "disabled" || svc.classification.known).map((t) => (
                     <option key={t} value={t}>{t}</option>
                   ))}
                   {!START_TYPES.includes(svc.startType as StartType) ? (

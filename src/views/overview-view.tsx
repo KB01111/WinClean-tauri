@@ -123,7 +123,7 @@ export function OverviewView({
           ) : (
             <StorageHogBars
               directories={topDirectories.slice(0, 8)}
-              bytesIndexed={indexedBytes}
+              bytesIndexed={activeRun?.bytesIndexed ?? 0}
               onOpenDirectory={onOpenDirectory}
             />
           )}
@@ -284,7 +284,7 @@ function StorageHogBars({
             <span className="flex shrink-0 items-baseline gap-1.5">
               {bytesIndexed > 0 ? (
                 <span className="text-xs text-muted-foreground tabular-nums">
-                  {Math.round((directory.totalSize / bytesIndexed) * 100)}% of
+                  {Math.min(100, Math.round((directory.totalSize / bytesIndexed) * 100))}% of
                   indexed
                 </span>
               ) : null}

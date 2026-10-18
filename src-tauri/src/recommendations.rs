@@ -86,6 +86,7 @@ pub fn build_recommendations(
     let min_size = filters.min_size.unwrap_or(0);
     let min_age_days = filters.min_age_days.unwrap_or(0);
     let records = db.recommendation_file_records(scan_run_id, min_size, min_age_days, 20_000)?;
+    let truncated = records.len() >= 20_000;
     let duplicate_keys = db.duplicate_name_size_keys(scan_run_id, DUPLICATE_REVIEW_BYTES)?;
     let mode = filters.mode.as_deref().map(str::to_ascii_lowercase);
     let only_offload = filters.only_offload_eligible.unwrap_or(false);
@@ -129,12 +130,12 @@ pub fn build_recommendations(
         clean_bytes,
         offload_bytes,
         review_bytes,
-        warnings: vec![
+        warnings: { let mut w = vec![
             "Clean candidates are conservative and use the Windows Recycle Bin.".to_string(),
             "Offload candidates require Google Drive upload verification before local recycling."
                 .to_string(),
             "Review candidates are never auto-selected.".to_string(),
-        ],
+        ]; if truncated { w.push("Recommendation input was capped at 20,000 files; some eligible files in very large scans may not be listed.".to_string()); } w },
     })
 }
 

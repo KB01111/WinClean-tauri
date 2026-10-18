@@ -35,8 +35,9 @@ SQLite adds `optimizer_snapshots`, `optimizer_audit`, `power_history`
   inference processes. Restore = `ControlMask 0` for the same PID.
 - AI (existing `@openai/agents`) gains read-only tools only
   (`get_services`, `get_processes`, `get_power_status`, `get_hardware`).
-  Suggestions pass `validateAiServiceSuggestions` and need explicit user
-  approval in the UI; the backend re-validates.
+  The AI layer cannot change services in this release: suggestions are
+  advisory text only. `validateAiServiceSuggestions` is reserved for a
+  future approval flow; the backend re-checks every direct UI mutation.
 
 ## ASUS G16 / RTX 4070 sleep policy
 

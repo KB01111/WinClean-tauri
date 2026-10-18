@@ -60,6 +60,7 @@ pub fn run() {
             commands::export_diagnostics,
             commands::app_health,
             commands::cancel_scan,
+            commands::reveal_in_explorer,
             commands::optimizer_list_services,
             commands::optimizer_set_service_start_type,
             commands::optimizer_list_processes,

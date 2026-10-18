@@ -18,7 +18,7 @@ const svc = (name: string, risk: string): ServiceInfo =>
     pid: null,
     dependencies: [],
     canChange: risk !== "protected",
-    classification: { risk, reason: "r", recommendation: "keep" },
+    classification: { risk, known: risk !== "protected", reason: "r", recommendation: "keep" },
   }) as unknown as ServiceInfo
 
 describe("optimizer helpers", () => {

@@ -16,7 +16,7 @@ pub enum ServiceRisk {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ServiceClassification {
+pub struct ServiceClassification {    pub known: bool,
     pub risk: ServiceRisk,
     pub reason: String,
     pub recommendation: String,
@@ -31,7 +31,7 @@ pub const PROTECTED_SERVICES: &[&str] = &[
     "samss", "winmgmt", "schedule", "profSvc", "userManager", "gpsvc",
     "spooler", "plugplay", "power", "systemEventsBroker", "brokerInfrastructure",
     "coreMessagingRegistrar", "deviceAssociationService", "installservice",
-    "storSvc", "amsi", "wdnisdrv", "wdfilter", "amdwddmg", "nvlddmkm",
+    "storSvc", "amsi", "usosvc", "rpceptmapper", "bfe", "nsi", "keyiso", "appinfo", "lanmanworkstation", "lanmanserver", "staterepository", "tokenbroker", "timebrokersvc", "appxsVc", "clipSvc", "lsalso", "vaultSvc", "seclogon2", "wdnisdrv", "wdfilter", "amdwddmg", "nvlddmkm",
     "amd external events utility", "nvdisplay.containerlocalsystem",
 ];
 
@@ -46,13 +46,10 @@ const SAFE_SERVICES: &[&str] = &[
     "edgeupdate", "gupdate", "skypeupdate", "spotify elevation service",
 ];
 
-/// Trim a policy name and fold ASCII letters to lowercase for comparisons.
 fn norm(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
-/// Classify service names and display names with deterministic protection and risk rules.
-/// Unknown services default to caution with a recommendation to retain their current start type.
 pub fn classify_service(name: &str, display_name: &str) -> ServiceClassification {
     let n = norm(name);
     let d = norm(display_name);
@@ -63,10 +60,10 @@ pub fn classify_service(name: &str, display_name: &str) -> ServiceClassification
         || d.contains("windows search")
         || d.contains("amd crash defender")
         || d.contains("nvidia display")
-        || d.contains("copilot")
+        || d.contains("copilot") || d.contains("update orchestrator")
     {
         return ServiceClassification {
-            risk: ServiceRisk::Protected,
+            known: true, risk: ServiceRisk::Protected,
             reason: "Essential Windows, security, networking, driver, or Copilot+ component.".into(),
             recommendation: "Leave unchanged. WinClean will never modify this service.".into(),
         };
@@ -74,25 +71,35 @@ pub fn classify_service(name: &str, display_name: &str) -> ServiceClassification
     if hit(CAUTION_SERVICES) {
         return ServiceClassification {
             risk: ServiceRisk::Caution,
+            known: true,
             reason: "Telemetry, diagnostics, or optional shell feature. Changing it can affect troubleshooting or Store/Xbox features.".into(),
             recommendation: "Manual is the balanced choice. Snapshot is taken before any change.".into(),
         };
     }
     if hit(SAFE_SERVICES) {
         return ServiceClassification {
-            risk: ServiceRisk::Safe,
+            known: true, risk: ServiceRisk::Safe,
             reason: "Third-party updater/helper that does not need to run at boot.".into(),
             recommendation: "Manual (trigger start) keeps updates available without boot cost.".into(),
         };
     }
     ServiceClassification {
         risk: ServiceRisk::Caution,
+        known: false,
         reason: "Unknown service. WinClean cannot prove it is safe to disable.".into(),
         recommendation: "Keep current start type unless you recognize this service.".into(),
     }
 }
 
-/// Return whether the service policy forbids changing the supplied service.
+/// Which start-type changes a classification permits. Unknown services
+/// may be switched between Automatic/Manual but never Disabled: WinClean
+/// cannot prove an unlisted service is safe to turn off entirely.
+pub fn start_type_allowed(classification: &ServiceClassification, target_is_disabled: bool) -> bool {
+    if classification.risk == ServiceRisk::Protected { return false; }
+    if target_is_disabled && !classification.known { return false; }
+    true
+}
+
 pub fn is_protected_service(name: &str, display_name: &str) -> bool {
     classify_service(name, display_name).risk == ServiceRisk::Protected
 }
@@ -117,8 +124,6 @@ pub enum EcoQosDecision {
     Unknown,
 }
 
-/// Classify EcoQoS eligibility from the executable name, foreground state, and recent CPU usage.
-/// Protect listed workloads and foreground apps; leave busy or unrecognized work unclassified.
 pub fn classify_process_for_ecoqos(
     exe_name: &str,
     is_foreground: bool,
@@ -133,6 +138,13 @@ pub fn classify_process_for_ecoqos(
     }
     // Busy background work (compilers, inference) can slip past the name list;
     // sustained CPU use means throttling would be felt. Stay conservative.
+    if cpu_percent_recent < 0.0 {
+        // No CPU sample: only the name-based eligible set may pass;
+        // everything else stays Unknown (never assumed idle).
+        if !(n.contains("update") || n.contains("index") || n.contains("telemetry") || n.contains("crashpad") || n.contains("searchindexer")) {
+            return EcoQosDecision::Unknown;
+        }
+    }
     if cpu_percent_recent >= 25.0 {
         return EcoQosDecision::Unknown;
     }
@@ -171,7 +183,6 @@ pub const SCHEME_POWER_SAVER: &str = "a1841308-3541-4fab-bc81-f71556f20b4a";
 pub const SCHEME_HIGH_PERFORMANCE: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
 pub const SCHEME_ULTIMATE: &str = "e9a42b02-d5df-448d-aa00-03f14749eb61";
 
-/// Return built-in profile metadata, Windows scheme GUIDs, and background EcoQoS preferences.
 pub fn builtin_profiles() -> Vec<PowerProfile> {
     vec![
         PowerProfile { id: PowerProfileId::BatterySaver, label: "Battery Saver".into(), scheme_guid: Some(SCHEME_POWER_SAVER.into()), eco_qos_for_background: true, description: "Power Saver scheme + EcoQoS for eligible background work.".into() },
@@ -221,6 +232,11 @@ mod tests {
         assert!(is_protected_service("wuauserv", "Windows Update"));
         assert!(is_protected_service("WSearch", "Windows Search"));
         assert_eq!(classify_service("DiagTrack", "Diagnostics Tracking").risk, ServiceRisk::Caution);
+        assert!(is_protected_service("UsoSvc", "Update Orchestrator"));
+        assert!(is_protected_service("BFE", "Base Filtering Engine"));
+        assert!(!start_type_allowed(&classify_service("SomeRandomSvc", "Some Random Service"), true));
+        assert!(start_type_allowed(&classify_service("SomeRandomSvc", "Some Random Service"), false));
+        assert!(start_type_allowed(&classify_service("DiagTrack", "Diagnostics Tracking"), true));
     }
 
     #[test]

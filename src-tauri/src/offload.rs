@@ -78,6 +78,7 @@ pub struct OffloadJobStatus {
 pub type OffloadProgressSink = Arc<dyn Fn(&OffloadJobStatus) + Send + Sync>;
 
 struct OffloadProgressEmitter<'a> {
+    last_transition_emit: Mutex<Instant>,
     db: &'a Database,
     job_id: i64,
     sink: Option<OffloadProgressSink>,
@@ -85,12 +86,12 @@ struct OffloadProgressEmitter<'a> {
 }
 
 impl<'a> OffloadProgressEmitter<'a> {
-    /// Create an optional job-progress emitter whose first byte-progress update can fire immediately.
     fn new(db: &'a Database, job_id: i64, sink: Option<OffloadProgressSink>) -> Self {
         Self {
             db,
             job_id,
             sink,
+            last_transition_emit: Mutex::new(Instant::now().checked_sub(Duration::from_millis(1_000)).unwrap_or_else(Instant::now)),
             last_byte_emit: Mutex::new(
                 Instant::now()
                     .checked_sub(Duration::from_millis(BYTE_PROGRESS_EMIT_INTERVAL_MS))
@@ -99,7 +100,6 @@ impl<'a> OffloadProgressEmitter<'a> {
         }
     }
 
-    /// Read and publish the current job status when a sink exists, ignoring status-read failures.
     fn emit_now(&self) {
         let Some(sink) = &self.sink else {
             return;
@@ -109,7 +109,16 @@ impl<'a> OffloadProgressEmitter<'a> {
         }
     }
 
-    /// Publish byte progress at most once per configured interval when a sink exists.
+    /// Item transitions share a 250 ms throttle so a many-file batch does
+    /// not reload and emit the full item list per file (quadratic payload).
+    /// Job-level start/terminal emits stay immediate via emit_now().
+    fn emit_transition(&self) {
+        if self.sink.is_none() { return; }
+        let should_emit = self.last_transition_emit.lock().map(|mut last| {
+            if last.elapsed() >= Duration::from_millis(250) { *last = Instant::now(); true } else { false }
+        }).unwrap_or(false);
+        if should_emit { self.emit_now(); }
+    }
     fn emit_byte_progress(&self) {
         if self.sink.is_none() {
             return;
@@ -286,7 +295,6 @@ pub fn run_offload_job_with_client(
     offload_status(db, status.id)
 }
 
-/// Process an offload job with the supplied uploader and recycler without a progress sink.
 pub fn process_offload_job_with_client(
     db: &Database,
     job_id: i64,
@@ -298,8 +306,6 @@ pub fn process_offload_job_with_client(
     process_offload_job_with_sink(db, job_id, candidates, drive, recycler, cancel, None)
 }
 
-/// Process an offload batch, persisting job state and optionally publishing progress.
-/// Honor cancellation between items and publish the final job status when processing completes.
 pub fn process_offload_job_with_sink(
     db: &Database,
     job_id: i64,
@@ -942,8 +948,6 @@ impl DriveUploader for GoogleDriveClient {
     }
 }
 
-/// Validate and upload one candidate, verify its size, then recycle the local original.
-/// Persist item outcomes and publish progress; skip recycling if validation, upload, or cancellation prevents it.
 fn process_item(
     db: &Database,
     item: OffloadItemRecord,
@@ -955,18 +959,18 @@ fn process_item(
     emitter: &OffloadProgressEmitter<'_>,
 ) -> anyhow::Result<()> {
     db.update_offload_item(item.id, "validating", None, None, 0, None, None, None, None)?;
-    emitter.emit_now();
+    emitter.emit_transition();
 
     if let Err(error) =
         validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms)
     {
         let result = mark_item_failed(db, item.id, "skipped", 0, &error.to_string());
-        emitter.emit_now();
+        emitter.emit_transition();
         return result;
     }
 
     db.update_offload_item(item.id, "uploading", None, None, 0, None, None, None, None)?;
-    emitter.emit_now();
+    emitter.emit_transition();
     let item_id = item.id;
     let report = move |uploaded: u64| {
         let _ = db.update_offload_item_progress(item_id, uploaded);
@@ -985,7 +989,7 @@ fn process_item(
                 "failed"
             };
             let result = mark_item_failed(db, item.id, status, 0, &error.to_string());
-            emitter.emit_now();
+            emitter.emit_transition();
             return result;
         }
     };
@@ -999,7 +1003,7 @@ fn process_item(
             upload.size,
             "Google Drive upload verification failed",
         );
-        emitter.emit_now();
+        emitter.emit_transition();
         return result;
     }
 
@@ -1008,7 +1012,7 @@ fn process_item(
     if cancel.load(Ordering::Relaxed) {
         let _ = drive.delete_file(&upload.file_id);
         let result = mark_item_failed(db, item.id, "canceled", 0, OFFLOAD_CANCELED_MESSAGE);
-        emitter.emit_now();
+        emitter.emit_transition();
         return result;
     }
 
@@ -1065,7 +1069,7 @@ fn process_item(
             Some(unix_millis()),
         ),
     };
-    emitter.emit_now();
+    emitter.emit_transition();
     result
 }
 

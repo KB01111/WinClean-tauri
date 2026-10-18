@@ -86,7 +86,7 @@ mod win {
         let rc = unsafe { RegQueryValueExW(hkey, valw.as_ptr(), std::ptr::null_mut(), &mut ty, std::ptr::null_mut(), &mut size) };
         let mut out = None;
         if rc == 0 && size > 0 {
-            let mut buf = vec![0u16; (size as usize / 2).max(1)];
+            let mut buf = vec![0u16; ((size as usize + 1) / 2).max(1)];
             let rc2 = unsafe { RegQueryValueExW(hkey, valw.as_ptr(), std::ptr::null_mut(), &mut ty, buf.as_mut_ptr() as *mut u8, &mut size) };
             if rc2 == 0 {
                 let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());

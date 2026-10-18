@@ -210,7 +210,6 @@ impl Database {
         &self.path
     }
 
-    /// Create missing application tables and indexes and record the current schema version.
     pub fn migrate(&self) -> anyhow::Result<()> {
         let conn = self.connect()?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -405,7 +404,6 @@ impl Database {
 
     // --- WinClean 2.0 optimizer persistence ---
 
-    /// Store the JSON needed to restore an optimization target and return the snapshot ID.
     pub fn insert_optimizer_snapshot(&self, kind: &str, target: &str, payload_json: &str) -> anyhow::Result<i64> {
         let conn = self.connect()?;
         conn.execute(
@@ -415,7 +413,6 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Read a snapshot by ID, returning `None` when it does not exist.
     pub fn get_optimizer_snapshot(&self, id: i64) -> anyhow::Result<Option<crate::optimizer::OptimizationSnapshot>> {
         let conn = self.connect()?;
         conn.query_row(
@@ -428,15 +425,12 @@ impl Database {
         ).optional().context("read optimizer snapshot")
     }
 
-    /// Set the rollback timestamp on the snapshot with the supplied ID.
     pub fn mark_snapshot_rolled_back(&self, id: i64) -> anyhow::Result<()> {
         let conn = self.connect()?;
         conn.execute("UPDATE optimizer_snapshots SET rolled_back_at_ms = ?2 WHERE id = ?1", params![id, unix_millis()])?;
         Ok(())
     }
 
-    /// Append an optimization audit entry and return its ID.
-    /// Only pending entries omit a completion timestamp; this does not update an earlier entry.
     pub fn insert_optimizer_audit(&self, kind: &str, target: &str, action: &str, status: &str, detail: Option<&str>, snapshot_id: Option<i64>) -> anyhow::Result<i64> {
         let conn = self.connect()?;
         let done = if status == "pending" { None } else { Some(unix_millis()) };
@@ -447,7 +441,16 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Return up to `limit` optimization audit entries in descending ID order.
+    /// Finalizes a pending audit row in place (no duplicate terminal row).
+    pub fn complete_optimizer_audit(&self, id: i64, status: &str, detail: Option<&str>) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE optimizer_audit SET status = ?2, detail = ?3, completed_at_ms = ?4 WHERE id = ?1 AND status = 'pending'",
+            params![id, status, detail, unix_millis()],
+        )?;
+        Ok(())
+    }
+
     pub fn list_optimizer_audit(&self, limit: u32) -> anyhow::Result<Vec<crate::optimizer::OptimizationAudit>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -461,7 +464,6 @@ impl Database {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("list optimizer audit")
     }
 
-    /// Return up to `limit` optimization snapshots in descending ID order.
     pub fn list_optimizer_snapshots(&self, limit: u32) -> anyhow::Result<Vec<crate::optimizer::OptimizationSnapshot>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -474,7 +476,6 @@ impl Database {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("list optimizer snapshots")
     }
 
-    /// Record a battery percentage and AC state, then retain only the latest 2000 samples.
     pub fn record_power_sample(&self, percent: u8, on_ac: bool) -> anyhow::Result<()> {
         let conn = self.connect()?;
         conn.execute("INSERT INTO power_history (at_ms, percent, on_ac) VALUES (?1, ?2, ?3)", params![unix_millis(), percent as i64, on_ac as i64])?;
@@ -483,7 +484,6 @@ impl Database {
         Ok(())
     }
 
-    /// Return up to `limit` battery samples in descending ID order.
     pub fn power_history(&self, limit: u32) -> anyhow::Result<Vec<crate::optimizer::power::PowerSample>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare("SELECT at_ms, percent, on_ac FROM power_history ORDER BY id DESC LIMIT ?1")?;
@@ -924,7 +924,6 @@ impl Database {
             .context("read extension summary")
     }
 
-    /// Aggregate file counts and bytes by extension category across all files in a scan run.
     pub fn category_summary(&self, run_id: i64) -> anyhow::Result<Vec<CategorySummary>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
@@ -1004,8 +1003,6 @@ impl Database {
             .context("read cleanup candidate files")
     }
 
-    /// Read nonempty files ordered by size, applying size and age filters before the limit.
-    /// Unknown modification times pass the age filter; the limit is clamped to 1–20000.
     pub fn recommendation_file_records(
         &self,
         run_id: i64,
@@ -1060,8 +1057,6 @@ impl Database {
             .context("read recommendation files")
     }
 
-    /// Return repeated lowercase filename and size pairs for files meeting the minimum size.
-    /// These are review candidates; file contents are not compared.
     pub fn duplicate_name_size_keys(
         &self,
         run_id: i64,
@@ -1075,6 +1070,14 @@ impl Database {
             WHERE scan_run_id = ?1
               AND is_directory = 0
               AND size >= ?2
+              AND is_reparse_point = 0
+              AND is_placeholder = 0
+              AND is_system = 0
+              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\windows\\%'
+              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\program files\\%'
+              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\program files (x86)\\%'
+              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\programdata\\%'
+              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\appdata\\%'
             GROUP BY LOWER(name), size
             HAVING COUNT(*) > 1
             "#,

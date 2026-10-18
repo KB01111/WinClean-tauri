@@ -1553,3 +1553,58 @@ fn current_test_millis() -> i64 {
 fn hours_ms(hours: i64) -> i64 {
     hours * 60 * 60 * 1000
 }
+
+#[test]
+fn callback_only_progress_reports_terminal_state_without_mutex() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("fixture");
+    fs::create_dir_all(&root).expect("fixture dir");
+    fs::write(root.join("small.txt"), vec![1_u8; 10]).expect("small file");
+    let db = Database::open(temp.path().join("index.sqlite3")).expect("open db");
+    db.migrate().expect("migrate db");
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_seen = std::sync::Arc::clone(&seen);
+    let summary = run_recursive_scan(
+        &db,
+        root.as_path(),
+        Some(ScanRunOptions {
+            file_system: None,
+            attempted_mode: None,
+            fallback_reason: None,
+            cancel: None,
+            progress: None,
+            progress_sink: Some(std::sync::Arc::new(move |p: &winclean_lib::scan::ScanProgress| {
+                sink_seen.lock().expect("sink lock").push((p.state.clone(), p.run_id));
+            })),
+        }),
+    )
+    .expect("scan");
+    assert_eq!(summary.files_indexed, 1);
+    let seen = seen.lock().expect("seen lock");
+    let (last_state, last_run) = seen.last().expect("terminal callback");
+    assert_eq!(*last_state, ScanState::Completed);
+    assert!(last_run.is_some());
+
+    // Failed scans also deliver a terminal callback without a mutex.
+    let failed_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failed_sink = std::sync::Arc::clone(&failed_seen);
+    let missing = temp.path().join("missing");
+    let _ = run_recursive_scan(
+        &db,
+        missing.as_path(),
+        Some(ScanRunOptions {
+            file_system: None,
+            attempted_mode: None,
+            fallback_reason: None,
+            cancel: None,
+            progress: None,
+            progress_sink: Some(std::sync::Arc::new(move |p: &winclean_lib::scan::ScanProgress| {
+                failed_sink.lock().expect("sink lock").push(p.state.clone());
+            })),
+        }),
+    )
+    .expect_err("missing root should fail");
+    let failed_seen = failed_seen.lock().expect("failed lock");
+    assert_eq!(failed_seen.last(), Some(&ScanState::Failed));
+}
