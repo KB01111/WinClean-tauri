@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "microsoft-learn": {
+      "type": "http",
+      "url": "https://learn.microsoft.com/api/mcp",
+      "description": "Development-time documentation research only (Microsoft Learn MCP). Not bundled into the shipped WinClean app; used to verify Windows AI / MCP / Windows ML APIs against official docs."
+    }
+  }
+}

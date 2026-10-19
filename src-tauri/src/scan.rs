@@ -118,13 +118,30 @@ impl Default for ScanProgress {
     }
 }
 
-#[derive(Clone, Debug)]
+pub type ScanProgressSink = Arc<dyn Fn(&ScanProgress) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct ScanRunOptions {
     pub file_system: Option<String>,
     pub attempted_mode: Option<ScanMode>,
     pub fallback_reason: Option<String>,
     pub cancel: Option<Arc<AtomicBool>>,
     pub progress: Option<Arc<Mutex<ScanProgress>>>,
+    pub progress_sink: Option<ScanProgressSink>,
+}
+
+impl std::fmt::Debug for ScanRunOptions {
+    /// Format scan options while representing the optional progress callback by its presence only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanRunOptions")
+            .field("file_system", &self.file_system)
+            .field("attempted_mode", &self.attempted_mode)
+            .field("fallback_reason", &self.fallback_reason)
+            .field("cancel", &self.cancel)
+            .field("progress", &self.progress)
+            .field("progress_sink", &self.progress_sink.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -244,6 +261,8 @@ pub fn choose_scan_plan(_root_path: &str, file_system: Option<&str>) -> ScanPlan
     }
 }
 
+/// Persist a recursive scan using parallel workers and optional cancellation and progress reporting.
+/// Finalize the stored run as completed, canceled, or failed according to the scan outcome.
 pub fn run_recursive_scan(
     db: &Database,
     root: &Path,
@@ -255,6 +274,7 @@ pub fn run_recursive_scan(
         fallback_reason: None,
         cancel: None,
         progress: None,
+        progress_sink: None,
     });
 
     let root = root.to_path_buf();
@@ -293,6 +313,7 @@ pub fn run_recursive_scan(
 
     update_progress(
         &options.progress,
+        &options.progress_sink,
         &summary,
         ScanState::Running,
         None,
@@ -319,6 +340,7 @@ pub fn run_recursive_scan(
                     options.progress.as_ref(),
                     &last_error,
                     Some(worker_count),
+                    options.progress_sink.as_ref(),
                 ) {
                     anyhow::bail!(
                         "scan failed with {last_error}; additionally failed to persist failed scan state: {finalize_error}"
@@ -328,6 +350,7 @@ pub fn run_recursive_scan(
             }
             update_progress(
                 &options.progress,
+                &options.progress_sink,
                 &summary,
                 if summary.canceled {
                     ScanState::Canceled
@@ -352,6 +375,7 @@ pub fn run_recursive_scan(
                 options.progress.as_ref(),
                 &last_error,
                 Some(worker_count),
+                options.progress_sink.as_ref(),
             ) {
                 anyhow::bail!(
                     "scan failed with {last_error}; additionally failed to persist failed scan state: {finalize_error}"
@@ -362,6 +386,8 @@ pub fn run_recursive_scan(
     }
 }
 
+/// Coordinate directory workers, persist batches of entries, and accumulate directory rollups.
+/// Publish progress while honoring cancellation and propagating worker or database errors.
 fn collect_parallel_scan(
     db: &Database,
     run_id: i64,
@@ -481,6 +507,7 @@ fn collect_parallel_scan(
                             pending_entries.clear();
                             maybe_update_progress(
                                 &options.progress,
+                                &options.progress_sink,
                                 summary,
                                 ScanState::Running,
                                 None,
@@ -509,6 +536,7 @@ fn collect_parallel_scan(
 
         maybe_update_progress(
             &options.progress,
+            &options.progress_sink,
             summary,
             ScanState::Running,
             None,
@@ -537,6 +565,7 @@ fn collect_parallel_scan(
         db.insert_file_entries(run_id, &pending_entries)?;
         update_progress(
             &options.progress,
+            &options.progress_sink,
             summary,
             ScanState::Running,
             None,
@@ -588,8 +617,10 @@ fn pump_pending_dirs(
     }
 }
 
+/// Publish a scan snapshot only after the configured progress interval has elapsed.
 fn maybe_update_progress(
     progress: &Option<Arc<Mutex<ScanProgress>>>,
+    progress_sink: &Option<ScanProgressSink>,
     summary: &ScanSummary,
     state: ScanState,
     last_error: Option<String>,
@@ -601,31 +632,44 @@ fn maybe_update_progress(
         return;
     }
 
-    update_progress(progress, summary, state, last_error, worker_count, phase);
+    update_progress(
+        progress,
+        progress_sink,
+        summary,
+        state,
+        last_error,
+        worker_count,
+        phase,
+    );
     *last_progress_update = Instant::now();
 }
 
+/// Persist a failed scan and update shared progress without worker details or a progress callback.
 pub fn finalize_failed_scan_run(
     db: &Database,
     summary: &mut ScanSummary,
     progress: Option<&Arc<Mutex<ScanProgress>>>,
     last_error: &str,
 ) -> anyhow::Result<()> {
-    finalize_failed_scan_run_with_details(db, summary, progress, last_error, None)
+    finalize_failed_scan_run_with_details(db, summary, progress, last_error, None, None)
 }
 
+/// Persist a failed scan, then publish its terminal snapshot with optional worker details.
 fn finalize_failed_scan_run_with_details(
     db: &Database,
     summary: &mut ScanSummary,
     progress: Option<&Arc<Mutex<ScanProgress>>>,
     last_error: &str,
     worker_count: Option<usize>,
+    progress_sink: Option<&ScanProgressSink>,
 ) -> anyhow::Result<()> {
     summary.finished_at_ms = unix_millis(SystemTime::now());
     db.finish_scan_run(summary, "failed", Some(last_error))?;
     let progress = progress.cloned();
+    let progress_sink = progress_sink.cloned();
     update_progress(
         &progress,
+        &progress_sink,
         summary,
         ScanState::Failed,
         Some(last_error.to_string()),
@@ -904,36 +948,46 @@ fn record_io_error_counts(
     }
 }
 
+/// Build a scan snapshot, update shared progress when its lock is available, and notify the optional sink.
 fn update_progress(
     progress: &Option<Arc<Mutex<ScanProgress>>>,
+    progress_sink: &Option<ScanProgressSink>,
     summary: &ScanSummary,
     state: ScanState,
     last_error: Option<String>,
     worker_count: Option<usize>,
     phase: Option<&str>,
 ) {
-    let Some(progress) = progress else {
+    if progress.is_none() && progress_sink.is_none() {
         return;
+    }
+
+    let snapshot = ScanProgress {
+        state,
+        run_id: Some(summary.run_id),
+        root_path: Some(summary.root_path.clone()),
+        mode: Some(summary.mode),
+        attempted_mode: summary.attempted_mode,
+        fallback_reason: summary.fallback_reason.clone(),
+        files_indexed: summary.files_indexed,
+        directories_indexed: summary.directories_indexed,
+        bytes_indexed: summary.bytes_indexed,
+        access_denied_count: summary.access_denied_count,
+        skipped_reparse_count: summary.skipped_reparse_count,
+        error_count: summary.error_count,
+        last_error,
+        worker_count,
+        phase: phase.map(str::to_string),
     };
 
-    if let Ok(mut progress) = progress.lock() {
-        *progress = ScanProgress {
-            state,
-            run_id: Some(summary.run_id),
-            root_path: Some(summary.root_path.clone()),
-            mode: Some(summary.mode),
-            attempted_mode: summary.attempted_mode,
-            fallback_reason: summary.fallback_reason.clone(),
-            files_indexed: summary.files_indexed,
-            directories_indexed: summary.directories_indexed,
-            bytes_indexed: summary.bytes_indexed,
-            access_denied_count: summary.access_denied_count,
-            skipped_reparse_count: summary.skipped_reparse_count,
-            error_count: summary.error_count,
-            last_error,
-            worker_count,
-            phase: phase.map(str::to_string),
-        };
+    if let Some(progress) = progress {
+        if let Ok(mut progress) = progress.lock() {
+            *progress = snapshot.clone();
+        }
+    }
+
+    if let Some(sink) = progress_sink {
+        sink(&snapshot);
     }
 }
 

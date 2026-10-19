@@ -7,10 +7,15 @@ import {
   Settings,
   Sparkles,
   Trash2,
+  BatteryCharging,
+  Cpu,
+  Leaf,
+  Server,
+  Undo2,
 } from "lucide-react"
 
-import { NavButton } from "@/components/common"
-import { formatPercentUsed } from "@/lib/format"
+import { CapacityBar, NavButton } from "@/components/common"
+import { formatBytes, formatPercentUsed } from "@/lib/format"
 import type { VolumeInfo } from "@/lib/api"
 import { cn } from "@/lib/utils"
 
@@ -18,6 +23,11 @@ export type View =
   | "overview"
   | "explorer"
   | "cleanup"
+  | "services"
+  | "processes"
+  | "power"
+  | "hardware"
+  | "optimizerHistory"
   | "history"
   | "insights"
   | "settings"
@@ -26,11 +36,17 @@ const NAV_ITEMS: { view: View; label: string; icon: typeof BarChart3 }[] = [
   { view: "overview", label: "Overview", icon: BarChart3 },
   { view: "explorer", label: "Explorer", icon: FolderTree },
   { view: "cleanup", label: "Recover space", icon: Trash2 },
+  { view: "services", label: "Windows Services", icon: Server },
+  { view: "processes", label: "Processes & EcoQoS", icon: Leaf },
+  { view: "power", label: "Battery & Power", icon: BatteryCharging },
+  { view: "hardware", label: "Hardware & NPU", icon: Cpu },
+  { view: "optimizerHistory", label: "Optimization History", icon: Undo2 },
   { view: "insights", label: "AI insights", icon: Sparkles },
   { view: "history", label: "History", icon: History },
   { view: "settings", label: "Settings", icon: Settings },
 ]
 
+/** Render navigation, volume selection, capacity details, and scan controls for the application. */
 export function Sidebar({
   view,
   onViewChange,
@@ -85,32 +101,50 @@ export function Sidebar({
               No volumes detected
             </p>
           ) : null}
-          {volumes.map((volume) => (
-            <button
-              type="button"
-              key={volume.rootPath}
-              onClick={() => onSelectRoot(volume.rootPath)}
-              className={cn(
-                "flex w-full items-center gap-2 rounded-lg border p-2 text-left transition-colors",
-                selectedRoot === volume.rootPath
-                  ? "border-primary/60 bg-accent"
-                  : "border-border bg-card hover:border-ring/50"
-              )}
-            >
-              <HardDrive
-                className="size-4 shrink-0 text-primary"
-                aria-hidden="true"
-              />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-medium">
-                  {volume.rootPath}
+          {volumes.map((volume) => {
+            const totalSpace = volume.totalSpace
+            const availableSpace = volume.availableSpace
+            const hasCapacity = totalSpace != null && availableSpace != null
+            return (
+              <button
+                type="button"
+                key={volume.rootPath}
+                onClick={() => onSelectRoot(volume.rootPath)}
+                aria-label={`Scan drive ${volume.rootPath}, ${formatPercentUsed(volume)}`}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-lg border p-2 text-left transition-colors",
+                  selectedRoot === volume.rootPath
+                    ? "border-primary/60 bg-accent"
+                    : "border-border bg-card hover:border-ring/50"
+                )}
+              >
+                <HardDrive
+                  className="size-4 shrink-0 text-primary"
+                  aria-hidden="true"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium">
+                    {volume.rootPath}
+                  </span>
+                  <span className="block truncate text-xs text-muted-foreground">
+                    {volume.fileSystem ?? "unknown"} ·{" "}
+                    {formatPercentUsed(volume)}
+                    {volume.availableSpace != null
+                      ? ` · ${formatBytes(volume.availableSpace)} free`
+                      : null}
+                  </span>
+                  {hasCapacity ? (
+                    <CapacityBar
+                      className="mt-1.5"
+                      used={(volume.totalSpace ?? 0) - (volume.availableSpace ?? 0)}
+                      total={volume.totalSpace ?? 0}
+                      label={`${volume.rootPath} capacity`}
+                    />
+                  ) : null}
                 </span>
-                <span className="block truncate text-xs text-muted-foreground">
-                  {volume.fileSystem ?? "unknown"} · {formatPercentUsed(volume)}
-                </span>
-              </span>
-            </button>
-          ))}
+              </button>
+            )
+          })}
         </div>
       </div>
     </aside>

@@ -3,15 +3,20 @@ import {
   ChevronUp,
   FileSearch,
   FolderOpen,
+  FolderSearch,
   FolderTree,
   Search,
+  SearchX,
 } from "lucide-react"
+import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
-import { EmptyState, Panel, TextInput } from "@/components/common"
+import { Panel, TextInput } from "@/components/common"
+import { api, formatError } from "@/lib/api"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
 import type { DirectoryChild, FileSearchResult, ScanRunRecord } from "@/lib/api"
 
+/** Render scan directory navigation, file filters, results, and Explorer reveal actions. */
 export function ExplorerView({
   activeRun,
   currentDirectory,
@@ -89,20 +94,33 @@ export function ExplorerView({
         </div>
         <div className="max-h-[560px] overflow-auto">
           {loadingRunData ? (
-            <EmptyState text="Loading directory data" />
+            <div className="space-y-2">
+              {Array.from({ length: 8 }, (_, index) => (
+                <div
+                  key={index}
+                  className="h-12 w-full animate-pulse rounded-md bg-muted"
+                />
+              ))}
+            </div>
           ) : directoryChildren.length === 0 ? (
-            <EmptyState text="No children for this directory" />
+            <div className="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
+              <FolderSearch className="size-8" aria-hidden="true" />
+              <span>No children for this directory</span>
+            </div>
           ) : (
             directoryChildren.map((entry) => (
-              <button
+              <div
                 key={entry.id}
-                type="button"
-                onClick={() =>
-                  entry.isDirectory && void onOpenDirectory(entry.path)
-                }
-                disabled={!entry.isDirectory}
-                className="grid w-full grid-cols-[1fr_120px_90px] items-center gap-3 border-b border-border/60 py-3 text-left text-sm disabled:cursor-default"
+                className="relative grid grid-cols-[minmax(0,1fr)_120px_90px_auto] items-center gap-3 border-b border-border/60 py-3 text-sm"
               >
+                {entry.isDirectory ? (
+                  <button
+                    type="button"
+                    aria-label={`Open ${entry.name}`}
+                    className="absolute inset-0 cursor-pointer rounded-sm transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                    onClick={() => void onOpenDirectory(entry.path)}
+                  />
+                ) : null}
                 <span className="min-w-0">
                   <span className="flex items-center gap-2 truncate font-medium">
                     {entry.isDirectory ? (
@@ -130,7 +148,8 @@ export function ExplorerView({
                     ? `${formatNumber(entry.fileCount)} files`
                     : formatDateTime(entry.modifiedAtMs)}
                 </span>
-              </button>
+                <RevealButton path={entry.path} name={entry.name} />
+              </div>
             ))
           )}
         </div>
@@ -164,7 +183,10 @@ export function ExplorerView({
         </div>
         <div className="max-h-[560px] overflow-auto">
           {files.length === 0 ? (
-            <EmptyState text="No files match this filter" />
+            <div className="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
+              <SearchX className="size-8" aria-hidden="true" />
+              <span>No files match this filter</span>
+            </div>
           ) : (
             files.map((file) => (
               <div
@@ -172,11 +194,21 @@ export function ExplorerView({
                 className="border-b border-border/60 py-3 text-sm"
               >
                 <div className="flex items-center justify-between gap-3">
-                  <span className="truncate font-medium">{file.name}</span>
-                  <span className="tabular-nums">{formatBytes(file.size)}</span>
+                  <span className="min-w-0 truncate font-medium">
+                    {file.name}
+                  </span>
+                  <span className="flex shrink-0 items-center gap-2">
+                    <span className="tabular-nums">
+                      {formatBytes(file.size)}
+                    </span>
+                    <RevealButton path={file.path} name={file.name} />
+                  </span>
                 </div>
                 <div className="mt-1 truncate text-xs text-muted-foreground">
                   {file.path}
+                </div>
+                <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                  {formatDateTime(file.modifiedAtMs)}
                 </div>
               </div>
             ))
@@ -184,5 +216,24 @@ export function ExplorerView({
         </div>
       </Panel>
     </div>
+  )
+}
+
+/** Reveal a path in Windows Explorer without triggering its parent row’s click action. */
+function RevealButton({ path, name }: { path: string; name: string }) {
+  return (
+    <button
+      type="button"
+      aria-label={`Reveal ${name} in Explorer`}
+      className="relative z-10 shrink-0 rounded-md p-1.5 text-primary transition-colors hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+      onClick={(event) => {
+        event.stopPropagation()
+        api.revealInExplorer(path).catch((error) => {
+          toast.error(formatError(error))
+        })
+      }}
+    >
+      <FolderOpen className="size-3.5" aria-hidden="true" />
+    </button>
   )
 }

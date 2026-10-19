@@ -3,6 +3,7 @@ import { Download, Flame, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
   DataTable,
+  DistributionBar,
   EmptyState,
   Metric,
   Panel,
@@ -20,6 +21,7 @@ import type {
   TopDirectory,
 } from "@/lib/api"
 
+/** Display scan totals, large files and directories, scan history, and file-type distributions. */
 export function OverviewView({
   progress,
   scanRuns,
@@ -57,6 +59,9 @@ export function OverviewView({
     (progress.state !== "idle" &&
       progress.runId != null &&
       progress.runId === activeRun?.id)
+  const indexedBytes = showLiveProgress
+    ? progress.bytesIndexed
+    : (activeRun?.bytesIndexed ?? 0)
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_360px]">
       <div className="space-y-4">
@@ -77,12 +82,12 @@ export function OverviewView({
                 : (activeRun?.directoriesIndexed ?? 0)
             )}
           />
+          <Metric label="Indexed" value={formatBytes(indexedBytes)} />
           <Metric
-            label="Indexed"
+            label="Recoverable"
             value={formatBytes(
-              showLiveProgress
-                ? progress.bytesIndexed
-                : (activeRun?.bytesIndexed ?? 0)
+              (recommendationPlan?.cleanBytes ?? 0) +
+                (recommendationPlan?.offloadBytes ?? 0)
             )}
           />
           <Metric
@@ -92,29 +97,12 @@ export function OverviewView({
                 ? progress.accessDeniedCount
                 : (activeRun?.accessDeniedCount ?? 0)
             )}
-          />
-          <Metric
-            label="Recoverable"
-            value={formatBytes(
-              (recommendationPlan?.cleanBytes ?? 0) +
-                (recommendationPlan?.offloadBytes ?? 0)
-            )}
+            hint="access denied paths"
           />
         </div>
 
-        <Panel title="Storage hogs">
-          {topDirectories.length === 0 ? (
-            <EmptyState text="Run a scan to find what is eating your disk" />
-          ) : (
-            <StorageHogBars
-              directories={topDirectories.slice(0, 8)}
-              onOpenDirectory={onOpenDirectory}
-            />
-          )}
-        </Panel>
-
         <Panel
-          title="Largest directories"
+          title="Storage hogs"
           action={
             <Button
               variant="outline"
@@ -130,16 +118,15 @@ export function OverviewView({
             </Button>
           }
         >
-          <DataTable
-            headers={["Path", "Size", "Files", "Folders"]}
-            empty="No directory data yet"
-            rows={topDirectories.map((directory) => [
-              directory.path,
-              formatBytes(directory.totalSize),
-              formatNumber(directory.fileCount),
-              formatNumber(directory.directoryCount),
-            ])}
-          />
+          {topDirectories.length === 0 ? (
+            <EmptyState text="Run a scan to find what is eating your disk" />
+          ) : (
+            <StorageHogBars
+              directories={topDirectories.slice(0, 8)}
+              bytesIndexed={activeRun?.bytesIndexed ?? 0}
+              onOpenDirectory={onOpenDirectory}
+            />
+          )}
         </Panel>
 
         <Panel title="Largest files">
@@ -206,12 +193,17 @@ export function OverviewView({
         </Panel>
 
         <Panel title="File mix">
-          <SummaryList
-            rows={categories.map((row) => [
-              row.category,
-              formatBytes(row.totalSize),
-            ])}
-          />
+          <DistributionBar segments={fileMixSegments(categories)} />
+          {categories.length > 0 ? (
+            <div className="mt-4">
+              <SummaryList
+                rows={categories.map((row) => [
+                  row.category,
+                  formatBytes(row.totalSize),
+                ])}
+              />
+            </div>
+          ) : null}
         </Panel>
 
         <Panel title="Top extensions">
@@ -229,11 +221,43 @@ export function OverviewView({
   )
 }
 
+const CHART_SEGMENT_CLASSES = [
+  "bg-chart-1",
+  "bg-chart-2",
+  "bg-chart-3",
+  "bg-chart-4",
+  "bg-chart-5",
+]
+
+/** Build chart segments for the five largest categories, grouping any remaining bytes as Other. */
+function fileMixSegments(categories: CategorySummary[]) {
+  const sorted = [...categories].sort((a, b) => b.totalSize - a.totalSize)
+  const segments = sorted.slice(0, 5).map((row, index) => ({
+    label: row.category,
+    value: row.totalSize,
+    className: CHART_SEGMENT_CLASSES[index],
+  }))
+  const remainder = sorted
+    .slice(5)
+    .reduce((sum, row) => sum + row.totalSize, 0)
+  if (remainder > 0) {
+    segments.push({
+      label: "Other",
+      value: remainder,
+      className: "bg-muted-foreground/40",
+    })
+  }
+  return segments
+}
+
+/** Render directory-size bars relative to the first directory, with navigation and indexed-byte shares. */
 function StorageHogBars({
   directories,
+  bytesIndexed,
   onOpenDirectory,
 }: {
   directories: TopDirectory[]
+  bytesIndexed: number
   onOpenDirectory: (path: string) => void
 }) {
   const maxSize = directories[0]?.totalSize || 1
@@ -250,20 +274,28 @@ function StorageHogBars({
           <div className="flex items-center justify-between gap-3 text-sm">
             <span className="flex min-w-0 items-center gap-1.5">
               <Flame
-                className="size-3.5 shrink-0 text-primary/70"
+                className="size-3.5 shrink-0 text-chart-1/70"
                 aria-hidden="true"
               />
               <span className="truncate font-medium group-hover:text-primary">
                 {directory.path}
               </span>
             </span>
-            <span className="shrink-0 tabular-nums">
-              {formatBytes(directory.totalSize)}
+            <span className="flex shrink-0 items-baseline gap-1.5">
+              {bytesIndexed > 0 ? (
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  {Math.min(100, Math.round((directory.totalSize / bytesIndexed) * 100))}% of
+                  indexed
+                </span>
+              ) : null}
+              <span className="tabular-nums">
+                {formatBytes(directory.totalSize)}
+              </span>
             </span>
           </div>
           <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
             <div
-              className="h-full rounded-full bg-primary/70 transition-colors group-hover:bg-primary"
+              className="h-full rounded-full bg-chart-1 transition-colors group-hover:bg-chart-2"
               style={{
                 width: `${Math.max(2, Math.round((directory.totalSize / maxSize) * 100))}%`,
               }}

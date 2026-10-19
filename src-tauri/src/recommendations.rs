@@ -76,16 +76,19 @@ pub struct RecommendationCandidate {
     pub modified_at_ms: Option<i64>,
 }
 
+/// Build filtered cleanup, offload, and review recommendations from a scan run.
+/// Use database-wide filename and size matches to identify possible duplicates for review.
 pub fn build_recommendations(
     db: &Database,
     scan_run_id: i64,
     filters: RecommendationFilters,
 ) -> anyhow::Result<RecommendationPlan> {
-    let records = db.recommendation_file_records(scan_run_id, 20_000)?;
-    let duplicate_keys = duplicate_keys(&records);
-    let mode = filters.mode.as_deref().map(str::to_ascii_lowercase);
     let min_size = filters.min_size.unwrap_or(0);
     let min_age_days = filters.min_age_days.unwrap_or(0);
+    let records = db.recommendation_file_records(scan_run_id, min_size, min_age_days, 20_000)?;
+    let truncated = records.len() >= 20_000;
+    let duplicate_keys = db.duplicate_name_size_keys(scan_run_id, DUPLICATE_REVIEW_BYTES)?;
+    let mode = filters.mode.as_deref().map(str::to_ascii_lowercase);
     let only_offload = filters.only_offload_eligible.unwrap_or(false);
 
     let mut candidates = records
@@ -127,12 +130,12 @@ pub fn build_recommendations(
         clean_bytes,
         offload_bytes,
         review_bytes,
-        warnings: vec![
+        warnings: { let mut w = vec![
             "Clean candidates are conservative and use the Windows Recycle Bin.".to_string(),
             "Offload candidates require Google Drive upload verification before local recycling."
                 .to_string(),
             "Review candidates are never auto-selected.".to_string(),
-        ],
+        ]; if truncated { w.push("Recommendation input was capped at 20,000 files; some eligible files in very large scans may not be listed.".to_string()); } w },
     })
 }
 
@@ -297,28 +300,6 @@ fn offload_reason(record: &CleanupFileRecord, age_days: Option<u64>) -> Option<S
         return Some("Large file that can be offloaded".to_string());
     }
     None
-}
-
-fn duplicate_keys(records: &[CleanupFileRecord]) -> HashSet<(String, u64)> {
-    let mut counts = HashMap::<(String, u64), usize>::new();
-    for record in records {
-        if record.size < DUPLICATE_REVIEW_BYTES {
-            continue;
-        }
-        if record.is_reparse_point || record.is_placeholder || record.is_system {
-            continue;
-        }
-        if is_protected_path(&record.path) {
-            continue;
-        }
-        *counts
-            .entry((record.name.to_ascii_lowercase(), record.size))
-            .or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .filter_map(|(key, count)| (count > 1).then_some(key))
-        .collect()
 }
 
 fn cleanup_risk(risk: CleanupRisk) -> RecommendationRisk {

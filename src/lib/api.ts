@@ -295,6 +295,9 @@ export const api = {
   cleanupHistory: (limit = 50) =>
     invoke<CleanupActionRecord[]>("cleanup_history", { limit }),
   openRecycleBin: () => invoke("open_recycle_bin"),
+  /** Ask the native backend to reveal a path in Windows Explorer. */
+  revealInExplorer: (path: string) =>
+    invoke("reveal_in_explorer", { path }),
   deleteScanRun: (runId: number) => invoke<boolean>("delete_scan_run", { runId }),
   clearScanHistory: () => invoke<number>("clear_scan_history"),
   googleDriveStatus: () => invoke<GoogleDriveStatus>("google_drive_status"),
@@ -333,6 +336,51 @@ export const api = {
     invoke<ExportArtifact | null>("export_report", { runId }),
   exportDiagnostics: () => invoke<ExportArtifact>("export_diagnostics"),
   appHealth: () => invoke<AppHealth>("app_health"),
+  // WinClean 2.0 optimizer (types in src/lib/optimizer.ts)
+  /** Read service configurations and risk classifications from the native optimizer. */
+  optimizerListServices: () =>
+    invoke<import("./optimizer").ServiceInfo[]>("optimizer_list_services"),
+  /** Request a service start-type change with backend protection checks, snapshotting, and auditing. */
+  optimizerSetServiceStartType: (
+    name: string,
+    displayName: string,
+    startType: string
+  ) =>
+    invoke<import("./optimizer").ServiceInfo>(
+      "optimizer_set_service_start_type",
+      { name, displayName, startType }
+    ),
+  /** Read sampled process resource usage and EcoQoS eligibility from the native optimizer. */
+  optimizerListProcesses: () =>
+    invoke<import("./optimizer").ProcessInfo[]>("optimizer_list_processes"),
+  /** Request an audited EcoQoS change for a PID; false releases WinClean’s throttling control. */
+  optimizerSetProcessEcoQos: (pid: number, name: string, enable: boolean) =>
+    invoke<void>("optimizer_set_process_ecoqos", { pid, name, enable }),
+  /** Read battery and active power-scheme telemetry, recording a sample when available. */
+  optimizerBatteryStatus: () =>
+    invoke<import("./optimizer").BatteryStatus>("optimizer_battery_status"),
+  /** Read recent battery samples in newest-first order, defaulting to 200 entries. */
+  optimizerPowerHistory: (limit = 200) =>
+    invoke<import("./optimizer").PowerSample[]>("optimizer_power_history", {
+      limit,
+    }),
+  /** Request a built-in power profile, snapshotting the prior scheme for rollback. */
+  optimizerApplyPowerProfile: (profileId: string) =>
+    invoke<string>("optimizer_apply_power_profile", { profileId }),
+  /** Read CPU, memory, and registry-based adapter and NPU discovery from the native backend. */
+  optimizerHardwareInfo: () =>
+    invoke<import("./optimizer").HardwareInfo>("optimizer_hardware_info"),
+  /** Read Windows ML and MCP discovery results without enabling unverified NPU inference. */
+  optimizerCapabilities: () =>
+    invoke<import("./optimizer").CapabilityReport>("optimizer_capabilities"),
+  /** Read recent optimization audit entries, snapshots, and built-in profile metadata. */
+  optimizerHistory: (limit = 100) =>
+    invoke<import("./optimizer").OptimizerHistory>("optimizer_history", {
+      limit,
+    }),
+  /** Request restoration from an unused service or power-scheme snapshot. */
+  optimizerRollback: (snapshotId: number) =>
+    invoke<string>("optimizer_rollback", { snapshotId }),
 }
 
 export function formatError(error: unknown) {

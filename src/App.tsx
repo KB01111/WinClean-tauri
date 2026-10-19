@@ -50,7 +50,13 @@ import {
   type RecoverFilterState,
 } from "@/views/recover-space-view"
 import { SettingsView } from "@/views/settings-view"
+import { ServicesView } from "@/views/services-view"
+import { ProcessesView } from "@/views/processes-view"
+import { PowerView } from "@/views/power-view"
+import { HardwareView } from "@/views/hardware-view"
+import { OptimizerHistoryView } from "@/views/optimizer-history-view"
 
+/** Coordinate scan, cleanup, offload, and optimizer views with shared application state. */
 function App() {
   const [view, setView] = useState<View>("overview")
   const [volumes, setVolumes] = useState<VolumeInfo[]>([])
@@ -868,6 +874,11 @@ function App() {
               onRestoreItem={restoreOffloadItem}
             />
           )}
+          {view === "services" && <ServicesView />}
+          {view === "processes" && <ProcessesView />}
+          {view === "power" && <PowerView />}
+          {view === "hardware" && <HardwareView />}
+          {view === "optimizerHistory" && <OptimizerHistoryView />}
           {view === "settings" && (
             <SettingsView
               health={health}
@@ -886,6 +897,7 @@ function App() {
   )
 }
 
+/** Return the page heading for a navigation view identifier. */
 function viewTitle(view: View) {
   if (view === "explorer") {
     return "Explorer"
@@ -898,6 +910,21 @@ function viewTitle(view: View) {
   }
   if (view === "history") {
     return "History"
+  }
+  if (view === "services") {
+    return "Windows Services"
+  }
+  if (view === "processes") {
+    return "Processes & EcoQoS"
+  }
+  if (view === "power") {
+    return "Battery & Power"
+  }
+  if (view === "hardware") {
+    return "Hardware & NPU"
+  }
+  if (view === "optimizerHistory") {
+    return "Optimization History & Rollback"
   }
   if (view === "settings") {
     return "Settings"

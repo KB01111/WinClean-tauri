@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -43,6 +43,7 @@ const TOKEN_EXPIRY_SKEW_SECS: u64 = 60;
 const UPLOAD_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const UPLOAD_MAX_ATTEMPTS: u32 = 4;
 const RETRY_BASE_DELAY_MS: u64 = 500;
+const BYTE_PROGRESS_EMIT_INTERVAL_MS: u64 = 500;
 pub const OFFLOAD_CANCELED_MESSAGE: &str = "Offload was canceled";
 
 #[derive(Clone, Debug, Serialize)]
@@ -72,6 +73,72 @@ pub struct OffloadJobStatus {
     pub completed_at_ms: Option<i64>,
     pub last_error: Option<String>,
     pub items: Vec<OffloadItemRecord>,
+}
+
+pub type OffloadProgressSink = Arc<dyn Fn(&OffloadJobStatus) + Send + Sync>;
+
+struct OffloadProgressEmitter<'a> {
+    last_transition_emit: Mutex<Instant>,
+    db: &'a Database,
+    job_id: i64,
+    sink: Option<OffloadProgressSink>,
+    last_byte_emit: Mutex<Instant>,
+}
+
+impl<'a> OffloadProgressEmitter<'a> {
+    fn new(db: &'a Database, job_id: i64, sink: Option<OffloadProgressSink>) -> Self {
+        Self {
+            db,
+            job_id,
+            sink,
+            last_transition_emit: Mutex::new(Instant::now().checked_sub(Duration::from_millis(1_000)).unwrap_or_else(Instant::now)),
+            last_byte_emit: Mutex::new(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(BYTE_PROGRESS_EMIT_INTERVAL_MS))
+                    .unwrap_or_else(Instant::now),
+            ),
+        }
+    }
+
+    fn emit_now(&self) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        if let Ok(status) = offload_status(self.db, self.job_id) {
+            sink(&status);
+        }
+    }
+
+    /// Item transitions share a 250 ms throttle so a many-file batch does
+    /// not reload and emit the full item list per file (quadratic payload).
+    /// Job-level start/terminal emits stay immediate via emit_now().
+    fn emit_transition(&self) {
+        if self.sink.is_none() { return; }
+        let should_emit = self.last_transition_emit.lock().map(|mut last| {
+            if last.elapsed() >= Duration::from_millis(250) { *last = Instant::now(); true } else { false }
+        }).unwrap_or(false);
+        if should_emit { self.emit_now(); }
+    }
+    fn emit_byte_progress(&self) {
+        if self.sink.is_none() {
+            return;
+        }
+        let should_emit = self
+            .last_byte_emit
+            .lock()
+            .map(|mut last| {
+                if last.elapsed() >= Duration::from_millis(BYTE_PROGRESS_EMIT_INTERVAL_MS) {
+                    *last = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if should_emit {
+            self.emit_now();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -236,11 +303,26 @@ pub fn process_offload_job_with_client(
     recycler: &dyn FileRecycler,
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
+    process_offload_job_with_sink(db, job_id, candidates, drive, recycler, cancel, None)
+}
+
+pub fn process_offload_job_with_sink(
+    db: &Database,
+    job_id: i64,
+    candidates: Vec<RecommendationCandidate>,
+    drive: &dyn DriveUploader,
+    recycler: &dyn FileRecycler,
+    cancel: &AtomicBool,
+    progress_sink: Option<OffloadProgressSink>,
+) -> anyhow::Result<()> {
+    let emitter = OffloadProgressEmitter::new(db, job_id, progress_sink);
     let started_at_ms = unix_millis();
     db.update_offload_job(job_id, "running", None, Some(started_at_ms), None, None)?;
+    emitter.emit_now();
 
     if cancel.load(Ordering::Relaxed) {
         db.update_offload_job(job_id, "canceled", None, None, Some(unix_millis()), None)?;
+        emitter.emit_now();
         return Ok(());
     }
 
@@ -258,10 +340,12 @@ pub fn process_offload_job_with_client(
                 Some(unix_millis()),
                 Some(&error.to_string()),
             )?;
+            emitter.emit_now();
             return Ok(());
         }
     };
     db.update_offload_job(job_id, "running", Some(&folder.id), None, None, None)?;
+    emitter.emit_now();
 
     let items = db.offload_items(job_id)?;
     if items.len() != candidates.len() {
@@ -278,16 +362,19 @@ pub fn process_offload_job_with_client(
             Some(unix_millis()),
             Some(&message),
         )?;
+        emitter.emit_now();
         anyhow::bail!(message);
     }
     for (item, candidate) in items.into_iter().zip(candidates.into_iter()) {
         if cancel.load(Ordering::Relaxed) {
             db.update_offload_job(job_id, "canceled", None, None, Some(unix_millis()), None)?;
+            emitter.emit_now();
             return Ok(());
         }
-        process_item(db, item, candidate, &folder, drive, recycler, cancel)?;
+        process_item(db, item, candidate, &folder, drive, recycler, cancel, &emitter)?;
         if cancel.load(Ordering::Relaxed) {
             db.update_offload_job(job_id, "canceled", None, None, Some(unix_millis()), None)?;
+            emitter.emit_now();
             return Ok(());
         }
     }
@@ -298,7 +385,9 @@ pub fn process_offload_job_with_client(
     } else {
         "completed_with_errors"
     };
-    db.update_offload_job(job_id, status, None, None, Some(unix_millis()), None)
+    db.update_offload_job(job_id, status, None, None, Some(unix_millis()), None)?;
+    emitter.emit_now();
+    Ok(())
 }
 
 pub fn offload_status(db: &Database, job_id: i64) -> anyhow::Result<OffloadJobStatus> {
@@ -867,19 +956,25 @@ fn process_item(
     drive: &dyn DriveUploader,
     recycler: &dyn FileRecycler,
     cancel: &AtomicBool,
+    emitter: &OffloadProgressEmitter<'_>,
 ) -> anyhow::Result<()> {
     db.update_offload_item(item.id, "validating", None, None, 0, None, None, None, None)?;
+    emitter.emit_transition();
 
     if let Err(error) =
         validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms)
     {
-        return mark_item_failed(db, item.id, "skipped", 0, &error.to_string());
+        let result = mark_item_failed(db, item.id, "skipped", 0, &error.to_string());
+        emitter.emit_transition();
+        return result;
     }
 
     db.update_offload_item(item.id, "uploading", None, None, 0, None, None, None, None)?;
+    emitter.emit_transition();
     let item_id = item.id;
     let report = move |uploaded: u64| {
         let _ = db.update_offload_item_progress(item_id, uploaded);
+        emitter.emit_byte_progress();
     };
     let progress = UploadProgress {
         report: &report,
@@ -893,26 +988,32 @@ fn process_item(
             } else {
                 "failed"
             };
-            return mark_item_failed(db, item.id, status, 0, &error.to_string());
+            let result = mark_item_failed(db, item.id, status, 0, &error.to_string());
+            emitter.emit_transition();
+            return result;
         }
     };
 
     if upload.size != candidate.size {
         let _ = drive.delete_file(&upload.file_id);
-        return mark_item_failed(
+        let result = mark_item_failed(
             db,
             item.id,
             "failed",
             upload.size,
             "Google Drive upload verification failed",
         );
+        emitter.emit_transition();
+        return result;
     }
 
     // The cancel flag may have been set while the final chunk was in flight;
     // never recycle the local original for a canceled batch.
     if cancel.load(Ordering::Relaxed) {
         let _ = drive.delete_file(&upload.file_id);
-        return mark_item_failed(db, item.id, "canceled", 0, OFFLOAD_CANCELED_MESSAGE);
+        let result = mark_item_failed(db, item.id, "canceled", 0, OFFLOAD_CANCELED_MESSAGE);
+        emitter.emit_transition();
+        return result;
     }
 
     db.record_cleanup_action(CleanupActionInsert {
@@ -928,7 +1029,7 @@ fn process_item(
         undo_token: upload.web_url.clone(),
     })?;
 
-    match recycler.recycle_file(Path::new(&candidate.path)) {
+    let result = match recycler.recycle_file(Path::new(&candidate.path)) {
         Ok(()) => {
             db.record_cleanup_action(CleanupActionInsert {
                 action_type: "recycle_bin".to_string(),
@@ -967,7 +1068,9 @@ fn process_item(
             Some("failed"),
             Some(unix_millis()),
         ),
-    }
+    };
+    emitter.emit_transition();
+    result
 }
 
 fn mark_item_failed(

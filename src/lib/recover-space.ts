@@ -1,3 +1,5 @@
+import { formatBytes } from "./format"
+
 export type RecoverMode = "clean" | "offload" | "review"
 
 export type RecoverCandidate = {
@@ -78,6 +80,55 @@ export function selectedVisibleCandidateStats<T extends RecoverCandidate>(
     },
     { count: 0, bytes: 0 }
   )
+}
+
+export type CleanupConfirmCopyInput = {
+  count: number
+  bytes: number
+}
+
+export type CleanupConfirmCopy = {
+  title: string
+  body: string
+  confirmLabel: string
+  cancelLabel: string
+}
+
+/** Build Recycle Bin confirmation text from the selected item count and byte total. */
+export function cleanupConfirmCopy({
+  count,
+  bytes,
+}: CleanupConfirmCopyInput): CleanupConfirmCopy {
+  return {
+    title: "Move to Recycle Bin",
+    body: `Move ${count} item(s) — ${formatBytes(
+      bytes
+    )} — to the Windows Recycle Bin? You can restore them from the Recycle Bin.`,
+    confirmLabel: "Move to Recycle Bin",
+    cancelLabel: "Cancel",
+  }
+}
+
+export type ReviewRevealState = {
+  disabled: boolean
+  label: string
+  hint: string | null
+}
+
+/** Enable the review reveal action only when at least one candidate is selected. */
+export function getReviewRevealState(selectedCount: number): ReviewRevealState {
+  if (selectedCount <= 0) {
+    return {
+      disabled: true,
+      label: "Reveal in Explorer",
+      hint: "Select an item to inspect it",
+    }
+  }
+  return {
+    disabled: false,
+    label: "Reveal in Explorer",
+    hint: null,
+  }
 }
 
 export function getOffloadActionState({
