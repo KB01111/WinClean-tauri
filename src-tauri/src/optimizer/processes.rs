@@ -151,6 +151,15 @@ mod win {
         Some((second.saturating_sub(first) as f64 / window_ticks * 100.0) as f32)
     }
 
+    /// Live EcoQoS bit of a PID; `None` when it cannot be opened.
+    pub fn process_ecoqos_state_impl(pid: u32) -> Option<bool> {
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() { return None; }
+        let on = eco_qos_applied(h);
+        unsafe { CloseHandle(h); }
+        Some(on)
+    }
+
     /// Whether a PID is running and, if so, when its process was created.
     pub fn process_liveness_impl(pid: u32) -> ProcessLiveness {
         const ERROR_INVALID_PARAMETER: i32 = 87;
@@ -310,6 +319,13 @@ pub fn set_process_ecoqos(_pid: u32, _expected_name: &str, _enable: bool) -> Res
 pub fn process_liveness(pid: u32) -> ProcessLiveness { win::process_liveness_impl(pid) }
 #[cfg(not(windows))]
 pub fn process_liveness(_pid: u32) -> ProcessLiveness { ProcessLiveness::Unknown }
+
+/// Reads the live EcoQoS bit, so callers only count a process as changed
+/// when its state really was on (another app may have cleared it).
+#[cfg(windows)]
+pub fn process_ecoqos_state(pid: u32) -> Option<bool> { win::process_ecoqos_state_impl(pid) }
+#[cfg(not(windows))]
+pub fn process_ecoqos_state(_pid: u32) -> Option<bool> { None }
 
 #[cfg(test)]
 mod tests {

@@ -35,7 +35,9 @@ export function OptimizerHistoryView() {
     setBusy(id)
     try {
       const msg = await api.optimizerRollback(id)
-      toast.success(msg)
+      // A partial rollback keeps the snapshot retryable; don't call it a success.
+      if (msg.includes("available to retry")) toast.warning(msg)
+      else toast.success(msg)
       await load()
     } catch (e) {
       toast.error(formatError(e))
