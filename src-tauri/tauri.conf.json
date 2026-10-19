@@ -18,11 +18,12 @@
         "height": 918,
         "minWidth": 1080,
         "minHeight": 720,
-        "center": true
+        "center": true,
+        "transparent": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost https://api.openai.com http://127.0.0.1:* http://localhost:* http://[::1]:*"
     }
   },
   "bundle": {

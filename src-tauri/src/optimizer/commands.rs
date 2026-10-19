@@ -501,3 +501,41 @@ pub async fn optimizer_rollback(app: State<'_, AppState>, state: State<'_, Optim
 pub fn optimizer_recovery_report(holder: State<'_, Arc<RecoveryHolder>>) -> RecoveryReport {
     holder.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
+
+// ---------------------------------------------------------------------------
+// Native window integration
+// ---------------------------------------------------------------------------
+
+/// Whether the Windows 11 Mica backdrop is active on the main window.
+pub struct NativeState {
+    pub mica: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeInfo {
+    pub windows_build: Option<u32>,
+    pub mica: bool,
+}
+
+#[tauri::command]
+pub fn native_info(state: State<'_, NativeState>) -> NativeInfo {
+    NativeInfo { windows_build: windows_build(), mica: state.mica }
+}
+
+/// Applies Mica on Windows 11 (build 22621+). Failure is silent: the opaque
+/// theme background is always the fallback.
+pub fn apply_native_effects(window: &tauri::WebviewWindow) -> NativeState {
+    #[cfg(windows)]
+    {
+        use tauri::utils::config::WindowEffectsConfig;
+        use tauri::window::{Effect, EffectsBuilder};
+        let supported = windows_build().map(|b| b >= 22621).unwrap_or(false);
+        if supported {
+            let effects: WindowEffectsConfig = EffectsBuilder::new().effect(Effect::Mica).build();
+            return NativeState { mica: window.set_effects(effects).is_ok() };
+        }
+    }
+    let _ = window;
+    NativeState { mica: false }
+}

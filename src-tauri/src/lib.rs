@@ -37,6 +37,11 @@ pub fn run() {
                 });
             }
             optimizer::runtime::start(app.handle().clone(), database.clone(), optimizer_state.backends.clone(), telemetry.clone());
+            let native = match app.get_webview_window("main") {
+                Some(window) => optimizer::commands::apply_native_effects(&window),
+                None => optimizer::commands::NativeState { mica: false },
+            };
+            app.manage(native);
             app.manage(optimizer_state);
             app.manage(telemetry);
             app.manage(recovery);
@@ -112,7 +117,8 @@ pub fn run() {
             optimizer::commands::optimizer_mcp_file_details,
             optimizer::commands::optimizer_history,
             optimizer::commands::optimizer_rollback,
-            optimizer::commands::optimizer_recovery_report
+            optimizer::commands::optimizer_recovery_report,
+            optimizer::commands::native_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
