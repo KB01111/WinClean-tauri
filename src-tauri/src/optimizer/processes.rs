@@ -168,6 +168,15 @@ mod win {
         state
     }
 
+    /// Creation time (Unix ms) of the process behind an open handle.
+    fn created_ms(h: HANDLE) -> Option<i64> {
+        let (mut created, mut x, mut k, mut u) = (zero_ft(), zero_ft(), zero_ft(), zero_ft());
+        if unsafe { GetProcessTimes(h, &mut created, &mut x, &mut k, &mut u) } == 0 { return None; }
+        // FILETIME epoch (1601) -> Unix epoch (1970), 100 ns -> ms.
+        const FILETIME_UNIX_DIFF_TICKS: u64 = 116_444_736_000_000_000;
+        Some((filetime_ticks(&created).saturating_sub(FILETIME_UNIX_DIFF_TICKS) / 10_000) as i64)
+    }
+
     /// Whether a PID is running and, if so, when its process was created.
     pub fn process_liveness_impl(pid: u32) -> ProcessLiveness {
         const ERROR_INVALID_PARAMETER: i32 = 87;
@@ -180,14 +189,12 @@ mod win {
                 ProcessLiveness::Unknown
             };
         }
-        let (mut created, mut x, mut k, mut u) = (zero_ft(), zero_ft(), zero_ft(), zero_ft());
-        let ok = unsafe { GetProcessTimes(h, &mut created, &mut x, &mut k, &mut u) };
+        let started = created_ms(h);
         unsafe { CloseHandle(h); }
-        if ok == 0 { return ProcessLiveness::Unknown; }
-        // FILETIME epoch (1601) -> Unix epoch (1970), 100 ns -> ms.
-        const FILETIME_UNIX_DIFF_TICKS: u64 = 116_444_736_000_000_000;
-        let ticks = filetime_ticks(&created);
-        ProcessLiveness::Alive { started_ms: (ticks.saturating_sub(FILETIME_UNIX_DIFF_TICKS) / 10_000) as i64 }
+        match started {
+            Some(started_ms) => ProcessLiveness::Alive { started_ms },
+            None => ProcessLiveness::Unknown,
+        }
     }
 
     pub fn list_processes_impl(limit: Option<usize>) -> Result<Vec<ProcessInfo>, String> {
@@ -249,7 +256,7 @@ mod win {
     }
 
     /// Returns the process's real current image name after applying.
-    pub fn set_ecoqos_impl(pid: u32, expected_name: &str, enable: bool) -> Result<String, String> {
+    pub fn set_ecoqos_impl(pid: u32, expected_name: &str, not_started_after_ms: Option<i64>, enable: bool) -> Result<String, String> {
         let access: PROCESS_ACCESS_RIGHTS = PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION;
         let h: HANDLE = unsafe { OpenProcess(access, 0, pid) };
         if h.is_null() {
@@ -260,6 +267,16 @@ mod win {
             let real = image_name(h).ok_or_else(|| format!("could not read image name for pid {pid}; refusing to guess"))?;
             if !expected_name.is_empty() && !real.eq_ignore_ascii_case(expected_name) {
                 return Err(format!("pid {pid} now belongs to '{real}', not '{expected_name}' (stale listing). Refresh and retry."));
+            }
+            // Pin identity to the handle being mutated: a PID reused by a
+            // same-named process since WinClean recorded the change has a
+            // newer creation time and must not be touched.
+            if let Some(limit) = not_started_after_ms {
+                match created_ms(h) {
+                    Some(started) if started <= limit => {}
+                    Some(_) => return Err(format!("pid {pid} now belongs to a newer '{real}' process than the one WinClean changed; leaving it alone.")),
+                    None => return Err(format!("could not read the start time of '{real}' (pid {pid}); refusing to change it blind.")),
+                }
             }
             if enable {
                 let is_fg = pid == foreground_pid();
@@ -316,11 +333,11 @@ pub fn list_all_processes() -> Result<Vec<ProcessInfo>, String> { list_processes
 /// Applies or restores EcoQoS after revalidating the PID's real identity.
 /// Returns the verified image name.
 #[cfg(windows)]
-pub fn set_process_ecoqos(pid: u32, expected_name: &str, enable: bool) -> Result<String, String> {
-    win::set_ecoqos_impl(pid, expected_name, enable)
+pub fn set_process_ecoqos(pid: u32, expected_name: &str, not_started_after_ms: Option<i64>, enable: bool) -> Result<String, String> {
+    win::set_ecoqos_impl(pid, expected_name, not_started_after_ms, enable)
 }
 #[cfg(not(windows))]
-pub fn set_process_ecoqos(_pid: u32, _expected_name: &str, _enable: bool) -> Result<String, String> {
+pub fn set_process_ecoqos(_pid: u32, _expected_name: &str, _not_started_after_ms: Option<i64>, _enable: bool) -> Result<String, String> {
     Err("EcoQoS is only available on Windows.".into())
 }
 

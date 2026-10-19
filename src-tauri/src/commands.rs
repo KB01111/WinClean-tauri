@@ -739,7 +739,7 @@ pub async fn optimizer_set_process_ecoqos(
         // The setter revalidates the PID's real image name, foreground
         // state and live policy verdict before enabling; restore (off)
         // always passes identity revalidation only.
-        match set_process_ecoqos(pid, &name, enable) {
+        match set_process_ecoqos(pid, &name, None, enable) {
             Ok(real_name) => {
                 let _ = db.complete_optimizer_audit(audit_id, "completed", Some(&format!("verified process: {real_name}")));
                 Ok(())
@@ -880,7 +880,7 @@ fn throttle_eligible_processes(db: &Database, snapshot_id: i64) -> EcoQosOutcome
     let mut skipped = 0usize;
     let eligible = processes.iter().filter(|p| p.eco_decision == EcoQosDecision::Eligible && !p.eco_qos_applied);
     for proc in eligible {
-        match set_process_ecoqos(proc.pid, &proc.name, true) {
+        match set_process_ecoqos(proc.pid, &proc.name, None, true) {
             Ok(real) => {
                 record_ecoqos_audit(db, &real, proc.pid, true, "via power profile", Some(snapshot_id));
                 touched.push(EcoQosTouched { pid: proc.pid, name: real, since_ms: Some(now_ms()) });
@@ -922,7 +922,7 @@ fn restore_ecoqos(db: &Database, candidates: Vec<EcoQosCandidate>, detail: &str,
                 record_ecoqos_audit(db, &name, pid, false, "EcoQoS was already off; left untouched", None);
                 released += 1;
             }
-            ProcessLiveness::Alive { .. } => match set_process_ecoqos(pid, &name, false) {
+            ProcessLiveness::Alive { .. } => match set_process_ecoqos(pid, &name, Some(since_ms), false) {
                 Ok(real) => {
                     record_ecoqos_audit(db, &real, pid, false, detail, snapshot_id);
                     touched.push(EcoQosTouched { pid, name: real, since_ms: Some(since_ms) });
@@ -943,7 +943,7 @@ fn rethrottle_ecoqos(db: &Database, candidates: Vec<EcoQosCandidate>, detail: &s
     for (name, pid, since_ms) in candidates {
         match process_liveness(pid) {
             ProcessLiveness::Alive { started_ms } if started_ms <= since_ms && process_ecoqos_state(pid) == Some(true) => {}
-            ProcessLiveness::Alive { started_ms } if started_ms <= since_ms => match set_process_ecoqos(pid, &name, true) {
+            ProcessLiveness::Alive { started_ms } if started_ms <= since_ms => match set_process_ecoqos(pid, &name, Some(since_ms), true) {
                 Ok(real) => {
                     record_ecoqos_audit(db, &real, pid, true, detail, None);
                     touched.push(EcoQosTouched { pid, name: real, since_ms: Some(since_ms) });
