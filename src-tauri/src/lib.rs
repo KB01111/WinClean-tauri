@@ -3,6 +3,7 @@ pub mod optimizer;
 pub mod commands;
 pub mod db;
 pub mod db_optimizer;
+pub mod db_storage;
 pub mod offload;
 pub mod pathutil;
 pub mod recommendations;

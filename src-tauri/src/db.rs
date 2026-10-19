@@ -15,6 +15,9 @@ pub const CURRENT_SCHEMA_VERSION: &str = "202605130001_production_foundation";
 #[derive(Clone, Debug)]
 pub struct Database {
     path: PathBuf,
+    /// Opened with SQLite's read-only flag: any write fails inside SQLite itself.
+    /// Used by the read-only MCP server so it cannot change WinClean's data.
+    read_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -203,7 +206,17 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
+            read_only: false,
         })
+    }
+
+    /// A handle whose every connection is read-only and never creates the file.
+    pub fn open_read_only(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if !path.is_file() {
+            anyhow::bail!("the WinClean database was not found at {}", path.display());
+        }
+        Ok(Self { path, read_only: true })
     }
 
     pub fn path(&self) -> &Path {
@@ -356,6 +369,7 @@ impl Database {
             "#,
         )?;
         conn.execute_batch(crate::db_optimizer::OPTIMIZER_SCHEMA)?;
+        conn.execute_batch(crate::db_storage::STORAGE_SCHEMA)?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
             params![CURRENT_SCHEMA_VERSION, unix_millis()],
@@ -1445,6 +1459,16 @@ impl Database {
     }
 
     pub(crate) fn connect(&self) -> anyhow::Result<Connection> {
+        if self.read_only {
+            let conn = Connection::open_with_flags(
+                &self.path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .with_context(|| format!("open sqlite database read-only {}", self.path.display()))?;
+            conn.busy_timeout(Duration::from_secs(5))?;
+            conn.pragma_update(None, "query_only", "ON")?;
+            return Ok(conn);
+        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create database directory {}", parent.display()))?;
