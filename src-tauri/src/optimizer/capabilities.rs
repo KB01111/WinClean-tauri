@@ -4,7 +4,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::policy::route_inference;
+/// Temporary local routing (replaced by `winml` selection).
+fn route_inference(npu_verified: bool, igpu_available: bool, dgpu_awake: bool) -> Vec<&'static str> {
+    let mut order: Vec<&'static str> = Vec::new();
+    if npu_verified { order.push("VitisAIExecutionProvider (XDNA 2 NPU)"); }
+    if igpu_available { order.push("MIGraphXExecutionProvider / DirectML (Radeon 890M)"); }
+    if dgpu_awake { order.push("CUDA / DirectML (RTX 4070, already awake)"); }
+    order.push("CPU (always available)");
+    order
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

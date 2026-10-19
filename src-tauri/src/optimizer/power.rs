@@ -1,10 +1,9 @@
-//! Battery telemetry (GetSystemPowerStatus) + power schemes (PowrProf).
-//! Discharge watts are derived from sampled capacity deltas by the caller
-//! and persisted as power history; no mock values are ever produced.
+//! AC/DC state, battery percentage and power-scheme control
+//! (`GetSystemPowerStatus` + PowrProf). Real wattage and battery health live
+//! in `battery.rs` (IOCTL based); nothing here estimates power.
 
 use serde::{Deserialize, Serialize};
 
-use super::policy::builtin_profiles;
 pub use super::policy::{PowerProfile, PowerProfileId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,24 +27,8 @@ pub struct PowerSample {
     pub on_ac: bool,
 }
 
-/// Discharge watts between two samples; None when charging or unusable.
-pub fn discharge_watts(prev: &PowerSample, next: &PowerSample, design_capacity_mwh: Option<f64>) -> Option<f64> {
-    if prev.on_ac || next.on_ac || next.at_ms <= prev.at_ms || next.percent >= prev.percent {
-        return None;
-    }
-    let capacity = design_capacity_mwh?;
-    let hours = (next.at_ms - prev.at_ms) as f64 / 3_600_000.0;
-    let used_mwh = (prev.percent as f64 - next.percent as f64) / 100.0 * capacity;
-    let w = used_mwh / hours / 1000.0;
-    if w.is_finite() && w > 0.0 { Some((w * 10.0).round() / 10.0) } else { None }
-}
-
-/// Estimate remaining minutes from charge percentage, watts, and design capacity in mWh.
-/// Return `None` when discharge power or design capacity is nonpositive.
-pub fn estimated_runtime_minutes(percent: u8, discharge_w: f64, design_capacity_mwh: f64) -> Option<f64> {
-    if discharge_w <= 0.0 || design_capacity_mwh <= 0.0 { return None; }
-    Some((percent as f64 / 100.0 * design_capacity_mwh / 1000.0) / discharge_w * 60.0)
-}
+/// Lowest-resolution history sample kept for compatibility with 1.x databases.
+/// New telemetry is stored in `power_telemetry` (see `battery.rs`).
 
 #[cfg(windows)]
 mod win {
@@ -156,23 +139,43 @@ pub fn set_active_scheme(_guid: &str) -> Result<(), String> {
     Err("Power schemes are only available on Windows.".into())
 }
 
-/// Return the built-in power profiles exposed to the optimizer UI.
-pub fn list_profiles() -> Vec<PowerProfile> { builtin_profiles() }
+/// The cheap part of the power state (no scheme lookup): what the sampler and
+/// the auto-switch controller need on every tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemPower {
+    pub on_ac: bool,
+    /// False when Windows reports ACLineStatus=255 (unknown).
+    pub ac_known: bool,
+    pub percent: Option<u8>,
+    pub charging: bool,
+}
+
+#[cfg(windows)]
+pub fn system_power() -> Result<SystemPower, String> {
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut st = SYSTEM_POWER_STATUS { ACLineStatus: 0, BatteryFlag: 0, BatteryLifePercent: 0, SystemStatusFlag: 0, BatteryLifeTime: 0, BatteryFullLifeTime: 0 };
+    if unsafe { GetSystemPowerStatus(&mut st) } == 0 {
+        return Err(format!("GetSystemPowerStatus failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(SystemPower {
+        on_ac: st.ACLineStatus == 1,
+        ac_known: st.ACLineStatus != 255,
+        percent: if st.BatteryLifePercent == 255 { None } else { Some(st.BatteryLifePercent) },
+        charging: st.BatteryFlag != 255 && st.BatteryFlag & 8 != 0,
+    })
+}
+#[cfg(not(windows))]
+pub fn system_power() -> Result<SystemPower, String> {
+    Err("Power status is only available on Windows.".into())
+}
+
+/// True for a well-formed `8-4-4-4-12` hex GUID (optionally braced).
+pub fn is_valid_guid(s: &str) -> bool { parse_guid_parts(s).is_ok() }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn discharge_watts_needs_real_drop() {
-        let a = PowerSample { at_ms: 0, percent: 80, on_ac: false };
-        let b = PowerSample { at_ms: 600_000, percent: 78, on_ac: false };
-        // 2% of 50 Wh in 10 min = 6 W
-        assert_eq!(discharge_watts(&a, &b, Some(50_000.0)), Some(6.0));
-        assert_eq!(discharge_watts(&a, &b, None), None);
-        let c = PowerSample { at_ms: 600_000, percent: 79, on_ac: true };
-        assert_eq!(discharge_watts(&a, &c, Some(50_000.0)), None);
-    }
-
     #[test]
     fn guid_parsing_is_strict_and_never_panics() {
         let (d1, d2, d3, d4) = parse_guid_parts("{381b4222-f694-41f0-9685-ff5bb260df2e}").unwrap();
@@ -182,6 +185,9 @@ mod tests {
         for bad in ["", "a-b-c-d-e", "381b4222-f694-41f0-96-ff5bb260df2e", "381b4222-f694-41f0-9685-ff5bb260df2e0",
                     "381b4222-f694-41f0-9685-ff5bb260df2g", "381b4222-f694-41f0-96é5-ff5bb260df2e"] {
             assert!(parse_guid_parts(bad).is_err(), "{bad} should be rejected");
+            assert!(!is_valid_guid(bad));
         }
+        assert!(is_valid_guid("{381b4222-f694-41f0-9685-ff5bb260df2e}"));
+        assert!(is_valid_guid(crate::optimizer::policy::SCHEME_POWER_SAVER));
     }
 }
