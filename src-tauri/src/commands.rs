@@ -1146,22 +1146,31 @@ mod optimizer_tests {
         let db = Database::open(&temp.path().join("index.sqlite3")).unwrap();
         db.migrate().unwrap();
         let snapshot_id = db.insert_optimizer_snapshot("powerScheme", "Balanced", "{}").unwrap();
+        // PIDs that cannot exist on any host, so the test never touches a
+        // real process whatever the platform's process table looks like.
+        let (owned, restored) = ("Owned.exe (4000000001)", "Restored.exe (4000000002)");
         let audit = |target: &str, action: &str| {
             db.insert_optimizer_audit("process", target, action, "completed", None, Some(snapshot_id)).unwrap();
         };
         // The profile throttled both; the user then restored one by hand.
-        audit("Owned.exe (10)", "ecoqos:on");
-        audit("Restored.exe (11)", "ecoqos:on");
-        db.insert_optimizer_audit("process", "Restored.exe (11)", "ecoqos:off", "completed", None, None).unwrap();
+        audit(owned, "ecoqos:on");
+        audit(restored, "ecoqos:on");
+        db.insert_optimizer_audit("process", restored, "ecoqos:off", "completed", None, None).unwrap();
         let payload = serde_json::json!({});
 
-        // Restored.exe is no longer owned, so only Owned.exe is attempted. Off
-        // Windows its liveness is unknown, so that one counts as incomplete.
-        let (_, incomplete) = rollback_profile_ecoqos(&db, &payload, snapshot_id, 0).unwrap();
+        // Restored.exe is no longer owned, so only Owned.exe is attempted.
+        let (summary, incomplete) = rollback_profile_ecoqos(&db, &payload, snapshot_id, 0).unwrap();
+        assert!(!summary.contains("no throttles"), "Owned.exe must still be attempted: {summary}");
+        // Off Windows liveness is unknown, so the attempt counts as incomplete.
+        // On Windows a nonexistent PID normally reads as gone (not incomplete),
+        // so only the upper bound is asserted there.
+        #[cfg(not(windows))]
         assert_eq!(incomplete, 1);
+        #[cfg(windows)]
+        assert!(incomplete <= 1);
 
         // With nothing owned, nothing is touched and the rollback can finish.
-        db.insert_optimizer_audit("process", "Owned.exe (10)", "ecoqos:off", "completed", None, None).unwrap();
+        db.insert_optimizer_audit("process", owned, "ecoqos:off", "completed", None, None).unwrap();
         let (summary, incomplete) = rollback_profile_ecoqos(&db, &payload, snapshot_id, 0).unwrap();
         assert_eq!(incomplete, 0);
         assert!(summary.contains("no throttles"));
