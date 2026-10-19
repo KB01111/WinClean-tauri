@@ -107,6 +107,9 @@ pub fn run() {
             optimizer::commands::optimizer_measurement_list,
             optimizer::commands::optimizer_hardware_info,
             optimizer::commands::optimizer_capabilities,
+            optimizer::commands::optimizer_mcp_discover,
+            optimizer::commands::optimizer_mcp_probe,
+            optimizer::commands::optimizer_mcp_file_details,
             optimizer::commands::optimizer_history,
             optimizer::commands::optimizer_rollback,
             optimizer::commands::optimizer_recovery_report

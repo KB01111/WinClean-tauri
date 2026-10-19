@@ -16,10 +16,11 @@ use crate::db_optimizer::MeasurementRecord;
 use super::auto_switch::AutoSwitchConfig;
 use super::backend::WriteCapability;
 use super::battery::{BatteryTelemetry, TelemetrySample};
-use super::capabilities::{capability_report, CapabilityReport};
+use super::capabilities::{capability_report, windows_build, CapabilityReport};
 use super::ecoqos::now_ms;
-use super::hardware::{hardware_info, HardwareInfo};
+use super::hardware::{hardware_info, hardware_info_refresh, HardwareInfo};
 use super::helper_client::HelperStatus;
+use super::mcp::{self, McpDiscovery};
 use super::measure::{compare_windows, MeasurementResult};
 use super::orchestrator::{self, Ctx, ErrorKind, OptError, Origin, ProfileOutcome, ServiceApplyOutcome};
 use super::policy::PowerProfile;
@@ -376,16 +377,90 @@ pub fn optimizer_measurement_list(app: State<'_, AppState>) -> CmdResult<Vec<Mea
 // ---------------------------------------------------------------------------
 
 #[tauri::command(async)]
-pub async fn optimizer_hardware_info() -> CmdResult<HardwareInfo> {
-    blocking(|| hardware_info().map_err(CommandError::from)).await
+pub async fn optimizer_hardware_info(refresh: Option<bool>) -> CmdResult<HardwareInfo> {
+    blocking(move || if refresh.unwrap_or(false) { hardware_info_refresh() } else { hardware_info() }.map_err(CommandError::from)).await
 }
 
-#[tauri::command]
-pub fn optimizer_capabilities() -> CmdResult<CapabilityReport> {
-    let hw = hardware_info().ok();
-    let npu_present = hw.as_ref().map(|h| h.npu.present).unwrap_or(false);
-    let igpu = hw.as_ref().map(|h| h.adapters.iter().any(|a| a.kind == "igpu")).unwrap_or(false);
-    Ok(capability_report(npu_present, igpu))
+/// Windows ML execution-provider assessment and routing. `model_path` (a local
+/// `.onnx` file) is optional and is only ever read, never loaded or executed.
+#[tauri::command(async)]
+pub async fn optimizer_capabilities(model_path: Option<String>) -> CmdResult<CapabilityReport> {
+    blocking(move || capability_report(model_path.as_deref()).map_err(CommandError::from)).await
+}
+
+// ---------------------------------------------------------------------------
+// MCP integrations
+// ---------------------------------------------------------------------------
+
+/// Lists MCP servers registered with the Windows On-device Agent Registry
+/// (`odr.exe mcp list`, read-only).
+#[tauri::command(async)]
+pub async fn optimizer_mcp_discover() -> CmdResult<McpDiscovery> {
+    blocking(|| Ok(mcp::discover(&mcp::SystemRunner, windows_build()))).await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpProbe {
+    pub server_info: serde_json::Value,
+    pub tools: Vec<mcp::McpToolInfo>,
+}
+
+fn valid_server_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 200 && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Starts a registered server through `odr.exe mcp run`, performs the MCP
+/// handshake and lists its tools with WinClean's policy for each. No tool is called.
+#[tauri::command(async)]
+pub async fn optimizer_mcp_probe(app: State<'_, AppState>, server_id: String) -> CmdResult<McpProbe> {
+    if !valid_server_id(&server_id) {
+        return Err(OptError::rejected("server ids contain only letters, digits, '.', '_' and '-'").into());
+    }
+    let db = app.db.clone();
+    blocking(move || {
+        let outcome = (|| {
+            let mut session = mcp::McpSession::spawn("odr.exe", &["mcp".into(), "run".into(), server_id.clone()], std::time::Duration::from_secs(15))?;
+            let server_info = session.initialize()?;
+            let tools = session.list_tools()?;
+            Ok::<_, String>(McpProbe { server_info, tools })
+        })();
+        let (status, detail) = match &outcome {
+            Ok(p) => ("completed", format!("handshake ok, {} tool(s) listed", p.tools.len())),
+            Err(e) => ("failed", e.clone()),
+        };
+        let _ = db.insert_optimizer_audit("mcp", &server_id, "probe", status, Some(&detail), None);
+        outcome.map_err(CommandError::from)
+    })
+    .await
+}
+
+/// Reads one file's *metadata* through the File Explorer connector — the only
+/// MCP call WinClean makes. The tool and the path are policy-checked before
+/// anything is sent; Windows shows its own consent prompt if needed.
+#[tauri::command(async)]
+pub async fn optimizer_mcp_file_details(app: State<'_, AppState>, server_id: String, path: String) -> CmdResult<serde_json::Value> {
+    if !valid_server_id(&server_id) {
+        return Err(OptError::rejected("server ids contain only letters, digits, '.', '_' and '-'").into());
+    }
+    let args = serde_json::json!({ "path": path });
+    mcp::check_call("get_file_details", &args).map_err(|e| CommandError::from(OptError::rejected(e)))?;
+    let db = app.db.clone();
+    blocking(move || {
+        let outcome = (|| {
+            let mut session = mcp::McpSession::spawn("odr.exe", &["mcp".into(), "run".into(), server_id.clone()], std::time::Duration::from_secs(20))?;
+            session.initialize()?;
+            session.call_tool("get_file_details", args)
+        })();
+        // The path is user data and is deliberately not stored in the audit trail.
+        let (status, detail) = match &outcome {
+            Ok(_) => ("completed", "get_file_details (metadata only)".to_string()),
+            Err(e) => ("failed", e.clone()),
+        };
+        let _ = db.insert_optimizer_audit("mcp", &format!("{server_id}:get_file_details"), "call", status, Some(&detail), None);
+        outcome.map_err(CommandError::from)
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------

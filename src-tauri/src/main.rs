@@ -9,5 +9,9 @@ fn main() {
     if winclean_lib::optimizer::helper_windows::is_helper_invocation(&args) {
         std::process::exit(winclean_lib::optimizer::helper_windows::helper_main(&args));
     }
+    // Read-only MCP server for agents (for example Lumen): diagnostics only.
+    if args.get(1).map(|a| a == "--mcp-stdio").unwrap_or(false) {
+        std::process::exit(winclean_lib::optimizer::mcp_server::run_stdio());
+    }
     winclean_lib::run()
 }
