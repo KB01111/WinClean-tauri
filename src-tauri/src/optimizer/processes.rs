@@ -25,6 +25,10 @@ pub struct ProcessInfo {
     pub eco_qos_applied: bool,
 }
 
+/// Rows returned to the Processes view (largest working sets first).
+#[cfg(windows)]
+const UI_PROCESS_LIMIT: usize = 300;
+
 /// What a PID currently identifies, used to tell a process WinClean
 /// throttled from a different process that reused the same PID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,7 +173,7 @@ mod win {
         ProcessLiveness::Alive { started_ms: (ticks.saturating_sub(FILETIME_UNIX_DIFF_TICKS) / 10_000) as i64 }
     }
 
-    pub fn list_processes_impl() -> Result<Vec<ProcessInfo>, String> {
+    pub fn list_processes_impl(limit: Option<usize>) -> Result<Vec<ProcessInfo>, String> {
         let fg = foreground_pid();
         let first = sample_times();
         let started = std::time::Instant::now();
@@ -223,7 +227,7 @@ mod win {
         }
         unsafe { CloseHandle(snap); }
         out.sort_by(|a, b| b.working_set_mb.partial_cmp(&a.working_set_mb).unwrap_or(std::cmp::Ordering::Equal));
-        out.truncate(300);
+        if let Some(limit) = limit { out.truncate(limit); }
         Ok(out)
     }
 
@@ -242,10 +246,16 @@ mod win {
             }
             if enable {
                 let is_fg = pid == foreground_pid();
+                // Another actor (or an earlier run) already throttled it:
+                // WinClean must not claim ownership of state it did not set.
+                if eco_qos_applied(h) {
+                    return Err(format!("'{real}' (pid {pid}) is already EcoQoS-throttled; WinClean will not claim it."));
+                }
                 // Sample this process's CPU now: a busy updater/indexer must
-                // be rejected here even if the listing showed it idle. No
-                // sample (-1.0) is never treated as idle.
-                let cpu = sample_cpu_percent(h).unwrap_or(-1.0);
+                // be rejected here even if the listing showed it idle. Without
+                // a sample the setter refuses rather than assuming idle.
+                let cpu = sample_cpu_percent(h)
+                    .ok_or_else(|| format!("could not sample CPU for '{real}' (pid {pid}); refusing to throttle without a measurement"))?;
                 let decision = classify_process_for_ecoqos(&real, is_fg, cpu);
                 if decision != EcoQosDecision::Eligible {
                     return Err(format!("'{real}' is {decision:?} and will not be throttled. Only clearly eligible, currently idle background work (updaters, indexers, telemetry) can be enabled."));
@@ -272,11 +282,17 @@ mod win {
 }
 
 #[cfg(windows)]
-pub fn list_processes() -> Result<Vec<ProcessInfo>, String> { win::list_processes_impl() }
+pub fn list_processes() -> Result<Vec<ProcessInfo>, String> { win::list_processes_impl(Some(UI_PROCESS_LIMIT)) }
+/// Every running process (no UI row cap), for profile application where a
+/// small updater must not be missed just because it uses little memory.
+#[cfg(windows)]
+pub fn list_all_processes() -> Result<Vec<ProcessInfo>, String> { win::list_processes_impl(None) }
 #[cfg(not(windows))]
 pub fn list_processes() -> Result<Vec<ProcessInfo>, String> {
     Err("Process monitoring is only available on Windows.".into())
 }
+#[cfg(not(windows))]
+pub fn list_all_processes() -> Result<Vec<ProcessInfo>, String> { list_processes() }
 
 /// Applies or restores EcoQoS after revalidating the PID's real identity.
 /// Returns the verified image name.

@@ -629,10 +629,26 @@ use crate::optimizer::{
     hardware::hardware_info,
     policy::{classify_service, is_protected_service, EcoQosDecision, ServiceRisk},
     power::{battery_status, list_profiles, set_active_scheme},
-    processes::{list_processes, parse_process_target, process_liveness, process_target, set_process_ecoqos, ProcessLiveness},
+    processes::{list_all_processes, list_processes, parse_process_target, process_liveness, process_target, set_process_ecoqos, ProcessLiveness},
     services::{list_services, set_service_start_type, snapshot_payload, start_type_from_snapshot, StartType},
     OptimizationAudit, OptimizationSnapshot,
 };
+
+/// Serializes optimizer mutations (profiles, rollbacks, EcoQoS, services) so
+/// overlapping requests cannot snapshot a stale scheme or complete their
+/// audit rows out of order. Reads never take it.
+static OPTIMIZER_MUTATION: Mutex<()> = Mutex::new(());
+
+fn lock_optimizer_mutations() -> std::sync::MutexGuard<'static, ()> {
+    OPTIMIZER_MUTATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 // Enumeration/mutation work runs on a blocking thread, never the UI thread.
 #[tauri::command(async)]
@@ -653,6 +669,7 @@ pub async fn optimizer_set_service_start_type(
 }
 
 fn set_service_start_type_blocking(db: &Database, name: &str, display_name: &str, start_type: &str) -> Result<crate::optimizer::services::ServiceInfo, String> {
+    let _guard = lock_optimizer_mutations();
     if is_protected_service(name, display_name) {
         return Err(format!("'{display_name}' is protected (essential Windows/security/driver service) and cannot be changed by WinClean."));
     }
@@ -716,6 +733,7 @@ pub async fn optimizer_set_process_ecoqos(
 ) -> Result<(), String> {
     let db = state.db.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _guard = lock_optimizer_mutations();
         let action = if enable { "ecoqos:on" } else { "ecoqos:off" };
         let audit_id = db.insert_optimizer_audit("process", &process_target(&name, pid), action, "pending", None, None).map_err(to_command_error)?;
         // The setter revalidates the PID's real image name, foreground
@@ -761,6 +779,7 @@ pub async fn optimizer_apply_power_profile(state: State<'_, AppState>, profile_i
 }
 
 fn apply_power_profile_blocking(db: &Database, profile_id: &str) -> Result<String, String> {
+    let _guard = lock_optimizer_mutations();
     let profiles = list_profiles();
     let profile = profiles.iter().find(|p| format!("{:?}", p.id).eq_ignore_ascii_case(profile_id)
         || p.label.eq_ignore_ascii_case(profile_id))
@@ -813,6 +832,11 @@ fn apply_power_profile_blocking(db: &Database, profile_id: &str) -> Result<Strin
 struct EcoQosTouched {
     pid: u32,
     name: String,
+    /// When WinClean changed this process. Rollback treats a process created
+    /// after this moment as a PID reuse; absent in older snapshots, where the
+    /// snapshot time is used instead.
+    #[serde(default, rename = "sinceMs")]
+    since_ms: Option<i64>,
 }
 
 struct EcoQosOutcome {
@@ -842,7 +866,7 @@ fn record_ecoqos_audit(db: &Database, name: &str, pid: u32, enable: bool, detail
 
 /// Enables EcoQoS for every currently eligible process.
 fn throttle_eligible_processes(db: &Database) -> EcoQosOutcome {
-    let processes = match list_processes() {
+    let processes = match list_all_processes() {
         Ok(p) => p,
         Err(e) => return EcoQosOutcome { summary: format!("process listing failed: {e}"), touched: Vec::new() },
     };
@@ -853,7 +877,7 @@ fn throttle_eligible_processes(db: &Database) -> EcoQosOutcome {
         match set_process_ecoqos(proc.pid, &proc.name, true) {
             Ok(real) => {
                 record_ecoqos_audit(db, &real, proc.pid, true, "via power profile");
-                touched.push(EcoQosTouched { pid: proc.pid, name: real });
+                touched.push(EcoQosTouched { pid: proc.pid, name: real, since_ms: Some(now_ms()) });
             }
             Err(_) => skipped += 1,
         }
@@ -889,7 +913,7 @@ fn restore_ecoqos(db: &Database, candidates: Vec<EcoQosCandidate>, detail: &str)
             ProcessLiveness::Alive { .. } => match set_process_ecoqos(pid, &name, false) {
                 Ok(real) => {
                     record_ecoqos_audit(db, &real, pid, false, detail);
-                    touched.push(EcoQosTouched { pid, name: real });
+                    touched.push(EcoQosTouched { pid, name: real, since_ms: Some(since_ms) });
                 }
                 Err(_) => skipped += 1,
             },
@@ -909,7 +933,7 @@ fn rethrottle_ecoqos(db: &Database, candidates: Vec<EcoQosCandidate>, detail: &s
             ProcessLiveness::Alive { started_ms } if started_ms <= since_ms => match set_process_ecoqos(pid, &name, true) {
                 Ok(real) => {
                     record_ecoqos_audit(db, &real, pid, true, detail);
-                    touched.push(EcoQosTouched { pid, name: real });
+                    touched.push(EcoQosTouched { pid, name: real, since_ms: Some(since_ms) });
                 }
                 Err(_) => skipped += 1,
             },
@@ -926,7 +950,7 @@ fn rollback_profile_ecoqos(db: &Database, payload: &serde_json::Value, snapshot_
             .and_then(|v| serde_json::from_value::<Vec<EcoQosTouched>>(v.clone()).ok())
             .unwrap_or_default()
             .into_iter()
-            .map(|t| (t.name, t.pid, snapshot_created_ms))
+            .map(|t| (t.name, t.pid, t.since_ms.unwrap_or(snapshot_created_ms)))
             .collect()
     };
     let (enabled, restored) = (list("ecoQosEnabled"), list("ecoQosRestored"));
@@ -975,6 +999,7 @@ pub async fn optimizer_rollback(state: State<'_, AppState>, snapshot_id: i64) ->
 }
 
 fn rollback_blocking(db: &Database, snapshot_id: i64) -> Result<String, String> {
+    let _guard = lock_optimizer_mutations();
     let snapshot = db.get_optimizer_snapshot(snapshot_id).map_err(to_command_error)?
         .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
     if snapshot.rolled_back_at_ms.is_some() {
@@ -1034,4 +1059,33 @@ fn open_recycle_bin_impl() -> anyhow::Result<()> {
 #[cfg(not(windows))]
 fn open_recycle_bin_impl() -> anyhow::Result<()> {
     anyhow::bail!("Opening Recycle Bin is only available on Windows in this build")
+}
+
+#[cfg(test)]
+mod optimizer_tests {
+    use super::*;
+
+    #[test]
+    fn touched_process_round_trips_and_older_snapshots_default_since() {
+        let touched = EcoQosTouched { pid: 7, name: "Updater.exe".into(), since_ms: Some(1_234) };
+        let json = serde_json::to_value(&touched).unwrap();
+        assert_eq!(json["sinceMs"], 1_234);
+        assert_eq!(serde_json::from_value::<EcoQosTouched>(json).unwrap(), touched);
+
+        // Snapshots written before sinceMs existed still load.
+        let old: EcoQosTouched = serde_json::from_str(r#"{"pid":9,"name":"Old.exe"}"#).unwrap();
+        assert_eq!(old.since_ms, None);
+    }
+
+    #[test]
+    fn mutation_lock_recovers_from_poisoning() {
+        let result = std::thread::spawn(|| {
+            let _guard = lock_optimizer_mutations();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(result.is_err());
+        // A panicked mutation must not wedge every later optimizer change.
+        let _guard = lock_optimizer_mutations();
+    }
 }
