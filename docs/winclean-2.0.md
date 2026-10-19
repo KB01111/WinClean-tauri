@@ -33,6 +33,12 @@ SQLite adds `optimizer_snapshots`, `optimizer_audit`, `power_history`
 - EcoQoS never terminates processes and never touches foreground apps,
   editors (VS Code/Cursor), Codex/Claude/OpenCode, compilers, games, or
   inference processes. Restore = `ControlMask 0` for the same PID.
+  Enabling re-samples the target PID's live CPU (a busy updater/indexer is
+  refused) and revalidates its image name. Power profiles only restore
+  processes the audit trail shows WinClean throttled (never EcoQoS set by
+  another app, and not limited to the 300 rows the UI lists); a reused PID
+  is detected by process creation time. The processes a profile changed are
+  stored in its snapshot, so rolling the profile back also undoes them.
 - AI (existing `@openai/agents`) gains read-only tools only
   (`get_services`, `get_processes`, `get_power_status`, `get_hardware`).
   The AI layer cannot change services in this release: suggestions are

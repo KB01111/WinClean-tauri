@@ -8,7 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::policy::{classify_process_for_ecoqos, EcoQosDecision};
+use super::policy::EcoQosDecision;
+#[cfg(windows)]
+use super::policy::classify_process_for_ecoqos;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,10 +25,35 @@ pub struct ProcessInfo {
     pub eco_qos_applied: bool,
 }
 
+/// What a PID currently identifies, used to tell a process WinClean
+/// throttled from a different process that reused the same PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessLiveness {
+    /// No such process.
+    Gone,
+    /// Running; `started_ms` is the Unix-ms creation time.
+    Alive { started_ms: i64 },
+    /// Could not be determined (access denied, unsupported platform).
+    Unknown,
+}
+
+/// Audit target for a process action: `"<image name> (<pid>)"`.
+pub fn process_target(name: &str, pid: u32) -> String {
+    format!("{name} ({pid})")
+}
+
+/// Inverse of [`process_target`].
+pub fn parse_process_target(target: &str) -> Option<(String, u32)> {
+    let body = target.strip_suffix(')')?;
+    let (name, pid) = body.rsplit_once(" (")?;
+    if name.is_empty() { return None; }
+    Some((name.to_string(), pid.parse().ok()?))
+}
+
 #[cfg(windows)]
 mod win {
     use super::*;
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
@@ -81,7 +108,7 @@ mod win {
     fn sample_times() -> std::collections::HashMap<u32, u64> {
         let mut map = std::collections::HashMap::new();
         let s = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if s.is_null() { return map; }
+        if s.is_null() || s == INVALID_HANDLE_VALUE { return map; }
         let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, cntUsage: 0, th32ProcessID: 0, th32DefaultHeapID: 0, th32ModuleID: 0, cntThreads: 0, th32ParentProcessID: 0, pcPriClassBase: 0, dwFlags: 0, szExeFile: [0; 260] };
         if unsafe { Process32FirstW(s, &mut e) } != 0 {
             loop {
@@ -102,6 +129,46 @@ mod win {
 
     fn zero_ft() -> FILETIME { FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 } }
 
+    /// Kernel + user CPU time in 100 ns ticks, read through an open handle.
+    fn cpu_ticks(h: HANDLE) -> Option<u64> {
+        let (mut c, mut u, mut k, mut x) = (zero_ft(), zero_ft(), zero_ft(), zero_ft());
+        if unsafe { GetProcessTimes(h, &mut c, &mut x, &mut k, &mut u) } == 0 { return None; }
+        Some(filetime_ticks(&k) + filetime_ticks(&u))
+    }
+
+    /// Measures one process's CPU over a short window on its own handle.
+    /// `None` when the times cannot be read.
+    pub fn sample_cpu_percent(h: HANDLE) -> Option<f32> {
+        let first = cpu_ticks(h)?;
+        let started = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let second = cpu_ticks(h)?;
+        let window_ticks = (started.elapsed().as_secs_f64() * 10_000_000.0).max(1.0);
+        Some((second.saturating_sub(first) as f64 / window_ticks * 100.0) as f32)
+    }
+
+    /// Whether a PID is running and, if so, when its process was created.
+    pub fn process_liveness_impl(pid: u32) -> ProcessLiveness {
+        const ERROR_INVALID_PARAMETER: i32 = 87;
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() {
+            // OpenProcess reports a PID that does not exist as invalid-parameter.
+            return if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                ProcessLiveness::Gone
+            } else {
+                ProcessLiveness::Unknown
+            };
+        }
+        let (mut created, mut x, mut k, mut u) = (zero_ft(), zero_ft(), zero_ft(), zero_ft());
+        let ok = unsafe { GetProcessTimes(h, &mut created, &mut x, &mut k, &mut u) };
+        unsafe { CloseHandle(h); }
+        if ok == 0 { return ProcessLiveness::Unknown; }
+        // FILETIME epoch (1601) -> Unix epoch (1970), 100 ns -> ms.
+        const FILETIME_UNIX_DIFF_TICKS: u64 = 116_444_736_000_000_000;
+        let ticks = filetime_ticks(&created);
+        ProcessLiveness::Alive { started_ms: (ticks.saturating_sub(FILETIME_UNIX_DIFF_TICKS) / 10_000) as i64 }
+    }
+
     pub fn list_processes_impl() -> Result<Vec<ProcessInfo>, String> {
         let fg = foreground_pid();
         let first = sample_times();
@@ -111,7 +178,7 @@ mod win {
         let window_ticks = (started.elapsed().as_secs_f64() * 10_000_000.0).max(1.0);
 
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snap.is_null() { return Err(format!("CreateToolhelp32Snapshot failed: {}", std::io::Error::last_os_error())); }
+        if snap.is_null() || snap == INVALID_HANDLE_VALUE { return Err(format!("CreateToolhelp32Snapshot failed: {}", std::io::Error::last_os_error())); }
         let mut out = Vec::new();
         let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, cntUsage: 0, th32ProcessID: 0, th32DefaultHeapID: 0, th32ModuleID: 0, cntThreads: 0, th32ParentProcessID: 0, pcPriClassBase: 0, dwFlags: 0, szExeFile: [0; 260] };
         if unsafe { Process32FirstW(snap, &mut entry) } != 0 {
@@ -175,12 +242,13 @@ mod win {
             }
             if enable {
                 let is_fg = pid == foreground_pid();
-                // Unknown CPU at apply time: sample once cheaply via name-only
-                // policy (busy-work guard lives in the listing path); enabling
-                // still requires an Eligible verdict for the *real* process.
-                let decision = classify_process_for_ecoqos(&real, is_fg, -1.0);
+                // Sample this process's CPU now: a busy updater/indexer must
+                // be rejected here even if the listing showed it idle. No
+                // sample (-1.0) is never treated as idle.
+                let cpu = sample_cpu_percent(h).unwrap_or(-1.0);
+                let decision = classify_process_for_ecoqos(&real, is_fg, cpu);
                 if decision != EcoQosDecision::Eligible {
-                    return Err(format!("'{real}' is {decision:?} and will not be throttled. Only clearly eligible background work (updaters, indexers, telemetry) can be enabled."));
+                    return Err(format!("'{real}' is {decision:?} and will not be throttled. Only clearly eligible, currently idle background work (updaters, indexers, telemetry) can be enabled."));
                 }
             }
             let mut state = PROCESS_POWER_THROTTLING_STATE {
@@ -219,4 +287,25 @@ pub fn set_process_ecoqos(pid: u32, expected_name: &str, enable: bool) -> Result
 #[cfg(not(windows))]
 pub fn set_process_ecoqos(_pid: u32, _expected_name: &str, _enable: bool) -> Result<String, String> {
     Err("EcoQoS is only available on Windows.".into())
+}
+
+/// Reports whether a PID is still the process WinClean may have throttled.
+#[cfg(windows)]
+pub fn process_liveness(pid: u32) -> ProcessLiveness { win::process_liveness_impl(pid) }
+#[cfg(not(windows))]
+pub fn process_liveness(_pid: u32) -> ProcessLiveness { ProcessLiveness::Unknown }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_target_round_trips() {
+        assert_eq!(parse_process_target(&process_target("GoogleUpdate.exe", 4242)), Some(("GoogleUpdate.exe".into(), 4242)));
+        // Names may themselves contain parentheses.
+        assert_eq!(parse_process_target("Tool (x64).exe (17)"), Some(("Tool (x64).exe".into(), 17)));
+        assert_eq!(parse_process_target("no pid"), None);
+        assert_eq!(parse_process_target(" (5)"), None);
+        assert_eq!(parse_process_target("a.exe (notanumber)"), None);
+    }
 }

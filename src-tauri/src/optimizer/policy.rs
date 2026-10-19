@@ -249,6 +249,18 @@ mod tests {
     }
 
     #[test]
+    fn busy_or_unsampled_background_work_is_never_eligible() {
+        // At/over the 25% threshold, a name match must not be enough.
+        assert_eq!(classify_process_for_ecoqos("GoogleUpdate.exe", false, 25.0), EcoQosDecision::Unknown);
+        assert_eq!(classify_process_for_ecoqos("SearchIndexer.exe", false, 80.0), EcoQosDecision::Unknown);
+        assert_eq!(classify_process_for_ecoqos("GoogleUpdate.exe", false, 24.9), EcoQosDecision::Eligible);
+        // A missing sample (-1.0) is never treated as idle for names that
+        // are only eligible on measured CPU.
+        assert_eq!(classify_process_for_ecoqos("OneDrive.exe", false, -1.0), EcoQosDecision::Unknown);
+        assert_eq!(classify_process_for_ecoqos("OneDrive.exe", false, 0.0), EcoQosDecision::Eligible);
+    }
+
+    #[test]
     fn npu_only_routed_first_when_verified() {
         assert_eq!(route_inference(false, true, false)[0], "MIGraphXExecutionProvider / DirectML (Radeon 890M)");
         assert!(route_inference(true, true, false)[0].contains("VitisAI"));

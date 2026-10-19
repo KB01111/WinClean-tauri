@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::policy::{classify_service, ServiceClassification};
+use super::policy::ServiceClassification;
+#[cfg(windows)]
+use super::policy::classify_service;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

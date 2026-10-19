@@ -99,7 +99,8 @@ export function ServicesView() {
                   onChange={(e) => void change(svc, e.target.value)}
                   className="h-9 rounded-md border border-input bg-card px-2 text-sm disabled:opacity-50"
                 >
-                  {START_TYPES.filter((t) => t !== "disabled" || svc.classification.known).map((t) => (
+                  {/* Unknown services cannot be newly disabled, but an already-disabled one must still show its real state. */}
+                  {START_TYPES.filter((t) => t !== "disabled" || svc.classification.known || svc.startType === "disabled").map((t) => (
                     <option key={t} value={t}>{t}</option>
                   ))}
                   {!START_TYPES.includes(svc.startType as StartType) ? (

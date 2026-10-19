@@ -53,7 +53,6 @@ mod win {
     use windows_sys::Win32::System::Power::{
         GetSystemPowerStatus, PowerGetActiveScheme, PowerReadFriendlyName, SYSTEM_POWER_STATUS,
     };
-    use windows_sys::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_READ};
 
     /// Format a Windows GUID as a lowercase, hyphen-separated string.
     fn guid_string(g: &windows_sys::core::GUID) -> String {
@@ -110,20 +109,33 @@ mod win {
 
     /// Parse a hyphen-separated scheme identifier, optionally enclosed in braces, into a Windows GUID.
     fn parse_guid(s: &str) -> Result<windows_sys::core::GUID, String> {
-        let parts: Vec<&str> = s.trim_matches(|c| c == '{' || c == '}').split('-').collect();
-        if parts.len() != 5 { return Err(format!("invalid scheme GUID: {s}")); }
-        let d1 = u32::from_str_radix(parts[0], 16).map_err(|_| "bad GUID".to_string())?;
-        let d2 = u16::from_str_radix(parts[1], 16).map_err(|_| "bad GUID".to_string())?;
-        let d3 = u16::from_str_radix(parts[2], 16).map_err(|_| "bad GUID".to_string())?;
-        let mut d4 = [0u8; 8];
-        let p3: Vec<u8> = (0..4).map(|i| u8::from_str_radix(&parts[3][i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
-        // Tail is exactly 6 bytes (12 hex chars); reading beyond that panics.
-        if parts[3].len() != 4 || parts[4].len() != 12 { return Err(format!("invalid scheme GUID: {s}")); }
-        let p4: Vec<u8> = (0..6).map(|i| u8::from_str_radix(&parts[4][i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
-        d4[0] = p3[0]; d4[1] = p3[1];
-        for i in 0..6 { d4[2 + i] = p4[i]; }
+        let (d1, d2, d3, d4) = super::parse_guid_parts(s)?;
         Ok(windows_sys::core::GUID { data1: d1, data2: d2, data3: d3, data4: d4 })
     }
+}
+
+/// Strictly parses `8-4-4-4-12` hex GUID text (optionally braced) into
+/// `(data1, data2, data3, data4)`. Validates every group's shape before
+/// slicing so malformed input returns an error instead of panicking.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn parse_guid_parts(s: &str) -> Result<(u32, u16, u16, [u8; 8]), String> {
+    let bad = || format!("invalid scheme GUID: {s}");
+    let parts: Vec<&str> = s.trim().trim_matches(|c| c == '{' || c == '}').split('-').collect();
+    let widths = [8usize, 4, 4, 4, 12];
+    if parts.len() != 5
+        || parts.iter().zip(widths).any(|(p, w)| p.len() != w || !p.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(bad());
+    }
+    let d1 = u32::from_str_radix(parts[0], 16).map_err(|_| bad())?;
+    let d2 = u16::from_str_radix(parts[1], 16).map_err(|_| bad())?;
+    let d3 = u16::from_str_radix(parts[2], 16).map_err(|_| bad())?;
+    let tail = format!("{}{}", parts[3], parts[4]);
+    let mut d4 = [0u8; 8];
+    for (i, byte) in d4.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&tail[i * 2..i * 2 + 2], 16).map_err(|_| bad())?;
+    }
+    Ok((d1, d2, d3, d4))
 }
 
 /// Return battery telemetry and active power-scheme information from Windows.
@@ -159,5 +171,17 @@ mod tests {
         assert_eq!(discharge_watts(&a, &b, None), None);
         let c = PowerSample { at_ms: 600_000, percent: 79, on_ac: true };
         assert_eq!(discharge_watts(&a, &c, Some(50_000.0)), None);
+    }
+
+    #[test]
+    fn guid_parsing_is_strict_and_never_panics() {
+        let (d1, d2, d3, d4) = parse_guid_parts("{381b4222-f694-41f0-9685-ff5bb260df2e}").unwrap();
+        assert_eq!((d1, d2, d3), (0x381b4222, 0xf694, 0x41f0));
+        assert_eq!(d4, [0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e]);
+        // Short, long, non-hex and non-ASCII groups are rejected, not sliced.
+        for bad in ["", "a-b-c-d-e", "381b4222-f694-41f0-96-ff5bb260df2e", "381b4222-f694-41f0-9685-ff5bb260df2e0",
+                    "381b4222-f694-41f0-9685-ff5bb260df2g", "381b4222-f694-41f0-96é5-ff5bb260df2e"] {
+            assert!(parse_guid_parts(bad).is_err(), "{bad} should be rejected");
+        }
     }
 }

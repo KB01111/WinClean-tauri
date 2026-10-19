@@ -431,6 +431,37 @@ impl Database {
         Ok(())
     }
 
+    /// Replaces a snapshot's payload (used to add the processes a power
+    /// profile touched after the profile has been applied).
+    pub fn update_optimizer_snapshot_payload(&self, id: i64, payload_json: &str) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute("UPDATE optimizer_snapshots SET payload_json = ?2 WHERE id = ?1", params![id, payload_json])?;
+        Ok(())
+    }
+
+    /// Processes WinClean currently owns EcoQoS throttling for: audit
+    /// targets whose latest completed EcoQoS action is `ecoqos:on`. Returns
+    /// `(target, created_at_ms)` so callers can reject a reused PID.
+    pub fn ecoqos_owned_processes(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT a.target, a.created_at_ms
+            FROM optimizer_audit a
+            WHERE a.kind = 'process' AND a.status = 'completed' AND a.action = 'ecoqos:on'
+              AND a.id = (
+                SELECT MAX(b.id) FROM optimizer_audit b
+                WHERE b.kind = 'process' AND b.status = 'completed'
+                  AND b.action IN ('ecoqos:on', 'ecoqos:off')
+                  AND b.target = a.target COLLATE NOCASE
+              )
+            ORDER BY a.id
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read owned EcoQoS processes")
+    }
+
     pub fn insert_optimizer_audit(&self, kind: &str, target: &str, action: &str, status: &str, detail: Option<&str>, snapshot_id: Option<i64>) -> anyhow::Result<i64> {
         let conn = self.connect()?;
         let done = if status == "pending" { None } else { Some(unix_millis()) };
@@ -1073,11 +1104,11 @@ impl Database {
               AND is_reparse_point = 0
               AND is_placeholder = 0
               AND is_system = 0
-              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\windows\\%'
-              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\program files\\%'
-              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\program files (x86)\\%'
-              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\programdata\\%'
-              AND LOWER(REPLACE(path, '/', '\\')) NOT LIKE '%\\appdata\\%'
+              AND LOWER(REPLACE(path, '/', '\')) NOT LIKE '%\windows\%'
+              AND LOWER(REPLACE(path, '/', '\')) NOT LIKE '%\program files\%'
+              AND LOWER(REPLACE(path, '/', '\')) NOT LIKE '%\program files (x86)\%'
+              AND LOWER(REPLACE(path, '/', '\')) NOT LIKE '%\programdata\%'
+              AND LOWER(REPLACE(path, '/', '\')) NOT LIKE '%\appdata\%'
             GROUP BY LOWER(name), size
             HAVING COUNT(*) > 1
             "#,

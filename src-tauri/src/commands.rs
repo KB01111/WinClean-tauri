@@ -8,7 +8,7 @@ use std::{
     thread,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::{
@@ -627,9 +627,9 @@ fn reveal_in_explorer_impl(_path: &str) -> Result<(), String> {
 use crate::optimizer::{
     capabilities::capability_report,
     hardware::hardware_info,
-    policy::{classify_service, is_protected_service, ServiceRisk},
+    policy::{classify_service, is_protected_service, EcoQosDecision, ServiceRisk},
     power::{battery_status, list_profiles, set_active_scheme},
-    processes::{list_processes, set_process_ecoqos},
+    processes::{list_processes, parse_process_target, process_liveness, process_target, set_process_ecoqos, ProcessLiveness},
     services::{list_services, set_service_start_type, snapshot_payload, start_type_from_snapshot, StartType},
     OptimizationAudit, OptimizationSnapshot,
 };
@@ -717,7 +717,7 @@ pub async fn optimizer_set_process_ecoqos(
     let db = state.db.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let action = if enable { "ecoqos:on" } else { "ecoqos:off" };
-        let audit_id = db.insert_optimizer_audit("process", &format!("{name} ({pid})"), action, "pending", None, None).map_err(to_command_error)?;
+        let audit_id = db.insert_optimizer_audit("process", &process_target(&name, pid), action, "pending", None, None).map_err(to_command_error)?;
         // The setter revalidates the PID's real image name, foreground
         // state and live policy verdict before enabling; restore (off)
         // always passes identity revalidation only.
@@ -771,7 +771,7 @@ fn apply_power_profile_blocking(db: &Database, profile_id: &str) -> Result<Strin
     let before = battery_status()?;
     let previous_guid = before.active_scheme_guid.clone()
         .ok_or_else(|| "could not determine the active power scheme; refusing to change it without a rollback snapshot".to_string())?;
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "profileId": format!("{:?}", profile.id),
         "schemeGuid": previous_guid,
         "schemeName": before.active_scheme_name.clone(),
@@ -792,38 +792,149 @@ fn apply_power_profile_blocking(db: &Database, profile_id: &str) -> Result<Strin
         }
         Err(e) => format!("scheme applied; verification re-read failed: {e}"),
     };
-    // Apply the profile's EcoQoS promise: enable for eligible background
-    // processes, restore for anything we previously throttled.
-    let eco_detail = apply_profile_ecoqos(db, profile.eco_qos_for_background);
-    let detail = format!("{scheme_detail}; EcoQoS: {eco_detail}");
+    // Apply the profile's EcoQoS promise: throttle eligible background
+    // processes, or restore the ones WinClean throttled earlier.
+    let eco = apply_profile_ecoqos(db, profile.eco_qos_for_background);
+    // Record exactly which processes this profile changed so rollback can
+    // undo them (the scheme GUID alone cannot).
+    let key = if profile.eco_qos_for_background { "ecoQosEnabled" } else { "ecoQosRestored" };
+    payload[key] = serde_json::json!(eco.touched);
+    let snapshot_note = match db.update_optimizer_snapshot_payload(snapshot_id, &payload.to_string()) {
+        Ok(()) => String::new(),
+        Err(e) => format!("; WARNING: could not record processes for rollback: {e}"),
+    };
+    let detail = format!("{scheme_detail}; EcoQoS: {}{snapshot_note}", eco.summary);
     let _ = db.complete_optimizer_audit(audit_id, "completed", Some(&detail));
     Ok(detail)
 }
 
-/// Enables EcoQoS for every currently eligible process, or restores every
-/// process the audit trail shows we throttled. Returns a human summary.
-fn apply_profile_ecoqos(db: &Database, enable: bool) -> String {
+/// A process whose EcoQoS state a power profile changed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct EcoQosTouched {
+    pid: u32,
+    name: String,
+}
+
+struct EcoQosOutcome {
+    summary: String,
+    touched: Vec<EcoQosTouched>,
+}
+
+/// A process WinClean may own EcoQoS throttling for: `(name, pid, since_ms)`.
+/// `since_ms` is when WinClean recorded the throttle; a process created
+/// after it is a different process that reused the PID.
+type EcoQosCandidate = (String, u32, i64);
+
+fn apply_profile_ecoqos(db: &Database, enable: bool) -> EcoQosOutcome {
+    if enable {
+        return throttle_eligible_processes(db);
+    }
+    match owned_ecoqos_candidates(db) {
+        Ok(candidates) => restore_ecoqos(db, candidates, "via power profile"),
+        Err(e) => EcoQosOutcome { summary: format!("could not read throttled processes: {e}"), touched: Vec::new() },
+    }
+}
+
+fn record_ecoqos_audit(db: &Database, name: &str, pid: u32, enable: bool, detail: &str) {
+    let action = if enable { "ecoqos:on" } else { "ecoqos:off" };
+    let _ = db.insert_optimizer_audit("process", &process_target(name, pid), action, "completed", Some(detail), None);
+}
+
+/// Enables EcoQoS for every currently eligible process.
+fn throttle_eligible_processes(db: &Database) -> EcoQosOutcome {
     let processes = match list_processes() {
         Ok(p) => p,
-        Err(e) => return format!("process listing failed: {e}"),
+        Err(e) => return EcoQosOutcome { summary: format!("process listing failed: {e}"), touched: Vec::new() },
     };
-    let (mut ok, mut skipped) = (0usize, 0usize);
-    for proc in &processes {
-        let should_touch = if enable {
-            proc.eco_decision == crate::optimizer::policy::EcoQosDecision::Eligible && !proc.eco_qos_applied
-        } else {
-            proc.eco_qos_applied
-        };
-        if !should_touch { continue; }
-        match set_process_ecoqos(proc.pid, &proc.name, enable) {
+    let mut touched = Vec::new();
+    let mut skipped = 0usize;
+    let eligible = processes.iter().filter(|p| p.eco_decision == EcoQosDecision::Eligible && !p.eco_qos_applied);
+    for proc in eligible {
+        match set_process_ecoqos(proc.pid, &proc.name, true) {
             Ok(real) => {
-                ok += 1;
-                let _ = db.insert_optimizer_audit("process", &format!("{real} ({})", proc.pid), if enable { "ecoqos:on" } else { "ecoqos:off" }, "completed", Some("via power profile"), None);
+                record_ecoqos_audit(db, &real, proc.pid, true, "via power profile");
+                touched.push(EcoQosTouched { pid: proc.pid, name: real });
             }
             Err(_) => skipped += 1,
         }
     }
-    format!("{} process(es) {}, {} skipped", ok, if enable { "throttled" } else { "restored" }, skipped)
+    EcoQosOutcome { summary: format!("{} process(es) throttled, {skipped} skipped", touched.len()), touched }
+}
+
+/// Processes the audit trail shows WinClean throttled and never restored.
+/// Independent of the UI listing cap and of EcoQoS set by other apps.
+fn owned_ecoqos_candidates(db: &Database) -> Result<Vec<EcoQosCandidate>, String> {
+    let rows = db.ecoqos_owned_processes().map_err(to_command_error)?;
+    Ok(rows.into_iter()
+        .filter_map(|(target, at_ms)| parse_process_target(&target).map(|(name, pid)| (name, pid, at_ms)))
+        .collect())
+}
+
+/// Restores EcoQoS for candidates that still identify the process WinClean
+/// throttled. Exited processes and reused PIDs are released from ownership
+/// without touching anything.
+fn restore_ecoqos(db: &Database, candidates: Vec<EcoQosCandidate>, detail: &str) -> EcoQosOutcome {
+    let (mut touched, mut released, mut skipped) = (Vec::new(), 0usize, 0usize);
+    for (name, pid, since_ms) in candidates {
+        match process_liveness(pid) {
+            ProcessLiveness::Gone => {
+                record_ecoqos_audit(db, &name, pid, false, "process had already exited");
+                released += 1;
+            }
+            ProcessLiveness::Alive { started_ms } if started_ms > since_ms => {
+                record_ecoqos_audit(db, &name, pid, false, "PID now belongs to a newer process; not throttled by WinClean");
+                released += 1;
+            }
+            ProcessLiveness::Unknown => skipped += 1,
+            ProcessLiveness::Alive { .. } => match set_process_ecoqos(pid, &name, false) {
+                Ok(real) => {
+                    record_ecoqos_audit(db, &real, pid, false, detail);
+                    touched.push(EcoQosTouched { pid, name: real });
+                }
+                Err(_) => skipped += 1,
+            },
+        }
+    }
+    EcoQosOutcome { summary: format!("{} process(es) restored, {released} already gone, {skipped} skipped", touched.len()), touched }
+}
+
+/// Re-applies EcoQoS to processes a profile had restored (rollback of a
+/// profile that turned background throttling off). The setter still
+/// enforces the current policy, so a process that is now busy or protected
+/// stays untouched.
+fn rethrottle_ecoqos(db: &Database, candidates: Vec<EcoQosCandidate>, detail: &str) -> EcoQosOutcome {
+    let (mut touched, mut skipped) = (Vec::new(), 0usize);
+    for (name, pid, since_ms) in candidates {
+        match process_liveness(pid) {
+            ProcessLiveness::Alive { started_ms } if started_ms <= since_ms => match set_process_ecoqos(pid, &name, true) {
+                Ok(real) => {
+                    record_ecoqos_audit(db, &real, pid, true, detail);
+                    touched.push(EcoQosTouched { pid, name: real });
+                }
+                Err(_) => skipped += 1,
+            },
+            _ => skipped += 1,
+        }
+    }
+    EcoQosOutcome { summary: format!("{} process(es) re-throttled, {skipped} skipped", touched.len()), touched }
+}
+
+/// Undoes the EcoQoS side of an applied power profile from its snapshot.
+fn rollback_profile_ecoqos(db: &Database, payload: &serde_json::Value, snapshot_created_ms: i64) -> Option<String> {
+    let list = |key: &str| -> Vec<EcoQosCandidate> {
+        payload.get(key)
+            .and_then(|v| serde_json::from_value::<Vec<EcoQosTouched>>(v.clone()).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| (t.name, t.pid, snapshot_created_ms))
+            .collect()
+    };
+    let (enabled, restored) = (list("ecoQosEnabled"), list("ecoQosRestored"));
+    if enabled.is_empty() && restored.is_empty() { return None; }
+    let mut parts = Vec::new();
+    if !enabled.is_empty() { parts.push(restore_ecoqos(db, enabled, "rollback of power profile").summary); }
+    if !restored.is_empty() { parts.push(rethrottle_ecoqos(db, restored, "rollback of power profile").summary); }
+    Some(parts.join("; "))
 }
 #[tauri::command(async)]
 pub async fn optimizer_hardware_info() -> Result<crate::optimizer::hardware::HardwareInfo, String> {
@@ -856,9 +967,15 @@ pub fn optimizer_history(state: State<'_, AppState>, limit: Option<u32>) -> Resu
     })
 }
 
-#[tauri::command]
-pub fn optimizer_rollback(state: State<'_, AppState>, snapshot_id: i64) -> Result<String, String> {
-    let snapshot = state.db.get_optimizer_snapshot(snapshot_id).map_err(to_command_error)?
+#[tauri::command(async)]
+pub async fn optimizer_rollback(state: State<'_, AppState>, snapshot_id: i64) -> Result<String, String> {
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || rollback_blocking(&db, snapshot_id))
+        .await.map_err(|e| e.to_string())?
+}
+
+fn rollback_blocking(db: &Database, snapshot_id: i64) -> Result<String, String> {
+    let snapshot = db.get_optimizer_snapshot(snapshot_id).map_err(to_command_error)?
         .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
     if snapshot.rolled_back_at_ms.is_some() {
         return Err("snapshot was already rolled back".into());
@@ -871,18 +988,24 @@ pub fn optimizer_rollback(state: State<'_, AppState>, snapshot_id: i64) -> Resul
         }
         "powerScheme" => {
             let guid = payload.get("schemeGuid").and_then(|v| v.as_str()).ok_or("snapshot has no previous scheme GUID")?;
-            set_active_scheme(guid).map(|_| format!("power scheme restored to {guid}"))
+            set_active_scheme(guid).map(|_| {
+                let scheme = format!("power scheme restored to {guid}");
+                match rollback_profile_ecoqos(db, &payload, snapshot.created_at_ms) {
+                    Some(eco) => format!("{scheme}; EcoQoS: {eco}"),
+                    None => scheme,
+                }
+            })
         }
         other => Err(format!("rollback is not supported for snapshot kind '{other}'")),
     };
     match result {
         Ok(msg) => {
-            state.db.mark_snapshot_rolled_back(snapshot_id).map_err(to_command_error)?;
-            let _ = state.db.insert_optimizer_audit(&snapshot.kind, &snapshot.target, "rollback", "completed", Some(&msg), Some(snapshot_id));
+            db.mark_snapshot_rolled_back(snapshot_id).map_err(to_command_error)?;
+            let _ = db.insert_optimizer_audit(&snapshot.kind, &snapshot.target, "rollback", "completed", Some(&msg), Some(snapshot_id));
             Ok(msg)
         }
         Err(e) => {
-            let _ = state.db.insert_optimizer_audit(&snapshot.kind, &snapshot.target, "rollback", "failed", Some(&e), Some(snapshot_id));
+            let _ = db.insert_optimizer_audit(&snapshot.kind, &snapshot.target, "rollback", "failed", Some(&e), Some(snapshot_id));
             Err(e)
         }
     }

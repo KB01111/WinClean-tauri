@@ -12,6 +12,7 @@ export function ProcessesView() {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<number | null>(null)
+  const [batchRunning, setBatchRunning] = useState(false)
 
   // EcoQoS state comes from the backend on every listing
   // (GetProcessInformation), so it survives view navigation and the
@@ -46,17 +47,31 @@ export function ProcessesView() {
   }
 
   async function applyEligible() {
+    if (batchRunning) return
     const eligible = processes.filter((p) => p.ecoDecision === "eligible" && !p.ecoQosApplied)
-    let failed = 0
-    for (const proc of eligible) {
-      try {
-        await api.optimizerSetProcessEcoQos(proc.pid, proc.name, true)
-      } catch {
-        failed += 1 // per-process failures are audited in the backend
-      }
+    if (eligible.length === 0) {
+      toast.info("No eligible background processes to throttle right now.")
+      return
     }
-    toast.success(`EcoQoS applied to eligible background processes (${eligible.length - failed}/${eligible.length}). Editors, compilers, games and inference were excluded.`)
-    await load()
+    setBatchRunning(true)
+    let failed = 0
+    try {
+      for (const proc of eligible) {
+        try {
+          await api.optimizerSetProcessEcoQos(proc.pid, proc.name, true)
+        } catch {
+          failed += 1 // per-process failures are audited in the backend
+        }
+      }
+      const done = eligible.length - failed
+      const summary = `EcoQoS applied to ${done}/${eligible.length} eligible background processes. Editors, compilers, games and inference were excluded.`
+      if (failed === 0) toast.success(summary)
+      else if (done === 0) toast.error(`EcoQoS was not applied to any eligible process (${failed} refused or failed). See Optimization History.`)
+      else toast.warning(`${summary} ${failed} refused or failed; see Optimization History.`)
+    } finally {
+      setBatchRunning(false)
+      await load()
+    }
   }
 
   return (
@@ -64,10 +79,10 @@ export function ProcessesView() {
       title="Processes & EcoQoS (SetProcessInformation)"
       action={
         <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={() => void applyEligible()} disabled={loading}>
-            <Leaf className="size-4" aria-hidden="true" /> Apply to eligible
+          <Button variant="outline" size="sm" onClick={() => void applyEligible()} disabled={loading || batchRunning}>
+            {batchRunning ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Leaf className="size-4" aria-hidden="true" />} Apply to eligible
           </Button>
-          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading || batchRunning}>
             {loading ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <RefreshCw className="size-4" aria-hidden="true" />}
             Refresh
           </Button>
@@ -95,7 +110,7 @@ export function ProcessesView() {
               <Button
                 size="sm"
                 variant={proc.ecoQosApplied ? "default" : "outline"}
-                disabled={(!proc.ecoQosApplied && (proc.ecoDecision === "protected" || proc.ecoDecision === "foreground")) || busy === proc.pid}
+                disabled={(!proc.ecoQosApplied && (proc.ecoDecision === "protected" || proc.ecoDecision === "foreground")) || busy === proc.pid || batchRunning}
                 onClick={() => void toggle(proc)}
               >
                 {proc.ecoQosApplied ? "Restore" : "EcoQoS"}

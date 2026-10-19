@@ -54,9 +54,10 @@ export function PowerView() {
   }
 
   const acKnown = battery?.acKnown ?? false
+  // No suggestion until AC status is known: nothing is marked "suggested now".
   const suggested = battery && acKnown
     ? suggestProfile({ onAc: battery.onAc, percent: battery.percent })
-    : "balanced"
+    : null
   const runtime =
     battery?.secondsRemaining && battery.secondsRemaining > 0
       ? `${Math.floor(battery.secondsRemaining / 3600)}h ${Math.floor((battery.secondsRemaining % 3600) / 60)}m (Windows estimate)`
@@ -65,10 +66,10 @@ export function PowerView() {
   return (
     <div className="space-y-4">
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Metric label="Battery" value={battery?.present ? `${battery.percent ?? "—"}%` : "No battery"} hint={!acKnown ? "AC status unknown" : battery?.onAc ? "On AC power" : "On battery"} />
+        <Metric label="Battery" value={!battery ? "—" : battery.present ? `${battery.percent ?? "—"}%` : "No battery"} hint={!battery ? "" : !acKnown ? "AC status unknown" : battery.onAc ? "On AC power" : "On battery"} />
         <Metric label="Active scheme" value={battery?.activeSchemeName ?? "—"} hint={battery?.activeSchemeGuid ?? ""} />
         <Metric label="Estimated runtime" value={runtime} hint="From GetSystemPowerStatus" />
-        <Metric label="Suggested profile" value={acKnown ? suggested : "-"} hint={acKnown ? "Deterministic AC/DC + level policy" : "AC status unknown - no DC rules applied"} />
+        <Metric label="Suggested profile" value={suggested ?? "-"} hint={acKnown ? "Deterministic AC/DC + level policy" : "AC status unknown - no DC rules applied"} />
       </div>
 
       <Panel

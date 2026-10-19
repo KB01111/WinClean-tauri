@@ -66,7 +66,8 @@ export type HardwareInfo = {
 
 export type CapabilityReport = {
   windowsBuild: number | null
-  copilotPlusCapable: boolean
+  /** null = unverified: registry-only discovery cannot measure the 40+ TOPS requirement. */
+  copilotPlusCapable: boolean | null
   mcpAgentRegistryFound: boolean
   mcpRegistryPaths: string[]
   fileExplorerMcp: string

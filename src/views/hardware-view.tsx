@@ -36,7 +36,7 @@ export function HardwareView() {
         <Metric label="CPU" value={hw?.cpuIsRyzenAi9Hx370 ? "Ryzen AI 9 HX 370" : (hw?.cpuName ?? "—")} hint={hw?.cpuArchitectureNote ?? ""} />
         <Metric label="Logical processors" value={hw ? String(hw.logicalProcessors) : "—"} />
         <Metric label="RAM" value={hw?.ramTotalMb ? `${(hw.ramTotalMb / 1024).toFixed(1)} GB` : "—"} />
-        <Metric label="NPU" value={hw?.npu.present ? "XDNA detected" : "Not detected"} hint={hw?.npu.inferenceVerified ? "Inference verified" : "Inference not verified — CPU fallback"} />
+        <Metric label="NPU" value={!hw ? "—" : hw.npu.present ? "XDNA detected" : "Not detected"} hint={!hw ? "" : hw.npu.inferenceVerified ? "Inference verified" : "Inference not verified — CPU fallback"} />
       </div>
 
       <Panel
@@ -75,7 +75,7 @@ export function HardwareView() {
             <SummaryList
               rows={[
                 ["Windows build", caps.windowsBuild ? String(caps.windowsBuild) : "unknown"],
-                ["Copilot+ capable", caps.copilotPlusCapable ? "yes (build + NPU)" : "no"],
+                ["Copilot+ capable", caps.copilotPlusCapable == null ? "unverified — needs a measured 40+ TOPS NPU" : caps.copilotPlusCapable ? "yes" : "no"],
                 ["On-device Agent Registry", caps.mcpAgentRegistryFound ? caps.mcpRegistryPaths.join(", ") : "not found"],
                 ["File Explorer MCP", caps.fileExplorerMcp],
                 ["Inference route", caps.inferenceRoute.join(" → ")],

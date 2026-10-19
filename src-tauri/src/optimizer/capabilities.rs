@@ -10,7 +10,9 @@ use super::policy::route_inference;
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityReport {
     pub windows_build: Option<u32>,
-    pub copilot_plus_capable: bool,
+    /// `None` = unverified: registry-only discovery cannot measure the
+    /// 40+ TOPS NPU requirement, so it is never reported as a plain no.
+    pub copilot_plus_capable: Option<bool>,
     pub mcp_agent_registry_found: bool,
     pub mcp_registry_paths: Vec<String>,
     pub file_explorer_mcp: String,
@@ -68,7 +70,7 @@ pub fn capability_report(_npu_present: bool, igpu_available: bool) -> Capability
         windows_build: build,
         // Presence + build is NOT proof of the 40+ TOPS Copilot+ requirement;
         // throughput cannot be verified registry-only, so never claim it.
-        copilot_plus_capable: false,
+        copilot_plus_capable: None,
         mcp_agent_registry_found: !paths.is_empty(),
         mcp_registry_paths: paths,
         file_explorer_mcp: "Discovery only. File Explorer MCP requires the connector app registered in the On-device Agent Registry and per-file user consent in Explorer. WinClean keeps its native scanner and never reads files through MCP without that consent.".into(),

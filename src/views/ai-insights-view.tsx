@@ -129,6 +129,8 @@ export function AiInsightsView({
               device. If the assistant uses its read-only optimizer tools,
               service names/start types, process names with CPU/memory,
               battery state and hardware model strings are also sent.
+              Hardware discovery can also include local agent-registry folder
+              paths, which may contain your Windows profile name.
             </p>
           </div>
         )}
