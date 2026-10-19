@@ -97,7 +97,8 @@ mod win {
         Some(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string())
     }
 
-    fn eco_qos_applied(h: HANDLE) -> bool {
+    /// Live EcoQoS bit; `None` when Windows could not report it.
+    fn eco_qos_state(h: HANDLE) -> Option<bool> {
         let mut state = PROCESS_POWER_THROTTLING_STATE {
             Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
             ControlMask: 0,
@@ -106,7 +107,14 @@ mod win {
         let ok = unsafe {
             GetProcessInformation(h, ProcessPowerThrottling, &mut state as *mut _ as *mut std::ffi::c_void, std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32)
         };
-        ok != 0 && (state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+        if ok == 0 { return None; }
+        Some((state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0)
+    }
+
+    /// Like [`eco_qos_state`] but a failed query reads as "off", for listing
+    /// and post-change verification where unknown must not look throttled.
+    fn eco_qos_applied(h: HANDLE) -> bool {
+        eco_qos_state(h).unwrap_or(false)
     }
 
     fn sample_times() -> std::collections::HashMap<u32, u64> {
@@ -155,9 +163,9 @@ mod win {
     pub fn process_ecoqos_state_impl(pid: u32) -> Option<bool> {
         let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if h.is_null() { return None; }
-        let on = eco_qos_applied(h);
+        let state = eco_qos_state(h);
         unsafe { CloseHandle(h); }
-        Some(on)
+        state
     }
 
     /// Whether a PID is running and, if so, when its process was created.
@@ -257,8 +265,10 @@ mod win {
                 let is_fg = pid == foreground_pid();
                 // Another actor (or an earlier run) already throttled it:
                 // WinClean must not claim ownership of state it did not set.
-                if eco_qos_applied(h) {
-                    return Err(format!("'{real}' (pid {pid}) is already EcoQoS-throttled; WinClean will not claim it."));
+                match eco_qos_state(h) {
+                    Some(false) => {}
+                    Some(true) => return Err(format!("'{real}' (pid {pid}) is already EcoQoS-throttled; WinClean will not claim it.")),
+                    None => return Err(format!("could not read the EcoQoS state of '{real}' (pid {pid}); refusing to change it blind.")),
                 }
                 // Sample this process's CPU now: a busy updater/indexer must
                 // be rejected here even if the listing showed it idle. Without

@@ -963,23 +963,28 @@ fn rollback_profile_ecoqos(db: &Database, payload: &serde_json::Value, snapshot_
     // The payload list is written once after the process loop; the per-process
     // audit rows are written as each process changes. Use both so a failed or
     // interrupted payload write cannot make the changes un-undoable.
-    let list = |key: &str, action: &str| -> Vec<EcoQosCandidate> {
+    let list = |key: &str, action: &str| -> Result<Vec<EcoQosCandidate>, String> {
         let mut out: Vec<EcoQosCandidate> = payload.get(key)
             .and_then(|v| serde_json::from_value::<Vec<EcoQosTouched>>(v.clone()).ok())
             .unwrap_or_default()
             .into_iter()
             .map(|t| (t.name, t.pid, t.since_ms.unwrap_or(snapshot_created_ms)))
             .collect();
-        for (target, at_ms) in db.ecoqos_changes_for_snapshot(snapshot_id, action).unwrap_or_default() {
+        for (target, at_ms) in db.ecoqos_changes_for_snapshot(snapshot_id, action).map_err(to_command_error)? {
             if let Some((name, pid)) = parse_process_target(&target) {
                 if !out.iter().any(|(n, p, _)| *p == pid && n.eq_ignore_ascii_case(&name)) {
                     out.push((name, pid, at_ms));
                 }
             }
         }
-        out
+        Ok(out)
     };
-    let (enabled, restored) = (list("ecoQosEnabled", "ecoqos:on"), list("ecoQosRestored", "ecoqos:off"));
+    // An unreadable recovery record must keep the rollback retryable, never
+    // look like "nothing to undo".
+    let (enabled, restored) = match (list("ecoQosEnabled", "ecoqos:on"), list("ecoQosRestored", "ecoqos:off")) {
+        (Ok(enabled), Ok(restored)) => (enabled, restored),
+        (Err(e), _) | (_, Err(e)) => return Some((format!("could not read the processes this profile changed ({e}); EcoQoS left unchanged"), 1)),
+    };
     if enabled.is_empty() && restored.is_empty() { return None; }
     // Only undo throttles WinClean still owns. A later manual Restore, or
     // EcoQoS another app set afterwards, must not be cleared by rolling back
