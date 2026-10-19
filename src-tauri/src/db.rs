@@ -462,6 +462,19 @@ impl Database {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read owned EcoQoS processes")
     }
 
+    /// Completed per-process EcoQoS changes a power profile made, linked to
+    /// its snapshot (`action` is `ecoqos:on` or `ecoqos:off`). Written as each
+    /// process changes, so rollback does not depend on the single payload
+    /// update that follows the loop.
+    pub fn ecoqos_changes_for_snapshot(&self, snapshot_id: i64, action: &str) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT target, created_at_ms FROM optimizer_audit WHERE kind = 'process' AND status = 'completed' AND action = ?2 AND snapshot_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![snapshot_id, action], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read EcoQoS changes for snapshot")
+    }
+
     pub fn insert_optimizer_audit(&self, kind: &str, target: &str, action: &str, status: &str, detail: Option<&str>, snapshot_id: Option<i64>) -> anyhow::Result<i64> {
         let conn = self.connect()?;
         let done = if status == "pending" { None } else { Some(unix_millis()) };

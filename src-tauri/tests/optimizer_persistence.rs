@@ -102,3 +102,29 @@ fn snapshot_payload_can_be_updated_after_apply() {
     let snapshot = db.get_optimizer_snapshot(id).expect("read").expect("exists");
     assert!(snapshot.payload_json.contains("ecoQosEnabled"));
 }
+
+#[test]
+fn profile_changes_are_recoverable_from_audit_rows_linked_to_the_snapshot() {
+    let (_temp, db) = open_db();
+    let snap = db.insert_optimizer_snapshot("powerScheme", "Balanced", "{}").expect("snapshot");
+    let other = db.insert_optimizer_snapshot("powerScheme", "Gaming", "{}").expect("snapshot");
+    let row = |target: &str, action: &str, status: &str, snapshot: Option<i64>| {
+        db.insert_optimizer_audit("process", target, action, status, None, snapshot).expect("audit");
+    };
+
+    row("Updater.exe (10)", "ecoqos:on", "completed", Some(snap));
+    row("Indexer.exe (11)", "ecoqos:on", "completed", Some(snap));
+    row("Failed.exe (12)", "ecoqos:on", "failed", Some(snap)); // never applied
+    row("Pending.exe (13)", "ecoqos:on", "pending", Some(snap)); // not finished
+    row("Elsewhere.exe (14)", "ecoqos:on", "completed", Some(other)); // another snapshot
+    row("Released.exe (15)", "ecoqos:on", "completed", None); // not a profile change
+    row("Restored.exe (16)", "ecoqos:off", "completed", Some(snap));
+
+    let on: Vec<String> = db.ecoqos_changes_for_snapshot(snap, "ecoqos:on").expect("on")
+        .into_iter().map(|(t, _)| t).collect();
+    let off: Vec<String> = db.ecoqos_changes_for_snapshot(snap, "ecoqos:off").expect("off")
+        .into_iter().map(|(t, _)| t).collect();
+
+    assert_eq!(on, vec!["Updater.exe (10)".to_string(), "Indexer.exe (11)".to_string()]);
+    assert_eq!(off, vec!["Restored.exe (16)".to_string()]);
+}
