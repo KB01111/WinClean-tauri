@@ -113,3 +113,16 @@ export function describeSeries(series: Series): string {
   const mean = watts.reduce((a, b) => a + b, 0) / watts.length
   return `Battery power draw over time: average ${mean.toFixed(1)} watts, lowest ${Math.min(...watts).toFixed(1)}, highest ${Math.max(...watts).toFixed(1)} watts across ${watts.length} readings.`
 }
+
+/**
+ * Appends a newer live sample to the history already on screen (capped at
+ * `limit`), so the chart can follow the battery without re-fetching the whole
+ * history every few seconds. An older or duplicate sample leaves it unchanged.
+ */
+export function appendSample(samples: TelemetrySample[], sample: TelemetrySample | null, limit: number): TelemetrySample[] {
+  if (!sample || !Number.isFinite(sample.atMs)) return samples
+  const last = samples[samples.length - 1]
+  if (last && sample.atMs <= last.atMs) return samples
+  const next = [...samples, sample]
+  return next.length > limit ? next.slice(next.length - limit) : next
+}

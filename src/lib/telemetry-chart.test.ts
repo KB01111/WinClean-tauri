@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { acSpans, buildSeries, describeSeries, linePath, niceMax } from "./telemetry-chart"
+import { acSpans, appendSample, buildSeries, describeSeries, linePath, niceMax } from "./telemetry-chart"
 import type { TelemetrySample } from "./optimizer"
 
 const sample = (atMs: number, rateMw: number | null, onAc = false, percent: number | null = 50): TelemetrySample => ({
@@ -79,5 +79,23 @@ describe("acSpans and description", () => {
   test("description reflects real numbers or says there are none", () => {
     expect(describeSeries(buildSeries([sample(0, 1000, true)], 5))).toContain("No discharge power readings")
     expect(describeSeries(buildSeries([sample(0, -10_000), sample(1000, -20_000)], 5))).toContain("average 15.0 watts")
+  })
+})
+
+describe("appendSample", () => {
+  const a = sample(1000, -5000)
+  const b = sample(2000, -6000)
+  test("adds only newer samples and ignores a missing one", () => {
+    expect(appendSample([a], b, 10)).toEqual([a, b])
+    expect(appendSample([a, b], a, 10)).toEqual([a, b])
+    expect(appendSample([a, b], b, 10)).toEqual([a, b])
+    expect(appendSample([a], null, 10)).toEqual([a])
+    expect(appendSample([], a, 10)).toEqual([a])
+  })
+  test("keeps the newest `limit` samples and does not mutate its input", () => {
+    const base = [sample(1, -1), sample(2, -2), sample(3, -3)]
+    const out = appendSample(base, sample(4, -4), 3)
+    expect(out.map((s) => s.atMs)).toEqual([2, 3, 4])
+    expect(base).toHaveLength(3)
   })
 })

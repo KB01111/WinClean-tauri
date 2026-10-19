@@ -19,6 +19,7 @@ import {
   newCustomProfile,
   parseOptimizerEvent,
   profileLabel,
+  reviewAgainReason,
   recommendationMemoryMb,
   routeHeadline,
   startTypeLabel,
@@ -219,5 +220,15 @@ describe("measurement wording", () => {
     expect(describeMeasurement({ ...base, verdict: "worse", deltaW: 1.2, deltaPercent: 10 }).tone).toBe("warn")
     expect(describeMeasurement({ ...base, verdict: "inconclusive", deltaW: 0.1, deltaPercent: 1 }).headline).toContain("No difference")
     expect(describeMeasurement({ ...base, verdict: "insufficientData", deltaW: null, deltaPercent: null }).headline).toContain("Not enough")
+  })
+})
+
+describe("review again", () => {
+  test("only recoverable failures re-open the review", () => {
+    expect(reviewAgainReason({ code: "elevationRequired", message: "x" })).toContain("administrator helper")
+    expect(reviewAgainReason({ code: "conflict", message: "x" })).toContain("changed")
+    expect(reviewAgainReason({ code: "rejected", message: "x" })).toBeNull()
+    expect(reviewAgainReason({ code: "failed", message: "x" })).toBeNull()
+    expect(reviewAgainReason(new Error("boom"))).toBeNull()
   })
 })

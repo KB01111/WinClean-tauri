@@ -42,6 +42,17 @@ export function isConflict(error: unknown): boolean {
   return isCommandError(error) && error.code === "conflict"
 }
 
+/**
+ * Approval tokens are single-use and consumed even when applying fails, so a
+ * plan that failed for a recoverable reason has to be reviewed again with a
+ * fresh token. Returns the explanation to show, or null for any other error.
+ */
+export function reviewAgainReason(error: unknown): string | null {
+  if (isElevationRequired(error)) return "The administrator helper is no longer connected. Enable it, then review the plan again."
+  if (isConflict(error)) return "Services changed since you reviewed this plan. Review the updated plan."
+  return null
+}
+
 // ---------------------------------------------------------------------------
 // Services
 // ---------------------------------------------------------------------------

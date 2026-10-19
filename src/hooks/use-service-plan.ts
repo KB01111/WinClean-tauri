@@ -4,8 +4,7 @@ import { toast } from "sonner"
 import { api } from "@/lib/api"
 import {
   describeError,
-  isConflict,
-  isElevationRequired,
+  reviewAgainReason,
   type PreparedPlanView,
   type ServiceApplyOutcome,
   type ServiceChange,
@@ -51,17 +50,17 @@ export function useServicePlan(onApplied: (outcome: ServiceApplyOutcome) => void
         toast.success(outcome.summary)
         onApplied(outcome)
       } catch (error) {
-        if (isElevationRequired(error)) {
-          // The plan stays open: enabling the helper and pressing Apply again uses the same token.
-          toast.error("Administrator rights are needed. Enable the administrator helper, then apply again.")
-        } else if (isConflict(error) && lastRequest.current) {
-          toast.warning("Services changed since you reviewed this plan. Review the updated plan.")
+        // The token is spent either way. For recoverable reasons (helper dropped,
+        // services changed) the plan is prepared again so the user reviews current facts.
+        const again = reviewAgainReason(error)
+        if (again && lastRequest.current) {
+          toast.warning(again)
           const { changes, origin: from } = lastRequest.current
           try {
             setPrepared(await api.optimizerPrepareServicePlan(changes, from))
-          } catch (again) {
+          } catch (second) {
             setPrepared(null)
-            toast.error(describeError(again))
+            toast.error(describeError(second))
           }
         } else {
           setPrepared(null)

@@ -41,9 +41,9 @@ export function ProcessesView() {
 
   const load = useCallback(async () => {
     try {
-      const [list, load] = await Promise.all([api.optimizerListProcesses(), api.optimizerWorkload()])
+      const [list, current] = await Promise.all([api.optimizerListProcesses(), api.optimizerWorkload()])
       setProcesses(list)
-      setWorkload(load)
+      setWorkload(current)
       setError(null)
     } catch (e) {
       setError(formatError(e))

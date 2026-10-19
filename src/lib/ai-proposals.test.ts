@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { normalizeProposals, systemReportSchema } from "./ai-proposals"
-import { OPTIMIZER_TOOL_NAMES } from "./ai-tools"
+import { OPTIMIZER_TOOL_NAMES, buildOptimizerTools } from "./ai-tools"
 import type { PowerProfile, ServiceInfo } from "./optimizer"
 
 const svc = (name: string, risk: "protected" | "caution" | "safe", startType = "automatic"): ServiceInfo => ({
@@ -64,12 +64,31 @@ describe("structured output schema", () => {
 })
 
 describe("assistant tools are read-only", () => {
-  test("no tool name suggests a mutation", () => {
+  test("every tool is a getter and the exported name list matches the tools that are built", () => {
     for (const name of OPTIMIZER_TOOL_NAMES) {
       expect(name.startsWith("get_")).toBe(true)
-      for (const word of ["set", "apply", "delete", "write", "rollback", "disable", "kill", "throttle"]) {
-        expect(name.includes(word) && word !== "set").toBe(false)
-      }
+    }
+    const built = buildOptimizerTools().map((t) => t.name)
+    expect([...built].sort()).toEqual([...OPTIMIZER_TOOL_NAMES].sort())
+  })
+
+  test("the tool source never reaches a command that changes state or prepares a change", async () => {
+    const source = await Bun.file(new URL("./ai-tools.ts", import.meta.url)).text()
+    const called = [...source.matchAll(/api\.(\w+)\(/g)].map((m) => m[1])
+    expect(called.length).toBeGreaterThan(0)
+    const allowed = new Set([
+      "optimizerListServices",
+      "optimizerServiceRecommendations",
+      "optimizerListProcesses",
+      "optimizerWorkload",
+      "optimizerBatteryTelemetry",
+      "optimizerHardwareInfo",
+      "optimizerCapabilities",
+      "optimizerListProfiles",
+      "optimizerHistory",
+    ])
+    for (const method of called) {
+      expect(allowed.has(method)).toBe(true)
     }
   })
 })

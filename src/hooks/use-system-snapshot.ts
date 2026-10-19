@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react"
 
+import { useOptimizerEvents } from "@/hooks/use-optimizer-events"
 import { usePolling } from "@/hooks/use-polling"
 import { api } from "@/lib/api"
 import type {
@@ -36,25 +37,22 @@ const value = <T,>(r: PromiseSettledResult<T>): T | null => (r.status === "fulfi
 
 /**
  * Facts for the System Overview. Each source loads independently, so one
- * failing (for example no battery on a desktop) never blanks the page. The
- * cheap, changing facts refresh while the window is visible; the expensive
- * ones (service enumeration, hardware) load once and on demand.
+ * failing (for example no battery on a desktop) never blanks the page. Battery
+ * and workload refresh while the window is visible; everything else (services,
+ * hardware, profiles) loads once and then follows events or a manual refresh.
  */
 export function useSystemSnapshot() {
   const [snapshot, setSnapshot] = useState<SystemSnapshot>(EMPTY)
   const [loading, setLoading] = useState(true)
 
   const loadFast = useCallback(async () => {
-    const [battery, workload, profiles] = await Promise.allSettled([
-      api.optimizerBatteryTelemetry(),
-      api.optimizerWorkload(),
-      api.optimizerListProfiles(),
-    ])
-    setSnapshot((s) => ({ ...s, battery: value(battery), workload: value(workload), profiles: value(profiles) }))
+    const [battery, workload] = await Promise.allSettled([api.optimizerBatteryTelemetry(), api.optimizerWorkload()])
+    setSnapshot((s) => ({ ...s, battery: value(battery), workload: value(workload) }))
   }, [])
 
   const loadSlow = useCallback(async () => {
-    const [hardware, recommendations, helper, recovery] = await Promise.allSettled([
+    const [profiles, hardware, recommendations, helper, recovery] = await Promise.allSettled([
+      api.optimizerListProfiles(),
       api.optimizerHardwareInfo(false),
       api.optimizerServiceRecommendations(),
       api.optimizerHelperStatus(),
@@ -62,6 +60,7 @@ export function useSystemSnapshot() {
     ])
     setSnapshot((s) => ({
       ...s,
+      profiles: value(profiles),
       hardware: value(hardware),
       recommendations: value(recommendations),
       helper: value(helper),
@@ -79,6 +78,16 @@ export function useSystemSnapshot() {
     void reload()
   }, [reload])
   usePolling(loadFast, 15_000)
+  // Profiles change on user action or an automatic switch, both announced as events.
+  useOptimizerEvents((event) => {
+    if (event.kind === "workload") setSnapshot((s) => ({ ...s, workload: event.data }))
+    if (event.kind === "profileChanged") {
+      void api
+        .optimizerListProfiles()
+        .then((profiles) => setSnapshot((s) => ({ ...s, profiles })))
+        .catch(() => {})
+    }
+  })
 
   return { snapshot, loading, reload }
 }

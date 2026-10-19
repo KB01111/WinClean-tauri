@@ -11,6 +11,7 @@ import { useOptimizerEvents } from "@/hooks/use-optimizer-events"
 import { usePolling } from "@/hooks/use-polling"
 import { useTelemetryLease } from "@/hooks/use-telemetry-lease"
 import { api, formatError } from "@/lib/api"
+import { appendSample } from "@/lib/telemetry-chart"
 import {
   formatMwh,
   formatRuntime,
@@ -41,6 +42,8 @@ export function PowerView() {
   const [busyId, setBusyId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
+  // Full load: history and profiles change rarely, so they are fetched on open,
+  // on a manual refresh and when a profile changes — not on every live tick.
   const refresh = useCallback(async () => {
     try {
       const [v, history, p] = await Promise.all([
@@ -49,7 +52,7 @@ export function PowerView() {
         api.optimizerListProfiles(),
       ])
       setView(v)
-      setSamples(history)
+      setSamples(appendSample(history, v.lastSample, HISTORY_LIMIT))
       setProfiles(p)
       setError(null)
     } catch (e) {
@@ -59,10 +62,22 @@ export function PowerView() {
     }
   }, [])
 
+  // Live tick: one cheap call; the newest sample extends the chart locally.
+  const refreshLive = useCallback(async () => {
+    try {
+      const v = await api.optimizerBatteryTelemetry()
+      setView(v)
+      setSamples((current) => appendSample(current, v.lastSample, HISTORY_LIMIT))
+      setError(null)
+    } catch (e) {
+      setError(formatError(e))
+    }
+  }, [])
+
   useEffect(() => {
     void refresh()
   }, [refresh])
-  usePolling(refresh, 5_000)
+  usePolling(refreshLive, 5_000)
   useOptimizerEvents((event) => {
     if (event.kind === "profileChanged") void refresh()
   })
