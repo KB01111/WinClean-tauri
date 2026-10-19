@@ -7,6 +7,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// True for a ComputeAccelerator driver description that looks like an NPU
+/// (AMD XDNA, or a generic NPU/IPU such as Intel's).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn is_npu_description(desc: &str) -> bool {
+    let d = desc.to_ascii_lowercase();
+    ["xdna", "x-dna", "npu", "ipu"].iter().any(|needle| d.contains(needle))
+}
+
+/// Vendor-accurate label: only an XDNA device is called "AMD XDNA NPU".
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn npu_label(desc: &str) -> &'static str {
+    let d = desc.to_ascii_lowercase();
+    if d.contains("xdna") || d.contains("x-dna") { "AMD XDNA NPU" } else { "NPU" }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HardwareInfo {
@@ -151,7 +166,7 @@ mod win {
                 let sub = String::from_utf16_lossy(&nb[..nl as usize]);
                 let path = format!("{base}\\{sub}");
                 if let Some(desc) = reg_get_string(HKEY_LOCAL_MACHINE, &path, "DriverDesc") {
-                    if desc.to_ascii_lowercase().contains("x-dna") || desc.to_ascii_lowercase().contains("xDNA") || desc.to_ascii_lowercase().contains("npu") || desc.to_ascii_lowercase().contains("ipu") {
+                    if is_npu_description(&desc) {
                         found = Some(desc);
                         break;
                     }
@@ -164,9 +179,9 @@ mod win {
         match found {
             Some(name) => NpuInfo {
                 present: true,
+                note: format!("{} enumerated from the registry. Inference is NOT enabled until a Windows ML model + execution-provider driver check passes on this machine; CPU fallback remains active.", npu_label(&name)),
                 name: Some(name),
                 inference_verified: false,
-                note: "AMD XDNA NPU enumerated from the registry. Inference is NOT enabled until a Windows ML model + VitisAI EP driver check passes on this machine; CPU fallback remains active.".into(),
             },
             None => NpuInfo {
                 present: false,
@@ -225,6 +240,17 @@ mod tests {
     fn adapter_classification() {
         assert_eq!(classify_adapter("AMD Radeon 890M Graphics"), "igpu");
         assert_eq!(classify_adapter("NVIDIA GeForce RTX 4070 Laptop GPU"), "dgpu");
+    }
+    #[test]
+    fn npu_detection_is_vendor_accurate() {
+        // The old matcher lowercased the text and then looked for "xDNA",
+        // which could never match.
+        assert!(is_npu_description("AMD IPU Device"));
+        assert!(is_npu_description("NPU Compute Accelerator Device"));
+        assert!(is_npu_description("AMD XDNA Neural Processing Unit"));
+        assert!(!is_npu_description("Microsoft Basic Display Adapter"));
+        assert_eq!(npu_label("AMD XDNA Neural Processing Unit"), "AMD XDNA NPU");
+        assert_eq!(npu_label("Intel(R) AI Boost NPU"), "NPU");
     }
     #[test]
     fn hx370_note() {
