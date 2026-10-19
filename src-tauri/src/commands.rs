@@ -981,6 +981,23 @@ fn rollback_profile_ecoqos(db: &Database, payload: &serde_json::Value, snapshot_
     };
     let (enabled, restored) = (list("ecoQosEnabled", "ecoqos:on"), list("ecoQosRestored", "ecoqos:off"));
     if enabled.is_empty() && restored.is_empty() { return None; }
+    // Only undo throttles WinClean still owns. A later manual Restore, or
+    // EcoQoS another app set afterwards, must not be cleared by rolling back
+    // an old profile. Unowned entries are skipped without holding the
+    // rollback open; an unreadable ownership record does hold it open.
+    let enabled = if enabled.is_empty() {
+        enabled
+    } else {
+        match owned_ecoqos_candidates(db) {
+            Ok(owned) => enabled.into_iter()
+                .filter(|(n, p, _)| owned.iter().any(|(on, op, _)| op == p && on.eq_ignore_ascii_case(n)))
+                .collect(),
+            Err(e) => return Some((format!("could not read which throttles WinClean still owns ({e}); EcoQoS left unchanged"), enabled.len())),
+        }
+    };
+    if enabled.is_empty() && restored.is_empty() {
+        return Some(("no throttles from this profile are still owned by WinClean".to_string(), 0));
+    }
     let (mut parts, mut incomplete) = (Vec::new(), 0usize);
     if !enabled.is_empty() {
         let outcome = restore_ecoqos(db, enabled, "rollback of power profile", None);
@@ -1116,6 +1133,33 @@ mod optimizer_tests {
         // Snapshots written before sinceMs existed still load.
         let old: EcoQosTouched = serde_json::from_str(r#"{"pid":9,"name":"Old.exe"}"#).unwrap();
         assert_eq!(old.since_ms, None);
+    }
+
+    #[test]
+    fn rollback_only_restores_throttles_winclean_still_owns() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(&temp.path().join("index.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let snapshot_id = db.insert_optimizer_snapshot("powerScheme", "Balanced", "{}").unwrap();
+        let audit = |target: &str, action: &str| {
+            db.insert_optimizer_audit("process", target, action, "completed", None, Some(snapshot_id)).unwrap();
+        };
+        // The profile throttled both; the user then restored one by hand.
+        audit("Owned.exe (10)", "ecoqos:on");
+        audit("Restored.exe (11)", "ecoqos:on");
+        db.insert_optimizer_audit("process", "Restored.exe (11)", "ecoqos:off", "completed", None, None).unwrap();
+        let payload = serde_json::json!({});
+
+        // Restored.exe is no longer owned, so only Owned.exe is attempted. Off
+        // Windows its liveness is unknown, so that one counts as incomplete.
+        let (_, incomplete) = rollback_profile_ecoqos(&db, &payload, snapshot_id, 0).unwrap();
+        assert_eq!(incomplete, 1);
+
+        // With nothing owned, nothing is touched and the rollback can finish.
+        db.insert_optimizer_audit("process", "Owned.exe (10)", "ecoqos:off", "completed", None, None).unwrap();
+        let (summary, incomplete) = rollback_profile_ecoqos(&db, &payload, snapshot_id, 0).unwrap();
+        assert_eq!(incomplete, 0);
+        assert!(summary.contains("no throttles"));
     }
 
     #[test]
