@@ -20,7 +20,7 @@ use super::capabilities::{capability_report, windows_build, CapabilityReport};
 use super::ecoqos::now_ms;
 use super::hardware::{hardware_info, hardware_info_refresh, HardwareInfo};
 use super::helper_client::HelperStatus;
-use super::mcp::{self, McpDiscovery};
+use super::mcp;
 use super::measure::{compare_windows, MeasurementResult};
 use super::orchestrator::{self, Ctx, ErrorKind, OptError, Origin, ProfileOutcome, ServiceApplyOutcome};
 use super::policy::PowerProfile;
@@ -389,76 +389,154 @@ pub async fn optimizer_capabilities(model_path: Option<String>) -> CmdResult<Cap
 }
 
 // ---------------------------------------------------------------------------
-// MCP integrations
+// Windows MCP integration (optional, preview)
 // ---------------------------------------------------------------------------
 
-/// Lists MCP servers registered with the Windows On-device Agent Registry
-/// (`odr.exe mcp list`, read-only).
+fn mcp_error(f: mcp::service::McpFailure) -> CommandError {
+    let code = match f.kind {
+        mcp::service::FailureKind::NotAuthorised | mcp::service::FailureKind::IdentityNotVerified => ErrorKind::Rejected,
+        _ => ErrorKind::Failed,
+    };
+    CommandError { code, message: f.message }
+}
+
+/// Copilot+ status by specification (never measured); gates semantic search.
+fn copilot_plus_by_spec() -> bool {
+    capability_report(None).map(|r| r.copilot_plus.status == super::capabilities::CopilotPlusKind::BySpec).unwrap_or(false)
+}
+
+fn audit_mcp(db: &Database, target: &str, action: &str, ok: bool, detail: &str) {
+    // Paths and search text are user data and are deliberately not stored in the audit trail.
+    let _ = db.insert_optimizer_audit("mcp", target, action, if ok { "completed" } else { "failed" }, Some(detail), None);
+}
+
+/// Windows MCP status. Discovery only: runs `odr.exe list` (read-only, cached
+/// for 30 s unless `refresh`) and never connects to or starts a server.
 #[tauri::command(async)]
-pub async fn optimizer_mcp_discover() -> CmdResult<McpDiscovery> {
-    blocking(|| Ok(mcp::discover(&mcp::SystemRunner, windows_build()))).await
+pub async fn optimizer_mcp_status(state: State<'_, OptimizerState>, refresh: Option<bool>) -> CmdResult<mcp::McpStatus> {
+    let (mcp, cancel) = (state.mcp.clone(), state.begin_mcp_operation());
+    blocking(move || Ok(mcp.status(windows_build(), copilot_plus_by_spec(), refresh.unwrap_or(false), &cancel))).await
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpProbe {
-    pub server_info: serde_json::Value,
-    pub tools: Vec<mcp::McpToolInfo>,
-}
-
-fn valid_server_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 200 && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-/// Starts a registered server through `odr.exe mcp run`, performs the MCP
-/// handshake and lists its tools with WinClean's policy for each. No tool is called.
+/// User-initiated: connect to the verified File Explorer connector, perform
+/// the MCP handshake and read its live tool list and schemas. No tool is called.
 #[tauri::command(async)]
-pub async fn optimizer_mcp_probe(app: State<'_, AppState>, server_id: String) -> CmdResult<McpProbe> {
-    if !valid_server_id(&server_id) {
-        return Err(OptError::rejected("server ids contain only letters, digits, '.', '_' and '-'").into());
-    }
-    let db = app.db.clone();
+pub async fn optimizer_mcp_verify(app: State<'_, AppState>, state: State<'_, OptimizerState>) -> CmdResult<mcp::McpStatus> {
+    let (mcp, cancel, db) = (state.mcp.clone(), state.begin_mcp_operation(), app.db.clone());
     blocking(move || {
-        let outcome = (|| {
-            let mut session = mcp::McpSession::spawn("odr.exe", &["mcp".into(), "run".into(), server_id.clone()], std::time::Duration::from_secs(15))?;
-            let server_info = session.initialize()?;
-            let tools = session.list_tools()?;
-            Ok::<_, String>(McpProbe { server_info, tools })
-        })();
-        let (status, detail) = match &outcome {
-            Ok(p) => ("completed", format!("handshake ok, {} tool(s) listed", p.tools.len())),
-            Err(e) => ("failed", e.clone()),
+        let status = mcp.verify_connection(windows_build(), copilot_plus_by_spec(), &cancel);
+        let (ok, detail) = match &status.file_explorer {
+            Some(fe) => (fe.connection == mcp::service::ConnectionState::Connected, format!("{:?}", fe.connection)),
+            None => (false, "connector not found or not verified".to_string()),
         };
-        let _ = db.insert_optimizer_audit("mcp", &server_id, "probe", status, Some(&detail), None);
-        outcome.map_err(CommandError::from)
+        audit_mcp(&db, "file-explorer", "verify-connection", ok, &detail);
+        Ok(status)
     })
     .await
 }
 
-/// Reads one file's *metadata* through the File Explorer connector — the only
-/// MCP call WinClean makes. The tool and the path are policy-checked before
-/// anything is sent; Windows shows its own consent prompt if needed.
+/// User-initiated: asks Windows to create the agent user account that
+/// contained MCP servers run as (`odr.exe mcp provision-agent-user`). This
+/// changes the system, so it is never done automatically.
 #[tauri::command(async)]
-pub async fn optimizer_mcp_file_details(app: State<'_, AppState>, server_id: String, path: String) -> CmdResult<serde_json::Value> {
-    if !valid_server_id(&server_id) {
-        return Err(OptError::rejected("server ids contain only letters, digits, '.', '_' and '-'").into());
-    }
-    let args = serde_json::json!({ "path": path });
-    mcp::check_call("get_file_details", &args).map_err(|e| CommandError::from(OptError::rejected(e)))?;
-    let db = app.db.clone();
+pub async fn optimizer_mcp_provision_agent_user(app: State<'_, AppState>, state: State<'_, OptimizerState>) -> CmdResult<String> {
+    let (mcp, cancel, db) = (state.mcp.clone(), state.begin_mcp_operation(), app.db.clone());
     blocking(move || {
-        let outcome = (|| {
-            let mut session = mcp::McpSession::spawn("odr.exe", &["mcp".into(), "run".into(), server_id.clone()], std::time::Duration::from_secs(20))?;
-            session.initialize()?;
-            session.call_tool("get_file_details", args)
-        })();
-        // The path is user data and is deliberately not stored in the audit trail.
-        let (status, detail) = match &outcome {
-            Ok(_) => ("completed", "get_file_details (metadata only)".to_string()),
-            Err(e) => ("failed", e.clone()),
+        let result = mcp.provision_agent_user(windows_build(), &cancel);
+        audit_mcp(&db, "odr", "provision-agent-user", result.is_ok(), result.as_ref().map(|s| s.as_str()).unwrap_or_else(|e| e.message.as_str()));
+        result.map_err(mcp_error)
+    })
+    .await
+}
+
+/// Stops whichever Windows MCP operation is running (the server process tree is killed).
+#[tauri::command]
+pub fn optimizer_mcp_cancel(state: State<'_, OptimizerState>) {
+    state.mcp_cancel.lock().unwrap_or_else(|p| p.into_inner()).store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Folders the user has authorised for Windows MCP search (empty by default).
+#[tauri::command]
+pub fn optimizer_mcp_search_roots(app: State<'_, AppState>) -> Vec<String> {
+    mcp::roots::list(&app.db)
+}
+
+#[tauri::command]
+pub fn optimizer_mcp_add_search_root(app: State<'_, AppState>, path: String) -> CmdResult<Vec<String>> {
+    let roots = mcp::roots::add(&app.db, &path, &mcp::roots::RealFs).map_err(|e| CommandError::from(OptError::rejected(e)))?;
+    audit_mcp(&app.db, "search-roots", "authorise-folder", true, &format!("{} folder(s) authorised", roots.len()));
+    Ok(roots)
+}
+
+#[tauri::command]
+pub fn optimizer_mcp_remove_search_root(app: State<'_, AppState>, path: String) -> CmdResult<Vec<String>> {
+    let roots = mcp::roots::remove(&app.db, &path).map_err(|e| CommandError::from(OptError::rejected(e)))?;
+    audit_mcp(&app.db, "search-roots", "revoke-folder", true, &format!("{} folder(s) authorised", roots.len()));
+    Ok(roots)
+}
+
+/// Asks the connector to list one authorised folder: proof that Windows granted
+/// access and that a tool really executed. User-initiated.
+#[tauri::command(async)]
+pub async fn optimizer_mcp_verify_permission(app: State<'_, AppState>, state: State<'_, OptimizerState>, folder: String) -> CmdResult<mcp::McpStatus> {
+    let (mcp, cancel, db) = (state.mcp.clone(), state.begin_mcp_operation(), app.db.clone());
+    blocking(move || {
+        let roots = mcp::roots::list(&db);
+        let result = mcp.verify_permission(windows_build(), copilot_plus_by_spec(), &folder, &roots, &cancel);
+        audit_mcp(&db, "file-explorer:get_directories", "verify-permission", result.is_ok(), result.as_ref().map(|_| "granted").unwrap_or_else(|e| e.message.as_str()));
+        result.map_err(mcp_error)
+    })
+    .await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpSearchArgs {
+    pub starting_dir: String,
+    pub patterns: String,
+    #[serde(default)]
+    pub file_types: Vec<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    #[serde(default)]
+    pub semantic: bool,
+    #[serde(default)]
+    pub include_snippets: bool,
+    pub limit: Option<usize>,
+}
+
+/// A user-initiated Windows MCP search inside an authorised folder. Results
+/// are untrusted: validated, cleaned and bounded; snippets are off unless asked for.
+#[tauri::command(async)]
+pub async fn optimizer_mcp_search(app: State<'_, AppState>, state: State<'_, OptimizerState>, args: McpSearchArgs) -> CmdResult<mcp::service::SearchOutcome> {
+    let (mcp, cancel, db) = (state.mcp.clone(), state.begin_mcp_operation(), app.db.clone());
+    blocking(move || {
+        let roots = mcp::roots::list(&db);
+        let req = mcp::policy::SearchRequest {
+            starting_dir: args.starting_dir,
+            patterns: args.patterns,
+            file_types: args.file_types,
+            start_date: args.start_date,
+            end_date: args.end_date,
+            semantic: if args.semantic { mcp::policy::Semantic::Requested } else { mcp::policy::Semantic::Off },
         };
-        let _ = db.insert_optimizer_audit("mcp", &format!("{server_id}:get_file_details"), "call", status, Some(&detail), None);
-        outcome.map_err(CommandError::from)
+        let result = mcp.search(windows_build(), copilot_plus_by_spec(), &req, &roots, args.include_snippets, args.limit.unwrap_or(100), &cancel);
+        audit_mcp(&db, "file-explorer:search_files", "search", result.is_ok(), result.as_ref().map(|r| format!("{} result(s)", r.hits.len())).unwrap_or_else(|e| e.message.clone()).as_str());
+        result.map_err(mcp_error)
+    })
+    .await
+}
+
+/// Metadata for one file inside an authorised folder (`get_file_details`).
+#[tauri::command(async)]
+pub async fn optimizer_mcp_file_details(app: State<'_, AppState>, state: State<'_, OptimizerState>, path: String) -> CmdResult<serde_json::Value> {
+    let (mcp, cancel, db) = (state.mcp.clone(), state.begin_mcp_operation(), app.db.clone());
+    blocking(move || {
+        let roots = mcp::roots::list(&db);
+        let result = mcp.file_details(windows_build(), &path, &roots, &cancel);
+        // The path is user data and is deliberately not stored in the audit trail.
+        audit_mcp(&db, "file-explorer:get_file_details", "call", result.is_ok(), "get_file_details (metadata only)");
+        result.map_err(mcp_error)
     })
     .await
 }

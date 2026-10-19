@@ -730,7 +730,7 @@ impl Database {
             params![
                 run_id,
                 extension,
-                min_size as i64,
+                clamp_i64(min_size),
                 query,
                 limit.clamp(1, 1000)
             ],
@@ -904,14 +904,14 @@ impl Database {
         let mut bindings = vec![run_id];
         if min_size > 0 {
             sql.push_str(&format!(" AND size >= ?{}", bindings.len() + 1));
-            bindings.push(min_size as i64);
+            bindings.push(clamp_i64(min_size));
         }
         if min_age_days > 0 {
             sql.push_str(&format!(
                 " AND (modified_at_ms IS NULL OR modified_at_ms <= ?{})",
                 bindings.len() + 1
             ));
-            bindings.push(unix_millis() - (min_age_days as i64) * 86_400_000);
+            bindings.push(age_cutoff_ms(min_age_days));
         }
         sql.push_str(&format!(
             " ORDER BY size DESC, path ASC LIMIT ?{}",
@@ -936,6 +936,23 @@ impl Database {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("read recommendation files")
+    }
+
+    /// Folders (from the scan index) that contain a project marker such as
+    /// `.git`, `package.json`, `Cargo.toml` or a `*.sln` — the roots of source-code projects.
+    pub fn project_marker_dirs(&self, run_id: i64) -> anyhow::Result<Vec<String>> {
+        use crate::storage_policy::{PROJECT_MARKER_EXTENSIONS, PROJECT_MARKER_NAMES};
+        let quote = |items: &[&str]| items.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+        // The lists are compile-time constants made of plain file names, never user input.
+        let sql = format!(
+            "SELECT DISTINCT parent_path FROM file_entries WHERE scan_run_id = ?1 AND parent_path IS NOT NULL AND (LOWER(name) IN ({}) OR (is_directory = 0 AND LOWER(COALESCE(extension, '')) IN ({}))) LIMIT 100000",
+            quote(PROJECT_MARKER_NAMES),
+            quote(PROJECT_MARKER_EXTENSIONS)
+        );
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read project marker folders")
     }
 
     pub fn duplicate_name_size_keys(
@@ -963,7 +980,7 @@ impl Database {
             HAVING COUNT(*) > 1
             "#,
         )?;
-        let rows = stmt.query_map(params![run_id, min_size as i64], |row| {
+        let rows = stmt.query_map(params![run_id, clamp_i64(min_size)], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
         })?;
         rows.collect::<rusqlite::Result<HashSet<_>>>()
@@ -1328,7 +1345,7 @@ impl Database {
         min_age_days: u64,
         limit: u32,
     ) -> anyhow::Result<Vec<FileSearchResult>> {
-        let cutoff_ms = unix_millis() - (min_age_days as i64) * 86_400_000;
+        let cutoff_ms = age_cutoff_ms(min_age_days);
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             r#"
@@ -1345,7 +1362,7 @@ impl Database {
             "#,
         )?;
         let rows = stmt.query_map(
-            params![run_id, min_size as i64, cutoff_ms, limit.clamp(1, 500)],
+            params![run_id, clamp_i64(min_size), cutoff_ms, limit.clamp(1, 500)],
             |row| {
                 Ok(FileSearchResult {
                     id: row.get(0)?,
@@ -1525,4 +1542,15 @@ pub(crate) fn unix_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+/// A `u64` for SQLite's signed integers: huge values saturate instead of wrapping negative.
+fn clamp_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Modification-time cutoff for "older than N days"; absurd values mean "nothing is that old", not "everything is".
+fn age_cutoff_ms(days: u64) -> i64 {
+    let span = i64::try_from(days).unwrap_or(i64::MAX).saturating_mul(86_400_000);
+    unix_millis().saturating_sub(span)
 }

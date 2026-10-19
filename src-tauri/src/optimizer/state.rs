@@ -68,12 +68,24 @@ pub struct OptimizerState {
     pub backends: Backends,
     pub helper: Arc<HelperManager>,
     pub plans: PlanStore,
+    /// Windows MCP (optional, preview). Servers only run during an operation.
+    pub mcp: Arc<super::mcp::McpManager>,
+    /// Cancellation flag of the Windows MCP operation currently running.
+    pub mcp_cancel: Mutex<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl OptimizerState {
     pub fn system() -> Self {
         let helper = Arc::new(HelperManager::new(super::helper_windows::system_launcher()));
-        Self { backends: Backends::system(helper.clone()), helper, plans: PlanStore::default() }
+        Self { backends: Backends::system(helper.clone()), helper, plans: PlanStore::default(), mcp: Arc::new(super::mcp::McpManager::system()), mcp_cancel: Mutex::new(Arc::default()) }
+    }
+
+    /// Starts a new Windows MCP operation: returns a fresh cancellation flag
+    /// and makes it the one `optimizer_mcp_cancel` trips.
+    pub fn begin_mcp_operation(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self.mcp_cancel.lock().unwrap_or_else(|p| p.into_inner()) = flag.clone();
+        flag
     }
 }
 

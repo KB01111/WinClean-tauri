@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cleanup::{cleanup_candidate_id, cleanup_reason, is_protected_path, CleanupRisk},
     db::{CleanupFileRecord, Database},
+    storage_policy::{is_document_type, StoragePolicy},
 };
 
 const LARGE_FILE_BYTES: u64 = 100 * 1024 * 1024;
@@ -88,12 +89,13 @@ pub fn build_recommendations(
     let records = db.recommendation_file_records(scan_run_id, min_size, min_age_days, 20_000)?;
     let truncated = records.len() >= 20_000;
     let duplicate_keys = db.duplicate_name_size_keys(scan_run_id, DUPLICATE_REVIEW_BYTES)?;
+    let policy = StoragePolicy::load(db, scan_run_id)?;
     let mode = filters.mode.as_deref().map(str::to_ascii_lowercase);
     let only_offload = filters.only_offload_eligible.unwrap_or(false);
 
     let mut candidates = records
         .into_iter()
-        .filter_map(|record| recommendation_candidate(scan_run_id, record, &duplicate_keys))
+        .filter_map(|record| recommendation_candidate(scan_run_id, record, &duplicate_keys, &policy))
         .filter(|candidate| {
             if candidate.size < min_size {
                 return false;
@@ -183,11 +185,18 @@ fn recommendation_candidate(
     scan_run_id: i64,
     record: CleanupFileRecord,
     duplicate_keys: &HashSet<(String, u64)>,
+    policy: &StoragePolicy,
 ) -> Option<RecommendationCandidate> {
     if record.is_reparse_point || record.is_placeholder || record.is_system {
         return None;
     }
     if is_protected_path(&record.path) {
+        return None;
+    }
+    // Source-code projects, cloud-synced folders, databases/VM disks/key material and
+    // user-excluded locations are never candidates. Documents are only offered by the
+    // explicit "old file in Downloads" rule below.
+    if policy.check_with(&record.path, record.extension.as_deref(), true).is_some() {
         return None;
     }
 
@@ -206,7 +215,8 @@ fn recommendation_candidate(
         ));
     }
 
-    if let Some(reason) = offload_reason(&record, age_days) {
+    let document = record.extension.as_deref().map(is_document_type).unwrap_or(false);
+    if let Some(reason) = offload_reason(&record, age_days).filter(|r| !document || r == "Old file in Downloads") {
         return Some(candidate(
             scan_run_id,
             record,

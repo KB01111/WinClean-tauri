@@ -4,9 +4,11 @@ pub mod commands;
 pub mod db;
 pub mod db_optimizer;
 pub mod offload;
+pub mod pathutil;
 pub mod recommendations;
 pub mod reports;
 pub mod scan;
+pub mod storage_policy;
 pub mod volume;
 
 use tauri::Manager;
@@ -112,8 +114,15 @@ pub fn run() {
             optimizer::commands::optimizer_measurement_list,
             optimizer::commands::optimizer_hardware_info,
             optimizer::commands::optimizer_capabilities,
-            optimizer::commands::optimizer_mcp_discover,
-            optimizer::commands::optimizer_mcp_probe,
+            optimizer::commands::optimizer_mcp_status,
+            optimizer::commands::optimizer_mcp_verify,
+            optimizer::commands::optimizer_mcp_provision_agent_user,
+            optimizer::commands::optimizer_mcp_cancel,
+            optimizer::commands::optimizer_mcp_search_roots,
+            optimizer::commands::optimizer_mcp_add_search_root,
+            optimizer::commands::optimizer_mcp_remove_search_root,
+            optimizer::commands::optimizer_mcp_verify_permission,
+            optimizer::commands::optimizer_mcp_search,
             optimizer::commands::optimizer_mcp_file_details,
             optimizer::commands::optimizer_history,
             optimizer::commands::optimizer_rollback,
