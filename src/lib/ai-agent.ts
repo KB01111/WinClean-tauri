@@ -10,29 +10,9 @@ import OpenAI from "openai"
 import { z } from "zod"
 
 import { api } from "@/lib/api"
-
-export const AI_MODELS = [
-  "gpt-5.1",
-  "gpt-5",
-  "gpt-5-mini",
-  "gpt-4.1",
-  "gpt-4.1-mini",
-] as const
-
-const AI_MODEL_STORAGE_KEY = "winclean-ai-model"
-const DEFAULT_AI_MODEL = "gpt-5-mini"
-
-export function getStoredAiModel(): string {
-  const stored = localStorage.getItem(AI_MODEL_STORAGE_KEY)
-  if (stored && (AI_MODELS as readonly string[]).includes(stored)) {
-    return stored
-  }
-  return DEFAULT_AI_MODEL
-}
-
-export function setStoredAiModel(model: string) {
-  localStorage.setItem(AI_MODEL_STORAGE_KEY, model)
-}
+import { OPENAI_BASE_URL, validateEndpoint, validateLocalBaseUrl, type AiEndpoint } from "@/lib/ai-config"
+import { buildOptimizerTools } from "@/lib/ai-tools"
+import { systemReportSchema, type SystemReport } from "@/lib/ai-proposals"
 
 const suggestionSchema = z.object({
   title: z.string().describe("Short, friendly title for the suggestion"),
@@ -68,7 +48,7 @@ function toMb(bytes: number) {
   return Math.round((bytes / (1024 * 1024)) * 10) / 10
 }
 
-/** Build scan-scoped storage tools and read-only optimizer tools for the AI analyst. */
+/** Build scan-scoped, read-only storage tools for the AI storage analyst. */
 function buildTools(runId: number) {
   const getScanSummary = tool({
     name: "get_scan_summary",
@@ -199,88 +179,9 @@ function buildTools(runId: number) {
     },
   })
 
-  return [
-    getScanSummary,
-    getTopDirectories,
-    getLargestFiles,
-    getStaleLargeFiles,
-    getRecommendations,
-    // WinClean 2.0 read-only optimizer tools (defined below via buildOptimizerTools)
-    ...buildOptimizerTools(),
-  ]
+  return [getScanSummary, getTopDirectories, getLargestFiles, getStaleLargeFiles, getRecommendations]
 }
 
-/** Build read-only service, process, power, and hardware tools for the AI analyst. */
-function buildOptimizerTools() {
-  const getServices = tool({
-    name: "get_services",
-    description:
-      "READ-ONLY. Windows services with start type, state, risk and recommendation. Protected services must never be suggested for change.",
-    parameters: z.object({}),
-    /** Serialize up to 300 services with their current state and risk recommendations. */
-    execute: async () => {
-      const services = await api.optimizerListServices()
-      return JSON.stringify(
-        services.slice(0, 300).map((s) => ({
-          name: s.name,
-          displayName: s.displayName,
-          state: s.state,
-          startType: s.startType,
-          risk: s.classification.risk,
-          recommendation: s.classification.recommendation,
-        }))
-      )
-    },
-  })
-  const getProcesses = tool({
-    name: "get_processes",
-    description:
-      "READ-ONLY. Top processes by memory with CPU %, foreground flag and EcoQoS decision.",
-    parameters: z.object({}),
-    /** Serialize resource usage and EcoQoS decisions for the first 60 processes returned by the backend. */
-    execute: async () => {
-      const processes = await api.optimizerListProcesses()
-      return JSON.stringify(
-        processes.slice(0, 60).map((p) => ({
-          pid: p.pid,
-          name: p.name,
-          workingSetMb: p.workingSetMb,
-          cpuPercent: p.cpuPercentRecent,
-          ecoDecision: p.ecoDecision,
-        }))
-      )
-    },
-  })
-  const getPowerStatus = tool({
-    name: "get_power_status",
-    description:
-      "READ-ONLY. Battery percent, AC/DC state, active power scheme, power-history sample count.",
-    parameters: z.object({}),
-    /** Serialize battery telemetry and the number of recent power samples returned by the backend. */
-    execute: async () => {
-      const [battery, history] = await Promise.all([
-        api.optimizerBatteryStatus(),
-        api.optimizerPowerHistory(50),
-      ])
-      return JSON.stringify({ battery, samples: history.length })
-    },
-  })
-  const getHardware = tool({
-    name: "get_hardware",
-    description:
-      "READ-ONLY. CPU, display adapters (registry-only, never wakes the RTX 4070), NPU and Windows ML / MCP capabilities.",
-    parameters: z.object({}),
-    /** Serialize hardware discovery and Windows ML and MCP capability information. */
-    execute: async () => {
-      const [hardware, capabilities] = await Promise.all([
-        api.optimizerHardwareInfo(),
-        api.optimizerCapabilities(),
-      ])
-      return JSON.stringify({ hardware, capabilities })
-    },
-  })
-  return [getServices, getProcesses, getPowerStatus, getHardware]
-}
 const INSTRUCTIONS = `You are WinClean's storage analyst. You help Windows users understand what is
 using their disk space and what they can safely clean up or offload to Google Drive.
 
@@ -290,10 +191,6 @@ Process:
 3. Optionally call get_largest_files / get_stale_large_files for extra context.
 4. Produce a short, friendly summary and 2-6 concrete suggestions.
 
-Optimizer rules:
-- get_services / get_processes / get_power_status / get_hardware are READ-ONLY. You cannot change services, processes or power schemes.
-- Never suggest changing a protected service or throttling a protected/foreground process. Any service suggestion must name a service returned by get_services and is validated deterministically before the user can approve it.
-
 Rules:
 - Suggestions must only reference candidate ids returned by get_recommendations.
 - Group related candidates into one suggestion (e.g. "Old installers in Downloads").
@@ -301,24 +198,42 @@ Rules:
 - Prefer high-impact, low-risk wins first. Never invent files or ids.
 - Be concise and avoid technical jargon.`
 
+/** Point the Agents SDK at OpenAI or at a validated loopback OpenAI-compatible server. */
+function configureClient(apiKey: string, endpoint: AiEndpoint) {
+  const problem = validateEndpoint(endpoint)
+  if (problem) {
+    throw new Error(problem)
+  }
+  setTracingDisabled(true)
+  setOpenAIAPI("chat_completions")
+  if (endpoint.kind === "local") {
+    const checked = validateLocalBaseUrl(endpoint.baseUrl)
+    if (!checked.ok) {
+      throw new Error(checked.error)
+    }
+    // A local server needs no key; the SDK still wants a non-empty string.
+    setDefaultOpenAIClient(new OpenAI({ apiKey: "local", baseURL: checked.url, dangerouslyAllowBrowser: true }))
+  } else {
+    setDefaultOpenAIClient(new OpenAI({ apiKey, baseURL: OPENAI_BASE_URL, dangerouslyAllowBrowser: true }))
+  }
+}
+
 export async function analyzeScanWithAi({
   apiKey,
   model,
   runId,
+  endpoint,
 }: {
   apiKey: string
   model: string
   runId: number
+  endpoint: AiEndpoint
 }): Promise<AiReport> {
-  setTracingDisabled(true)
-  setOpenAIAPI("chat_completions")
-  setDefaultOpenAIClient(
-    new OpenAI({ apiKey, dangerouslyAllowBrowser: true })
-  )
+  configureClient(apiKey, endpoint)
 
   const agent = new Agent({
     name: "WinClean storage analyst",
-    model,
+    model: endpoint.kind === "local" ? endpoint.localModel : model,
     instructions: INSTRUCTIONS,
     tools: buildTools(runId),
     outputType: reportSchema,
@@ -328,6 +243,52 @@ export async function analyzeScanWithAi({
     agent,
     "Analyze the selected scan and recommend what to clean and what to offload to Google Drive."
   )
+  const report = result.finalOutput
+  if (!report) {
+    throw new Error("The AI assistant did not return a report. Try again.")
+  }
+  return report
+}
+
+const SYSTEM_INSTRUCTIONS = `You are WinClean's Windows 11 optimization analyst for an ASUS ROG Zephyrus G16
+(AMD Ryzen AI 9 HX 370, Radeon 890M, RTX 4070, AMD XDNA 2 NPU). You analyse services, processes,
+battery consumption, hardware activity and optimization opportunities using READ-ONLY tools.
+
+Process:
+1. Call get_workload, get_battery, get_hardware and get_profiles to understand the situation.
+2. Call get_service_recommendations first; call get_services and get_processes for evidence.
+3. Call get_capabilities only if local AI/NPU questions matter. Call get_optimization_history to avoid repeating work.
+4. Return a short summary, concrete findings backed by tool evidence, and optional proposals.
+
+Hard rules:
+- You can only PROPOSE. You cannot change anything. Every proposal is validated by deterministic code and the user must approve it explicitly before anything happens.
+- serviceProposals may only name services returned by get_services whose risk is NOT 'protected'. Prefer the exact changes from get_service_recommendations. Never propose disabling a service unless its canDisable is true.
+- Never propose anything for ASUS, AMD, NVIDIA, Windows Update, Defender, Windows Search, networking, audio or Copilot+ components.
+- profileProposal must use an id from get_profiles. Do not propose a profile that fights the current workload (for example Battery Saver while gaming).
+- Battery figures can be null; say so instead of estimating. Never invent numbers.
+- The RTX 4070 may be powered down. Do not recommend anything that would wake it.
+- Be concise and avoid technical jargon in summaries.`
+
+export async function analyzeSystemWithAi({
+  apiKey,
+  model,
+  endpoint,
+}: {
+  apiKey: string
+  model: string
+  endpoint: AiEndpoint
+}): Promise<SystemReport> {
+  configureClient(apiKey, endpoint)
+
+  const agent = new Agent({
+    name: "WinClean optimization analyst",
+    model: endpoint.kind === "local" ? endpoint.localModel : model,
+    instructions: SYSTEM_INSTRUCTIONS,
+    tools: buildOptimizerTools(),
+    outputType: systemReportSchema,
+  })
+
+  const result = await run(agent, "Analyze this PC's efficiency and propose safe optimizations, if any are justified by the data.")
   const report = result.finalOutput
   if (!report) {
     throw new Error("The AI assistant did not return a report. Try again.")

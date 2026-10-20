@@ -1,5 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import * as React from "react"
+import { getCurrentWindow } from "@tauri-apps/api/window"
 
 type Theme = "dark" | "light" | "system"
 type ResolvedTheme = "dark" | "light"
@@ -138,6 +139,17 @@ export function ThemeProvider({
       mediaQuery.removeEventListener("change", handleChange)
     }
   }, [theme, applyTheme])
+
+  React.useEffect(() => {
+    // Keep the native title bar and the Mica backdrop in step with the app theme.
+    // Outside the Tauri shell (browser, tests) there is no window to update.
+    if (!("__TAURI_INTERNALS__" in window)) {
+      return
+    }
+    getCurrentWindow()
+      .setTheme(theme === "system" ? null : theme)
+      .catch(() => {})
+  }, [theme])
 
   React.useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {

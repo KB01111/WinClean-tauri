@@ -1,52 +1,48 @@
 import {
   BarChart3,
-  FolderTree,
-  HardDrive,
-  History,
-  Loader2,
-  Settings,
-  Sparkles,
-  Trash2,
   BatteryCharging,
   Cpu,
+  FolderTree,
+  Gauge,
+  HardDrive,
+  History,
   Leaf,
+  Loader2,
+  Plug,
   Server,
+  Settings,
+  SlidersHorizontal,
+  Sparkles,
+  Trash2,
   Undo2,
 } from "lucide-react"
 
 import { CapacityBar, NavButton } from "@/components/common"
 import { formatBytes, formatPercentUsed } from "@/lib/format"
 import type { VolumeInfo } from "@/lib/api"
+import { NAV_GROUPS, VIEW_META, isStorageView, type View } from "@/lib/views"
 import { cn } from "@/lib/utils"
 
-export type View =
-  | "overview"
-  | "explorer"
-  | "cleanup"
-  | "services"
-  | "processes"
-  | "power"
-  | "hardware"
-  | "optimizerHistory"
-  | "history"
-  | "insights"
-  | "settings"
+export type { View } from "@/lib/views"
 
-const NAV_ITEMS: { view: View; label: string; icon: typeof BarChart3 }[] = [
-  { view: "overview", label: "Overview", icon: BarChart3 },
-  { view: "explorer", label: "Explorer", icon: FolderTree },
-  { view: "cleanup", label: "Recover space", icon: Trash2 },
-  { view: "services", label: "Windows Services", icon: Server },
-  { view: "processes", label: "Processes & EcoQoS", icon: Leaf },
-  { view: "power", label: "Battery & Power", icon: BatteryCharging },
-  { view: "hardware", label: "Hardware & NPU", icon: Cpu },
-  { view: "optimizerHistory", label: "Optimization History", icon: Undo2 },
-  { view: "insights", label: "AI insights", icon: Sparkles },
-  { view: "history", label: "History", icon: History },
-  { view: "settings", label: "Settings", icon: Settings },
-]
+const ICONS: Record<View, typeof BarChart3> = {
+  system: Gauge,
+  overview: BarChart3,
+  explorer: FolderTree,
+  cleanup: Trash2,
+  services: Server,
+  processes: Leaf,
+  power: BatteryCharging,
+  hardware: Cpu,
+  profiles: SlidersHorizontal,
+  insights: Sparkles,
+  mcp: Plug,
+  optimizerHistory: Undo2,
+  history: History,
+  settings: Settings,
+}
 
-/** Render navigation, volume selection, capacity details, and scan controls for the application. */
+/** Render grouped navigation and, on storage views, the scan target picker. */
 export function Sidebar({
   view,
   onViewChange,
@@ -63,90 +59,71 @@ export function Sidebar({
   loadingVolumes: boolean
 }) {
   return (
-    <aside className="flex flex-col gap-6 border-r border-sidebar-border bg-sidebar p-4 text-sidebar-foreground">
+    <aside className="sticky top-0 flex h-svh flex-col gap-5 overflow-y-auto border-r border-sidebar-border bg-sidebar p-4 text-sidebar-foreground">
       <div className="flex items-center gap-3">
         <div className="flex size-10 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
           <HardDrive className="size-5" aria-hidden="true" />
         </div>
         <div>
           <h1 className="text-xl font-semibold tracking-tight">WinClean</h1>
-          <p className="text-xs text-muted-foreground">Local disk analyzer</p>
+          <p className="text-xs text-muted-foreground">Windows optimization suite</p>
         </div>
       </div>
 
-      <nav className="space-y-1">
-        {NAV_ITEMS.map((item) => (
-          <NavButton
-            key={item.view}
-            icon={item.icon}
-            label={item.label}
-            active={view === item.view}
-            onClick={() => onViewChange(item.view)}
-          />
+      <nav aria-label="Main" className="space-y-4">
+        {NAV_GROUPS.map((group) => (
+          <div key={group.id} role="group" aria-labelledby={`nav-${group.id}`}>
+            <p id={`nav-${group.id}`} className="mb-1 px-3 text-[0.68rem] font-semibold tracking-wider text-muted-foreground uppercase">
+              {group.label}
+            </p>
+            <div className="space-y-0.5">
+              {group.views.map((id) => (
+                <NavButton key={id} icon={ICONS[id]} label={VIEW_META[id].label} active={view === id} onClick={() => onViewChange(id)} />
+              ))}
+            </div>
+          </div>
         ))}
       </nav>
 
-      <div className="rounded-xl border border-sidebar-border bg-card p-3 shadow-sm">
-        <div className="mb-2 flex items-center justify-between">
-          <span className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-            Scan target
-          </span>
-          {loadingVolumes ? (
-            <Loader2 className="size-4 animate-spin text-primary" />
-          ) : null}
-        </div>
-        <div className="space-y-2">
-          {volumes.length === 0 && !loadingVolumes ? (
-            <p className="py-2 text-center text-xs text-muted-foreground">
-              No volumes detected
-            </p>
-          ) : null}
-          {volumes.map((volume) => {
-            const totalSpace = volume.totalSpace
-            const availableSpace = volume.availableSpace
-            const hasCapacity = totalSpace != null && availableSpace != null
-            return (
-              <button
-                type="button"
-                key={volume.rootPath}
-                onClick={() => onSelectRoot(volume.rootPath)}
-                aria-label={`Scan drive ${volume.rootPath}, ${formatPercentUsed(volume)}`}
-                className={cn(
-                  "flex w-full items-center gap-2 rounded-lg border p-2 text-left transition-colors",
-                  selectedRoot === volume.rootPath
-                    ? "border-primary/60 bg-accent"
-                    : "border-border bg-card hover:border-ring/50"
-                )}
-              >
-                <HardDrive
-                  className="size-4 shrink-0 text-primary"
-                  aria-hidden="true"
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-medium">
-                    {volume.rootPath}
+      {isStorageView(view) ? (
+        <div className="rounded-xl border border-sidebar-border bg-card p-3 shadow-sm">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">Scan target</span>
+            {loadingVolumes ? <Loader2 className="size-4 animate-spin text-primary" /> : null}
+          </div>
+          <div className="space-y-2">
+            {volumes.length === 0 && !loadingVolumes ? <p className="py-2 text-center text-xs text-muted-foreground">No volumes detected</p> : null}
+            {volumes.map((volume) => {
+              const hasCapacity = volume.totalSpace != null && volume.availableSpace != null
+              return (
+                <button
+                  type="button"
+                  key={volume.rootPath}
+                  onClick={() => onSelectRoot(volume.rootPath)}
+                  aria-label={`Scan drive ${volume.rootPath}, ${formatPercentUsed(volume)}`}
+                  aria-pressed={selectedRoot === volume.rootPath}
+                  className={cn(
+                    "flex w-full items-center gap-2 rounded-lg border p-2 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
+                    selectedRoot === volume.rootPath ? "border-primary/60 bg-accent" : "border-border bg-card hover:border-ring/50"
+                  )}
+                >
+                  <HardDrive className="size-4 shrink-0 text-primary" aria-hidden="true" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium">{volume.rootPath}</span>
+                    <span className="block truncate text-xs text-muted-foreground">
+                      {volume.fileSystem ?? "unknown"} · {formatPercentUsed(volume)}
+                      {volume.availableSpace != null ? ` · ${formatBytes(volume.availableSpace)} free` : null}
+                    </span>
+                    {hasCapacity ? (
+                      <CapacityBar className="mt-1.5" used={(volume.totalSpace ?? 0) - (volume.availableSpace ?? 0)} total={volume.totalSpace ?? 0} label={`${volume.rootPath} capacity`} />
+                    ) : null}
                   </span>
-                  <span className="block truncate text-xs text-muted-foreground">
-                    {volume.fileSystem ?? "unknown"} ·{" "}
-                    {formatPercentUsed(volume)}
-                    {volume.availableSpace != null
-                      ? ` · ${formatBytes(volume.availableSpace)} free`
-                      : null}
-                  </span>
-                  {hasCapacity ? (
-                    <CapacityBar
-                      className="mt-1.5"
-                      used={(volume.totalSpace ?? 0) - (volume.availableSpace ?? 0)}
-                      total={volume.totalSpace ?? 0}
-                      label={`${volume.rootPath} capacity`}
-                    />
-                  ) : null}
-                </span>
-              </button>
-            )
-          })}
+                </button>
+              )
+            })}
+          </div>
         </div>
-      </div>
+      ) : null}
     </aside>
   )
 }

@@ -1,12 +1,37 @@
 //! WinClean 2.0 optimizer: services, EcoQoS, power, hardware, capabilities.
 //! Safety policy lives in `policy` and is enforced by the command layer.
 
+pub mod auto_switch;
+pub mod backend;
+pub mod battery;
 pub mod capabilities;
+pub mod commands;
+pub mod ecoqos;
 pub mod hardware;
+pub mod helper_client;
+pub mod helper_protocol;
+pub mod helper_windows;
+pub mod mcp;
+pub mod mcp_server;
+pub mod measure;
+pub mod onnx_model;
+pub mod orchestrator;
 pub mod policy;
 pub mod power;
+pub mod power_events;
+pub mod privileged;
 pub mod processes;
+pub mod profiles;
+pub mod recovery;
+pub mod runtime;
+pub mod service_graph;
+pub mod service_plan;
 pub mod services;
+pub mod state;
+pub mod telemetry;
+pub mod topology;
+pub mod winml;
+pub mod workload;
 
 use serde::{Deserialize, Serialize};
 

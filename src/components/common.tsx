@@ -18,8 +18,9 @@ export function NavButton({
     <button
       type="button"
       onClick={onClick}
+      aria-current={active ? "page" : undefined}
       className={cn(
-        "flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-sm font-medium transition-colors",
+        "flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-sm font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
         active
           ? "bg-primary text-primary-foreground shadow-sm"
           : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
@@ -380,11 +381,16 @@ const STATUS_TONES: Record<string, string> = {
   uploaded_recycle_failed: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
   skipped: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
   failed: "bg-destructive/15 text-destructive",
+  pending: "bg-sky-500/15 text-sky-700 dark:text-sky-300",
+  partial: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+  rolledBack: "bg-muted text-muted-foreground",
+  stopped: "bg-muted text-muted-foreground",
+  paused: "bg-muted text-muted-foreground",
 }
 
 /** Render a status with readable spacing and a matching tone, defaulting to a neutral style. */
 export function StatusBadge({ status }: { status: string }) {
-  const text = status.replaceAll("_", " ")
+  const text = status.replaceAll("_", " ").replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()
   return (
     <span
       title={text}
@@ -408,5 +414,39 @@ export function TextInput(props: React.ComponentProps<"input">) {
         className
       )}
     />
+  )
+}
+
+export function SelectInput(props: React.ComponentProps<"select">) {
+  const { className, ...rest } = props
+  return (
+    <select
+      {...rest}
+      className={cn(
+        "h-9 rounded-md border border-input bg-card px-2 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40 disabled:opacity-50",
+        className
+      )}
+    />
+  )
+}
+
+/** Label + control + optional hint, stacked. */
+export function Field({
+  label,
+  hint,
+  children,
+  className,
+}: {
+  label: string
+  hint?: string
+  children: React.ReactNode
+  className?: string
+}) {
+  return (
+    <label className={cn("grid gap-1 text-sm", className)}>
+      <span className="font-medium">{label}</span>
+      {children}
+      {hint ? <span className="text-xs text-muted-foreground">{hint}</span> : null}
+    </label>
   )
 }

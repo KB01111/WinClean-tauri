@@ -65,8 +65,10 @@ pub fn build_cleanup_plan(
 ) -> anyhow::Result<CleanupPlan> {
     let records = db.cleanup_file_records(scan_run_id, 5000)?;
     let now_ms = unix_millis();
+    let policy = crate::storage_policy::StoragePolicy::load(db, scan_run_id)?;
     let mut candidates = records
         .into_iter()
+        .filter(|record| policy.check(&record.path, record.extension.as_deref()).is_none())
         .filter_map(|record| cleanup_candidate(scan_run_id, record, now_ms))
         .take(limit.clamp(1, 500) as usize)
         .collect::<Vec<_>>();
@@ -95,6 +97,8 @@ pub fn execute_cleanup_plan(
 ) -> anyhow::Result<CleanupExecutionResult> {
     let plan = build_cleanup_plan(db, scan_run_id, 500)?;
     let candidates = resolve_cleanup_candidates(&plan.candidates, candidate_ids)?;
+    // Exclusions can change between planning and execution, so the policy is read again here.
+    let policy = crate::storage_policy::StoragePolicy::load(db, scan_run_id)?;
 
     let mut actions = Vec::new();
     let mut recycled_count = 0;
@@ -118,7 +122,11 @@ pub fn execute_cleanup_plan(
             undo_token: None,
         })?;
 
-        match validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms) {
+        let checked = match policy.check(&candidate.path, None) {
+            Some(blocked) => Err(anyhow::anyhow!("{}", blocked.detail)),
+            None => validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms).and_then(|path| ensure_still_a_cleanup_category(&path).map(|_| path)),
+        };
+        match checked {
             Ok(path) => match recycle_file(&path) {
                 Ok(()) => {
                     recycled_count += 1;
@@ -169,6 +177,29 @@ pub fn execute_cleanup_plan(
         skipped_count,
         bytes_requested,
     })
+}
+
+/// The scan-time label is not trusted at execution time: the file the path
+/// resolves to *now* must still be of a category WinClean cleans (a swapped
+/// file or junction target keeps its old "Log file" label otherwise).
+pub fn ensure_still_a_cleanup_category(canonical: &Path) -> anyhow::Result<()> {
+    let name = canonical.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let extension = canonical.extension().map(|e| e.to_string_lossy().to_string());
+    let record = CleanupFileRecord {
+        id: 0,
+        path: canonical.to_string_lossy().to_string(),
+        name,
+        extension,
+        size: 0,
+        modified_at_ms: None,
+        is_reparse_point: false,
+        is_placeholder: false,
+        is_system: false,
+    };
+    if cleanup_reason(&record).is_none() {
+        anyhow::bail!("the file no longer matches a cleanup category: {}", canonical.display());
+    }
+    Ok(())
 }
 
 pub fn resolve_cleanup_candidates(
@@ -331,18 +362,34 @@ pub fn cleanup_reason(record: &CleanupFileRecord) -> Option<(String, CleanupRisk
 }
 
 pub fn is_protected_path(path: &str) -> bool {
-    let normalized = normalize_for_rules(path);
+    let mut normalized = normalize_for_rules(path);
+    // `\\?\C:\…` is the same location as `C:\…`; `\\?\UNC\…` is a network share (never ours to clean).
+    if let Some(rest) = normalized.strip_prefix("\\\\?\\") {
+        if rest.starts_with("unc\\") {
+            return true;
+        }
+        normalized = rest.to_string();
+    }
+    if normalized.starts_with("\\\\") {
+        return true; // UNC path
+    }
     let root_like = normalized.ends_with(":\\")
         || normalized.matches('\\').count() <= 1
         || PathBuf::from(path).parent().is_none();
-
-    root_like
-        || normalized.contains("\\windows\\")
-        || normalized.contains("\\program files\\")
-        || normalized.contains("\\program files (x86)\\")
-        || normalized.contains("\\programdata\\")
-        || normalized.contains("\\appdata\\")
-        || normalized.contains("\\appdata\\local\\microsoft\\windows\\")
+    if root_like {
+        return true;
+    }
+    // Compare with a trailing separator so `C:\Windows` itself is covered too.
+    let padded = format!("{normalized}\\");
+    const PROTECTED: &[&str] = &[
+        "\\windows\\", "\\windows.old\\", "\\program files\\", "\\program files (x86)\\", "\\programdata\\", "\\appdata\\",
+        "\\system volume information\\", "\\recovery\\", "\\boot\\", "\\msocache\\", "\\perflogs\\",
+    ];
+    if PROTECTED.iter().any(|p| padded.contains(p)) {
+        return true;
+    }
+    // Any component starting with `$` is a Windows system folder (`$Recycle.Bin`, `$Extend`, `$WINDOWS.~BT`, …).
+    normalized.split('\\').skip(1).any(|component| component.starts_with('$'))
 }
 
 fn normalize_for_rules(path: &str) -> String {
@@ -416,6 +463,9 @@ fn move_to_recycle_bin(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
     }
+    // Only fixed local drives have a Recycle Bin. On removable and network drives
+    // SHFileOperation would delete permanently without a prompt, so refuse.
+    ensure_fixed_drive(&canonical)?;
 
     let mut from = canonical
         .as_os_str()
@@ -439,6 +489,26 @@ fn move_to_recycle_bin(path: &Path) -> anyhow::Result<()> {
     }
     if operation.fAnyOperationsAborted != 0 {
         anyhow::bail!("Windows recycle operation was canceled");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_fixed_drive(canonical: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    /// `DRIVE_FIXED` from fileapi.h.
+    const DRIVE_FIXED: u32 = 3;
+
+    let text = canonical.to_string_lossy();
+    let trimmed = text.strip_prefix("\\\\?\\").unwrap_or(&text);
+    let root: String = trimmed.chars().take(3).collect();
+    if root.len() < 3 || !root.as_bytes()[0].is_ascii_alphabetic() || &root[1..] != ":\\" {
+        anyhow::bail!("cannot tell which drive holds {}; it was not recycled", canonical.display());
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(&root).encode_wide().chain(std::iter::once(0)).collect();
+    if unsafe { GetDriveTypeW(wide.as_ptr()) } != DRIVE_FIXED {
+        anyhow::bail!("{root} is not a fixed drive, so it has no Recycle Bin and the file was not removed");
     }
     Ok(())
 }

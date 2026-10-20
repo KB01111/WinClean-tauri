@@ -1,34 +1,59 @@
 import { useCallback, useEffect, useState } from "react"
-import { BatteryCharging, Loader2, RefreshCw, Zap } from "lucide-react"
+import { Loader2, RefreshCw } from "lucide-react"
 import { toast } from "sonner"
 
-import { Button } from "@/components/ui/button"
 import { EmptyState, Metric, Notice, Panel } from "@/components/common"
+import { PowerChart } from "@/components/optimizer/power-chart"
+import { ProfileButtons } from "@/components/optimizer/profile-buttons"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { useOptimizerEvents } from "@/hooks/use-optimizer-events"
+import { usePolling } from "@/hooks/use-polling"
+import { useTelemetryLease } from "@/hooks/use-telemetry-lease"
 import { api, formatError } from "@/lib/api"
-import type { BatteryStatus, OptimizerHistory, PowerSample } from "@/lib/optimizer"
-import { suggestProfile } from "@/lib/optimizer"
+import { appendSample } from "@/lib/telemetry-chart"
+import {
+  formatMwh,
+  formatRuntime,
+  formatWatts,
+  healthLabel,
+  suggestProfile,
+  type PowerProfile,
+  type ProfilesView,
+  type TelemetrySample,
+  type TelemetryView,
+} from "@/lib/optimizer"
 
-/** Display battery telemetry, recorded samples, and built-in power-profile actions. */
+const HISTORY_LIMIT = 240
+
+/**
+ * Battery & Power. Watts come from the battery's own reported discharge rate
+ * (IOCTL_BATTERY_QUERY_STATUS); when a battery does not report it the value is
+ * shown as "—" — WinClean never estimates power it did not measure. Fast
+ * sampling runs only while this view is visible (a lease the backend lets
+ * expire on its own).
+ */
 export function PowerView() {
-  const [battery, setBattery] = useState<BatteryStatus | null>(null)
-  const [history, setHistory] = useState<PowerSample[]>([])
-  const [profiles, setProfiles] = useState<OptimizerHistory["profiles"]>([])
+  useTelemetryLease(true)
+  const [view, setView] = useState<TelemetryView | null>(null)
+  const [samples, setSamples] = useState<TelemetrySample[]>([])
+  const [profiles, setProfiles] = useState<ProfilesView | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [busy, setBusy] = useState<string | null>(null)
+  const [busyId, setBusyId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
-  /** Refresh battery telemetry, recent samples, and available profiles, updating loading and error state. */
-  const load = useCallback(async () => {
-    setLoading(true)
+  // Full load: history and profiles change rarely, so they are fetched on open,
+  // on a manual refresh and when a profile changes — not on every live tick.
+  const refresh = useCallback(async () => {
     try {
-      const [b, h, hist] = await Promise.all([
-        api.optimizerBatteryStatus(),
-        api.optimizerPowerHistory(200),
-        api.optimizerHistory(1),
+      const [v, history, p] = await Promise.all([
+        api.optimizerBatteryTelemetry(),
+        api.optimizerTelemetryHistory(HISTORY_LIMIT),
+        api.optimizerListProfiles(),
       ])
-      setBattery(b)
-      setHistory(h)
-      setProfiles(hist.profiles)
+      setView(v)
+      setSamples(appendSample(history, v.lastSample, HISTORY_LIMIT))
+      setProfiles(p)
       setError(null)
     } catch (e) {
       setError(formatError(e))
@@ -37,88 +62,111 @@ export function PowerView() {
     }
   }, [])
 
-  useEffect(() => { void load() }, [load])
-
-  /** Apply a power profile through the backend, report its outcome, and reload telemetry on success. */
-  async function apply(profileId: string, label: string) {
-    setBusy(profileId)
+  // Live tick: one cheap call; the newest sample extends the chart locally.
+  const refreshLive = useCallback(async () => {
     try {
-      const msg = await api.optimizerApplyPowerProfile(profileId)
-      toast.success(`${label}: ${msg}`)
-      await load()
+      const v = await api.optimizerBatteryTelemetry()
+      setView(v)
+      setSamples((current) => appendSample(current, v.lastSample, HISTORY_LIMIT))
+      setError(null)
+    } catch (e) {
+      setError(formatError(e))
+    }
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+  }, [refresh])
+  usePolling(refreshLive, 5_000)
+  useOptimizerEvents((event) => {
+    if (event.kind === "profileChanged") void refresh()
+  })
+
+  async function apply(profile: PowerProfile) {
+    setBusyId(profile.id)
+    try {
+      const outcome = await api.optimizerApplyPowerProfile(profile.id)
+      toast.success(`${profile.label}: ${outcome.detail}`)
+      await refresh()
     } catch (e) {
       toast.error(formatError(e))
     } finally {
-      setBusy(null)
+      setBusyId(null)
     }
   }
 
-  const acKnown = battery?.acKnown ?? false
-  // No suggestion until AC status is known: nothing is marked "suggested now".
-  const suggested = battery && acKnown
-    ? suggestProfile({ onAc: battery.onAc, percent: battery.percent })
-    : null
-  const runtime =
-    battery?.secondsRemaining && battery.secondsRemaining > 0
-      ? `${Math.floor(battery.secondsRemaining / 3600)}h ${Math.floor((battery.secondsRemaining % 3600) / 60)}m (Windows estimate)`
-      : "—"
+  const t = view?.telemetry
+  const status = view?.status ?? null
+  const health = healthLabel(t?.info?.healthPercent)
+  const runtime = t?.estimatedRuntimeMinutes ?? (status?.secondsRemaining && status.secondsRemaining > 0 ? status.secondsRemaining / 60 : null)
+  const runtimeSource = t?.estimatedRuntimeMinutes != null ? "From measured draw" : runtime != null ? "Windows estimate" : "Not available"
+  const acKnown = status?.acKnown ?? false
+  const suggested = status && acKnown ? suggestProfile({ onAc: status.onAc, percent: status.percent }) : null
+  const draw = t?.dischargeWatts ?? (t?.chargeWatts != null ? t.chargeWatts : null)
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Metric label="Battery" value={!battery ? "—" : battery.present ? `${battery.percent ?? "—"}%` : "No battery"} hint={!battery ? "" : !acKnown ? "AC status unknown" : battery.onAc ? "On AC power" : "On battery"} />
-        <Metric label="Active scheme" value={battery?.activeSchemeName ?? "—"} hint={battery?.activeSchemeGuid ?? ""} />
-        <Metric label="Estimated runtime" value={runtime} hint="From GetSystemPowerStatus" />
-        <Metric label="Suggested profile" value={suggested ?? "-"} hint={acKnown ? "Deterministic AC/DC + level policy" : "AC status unknown - no DC rules applied"} />
+      {error ? <Notice tone="danger" text={error} /> : null}
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+        <Metric
+          label="Battery"
+          value={!status ? "—" : status.present ? `${status.percent ?? "—"}%` : "No battery"}
+          hint={!status ? "" : !acKnown ? "AC status unknown" : status.onAc ? "Plugged in" : "On battery"}
+        />
+        <Metric
+          label={t?.chargeWatts != null && t.dischargeWatts == null ? "Charging at" : "Power draw"}
+          value={formatWatts(draw)}
+          hint={t?.averageDischargeWatts != null ? `avg ${formatWatts(t.averageDischargeWatts)}` : "reported by the battery"}
+        />
+        <Metric label="Estimated runtime" value={formatRuntime(runtime)} hint={runtimeSource} />
+        <Metric
+          label="Battery health"
+          value={t?.info?.healthPercent != null ? `${t.info.healthPercent.toFixed(0)}%` : "—"}
+          hint={t?.info?.cycleCount != null ? `${health.label} · ${t.info.cycleCount} cycles` : health.label}
+        />
+        <Metric
+          label="Full-charge capacity"
+          value={formatMwh(t?.info?.fullChargeCapacityMwh)}
+          hint={t?.info?.designCapacityMwh != null ? `design ${formatMwh(t.info.designCapacityMwh)}` : undefined}
+        />
       </div>
 
       <Panel
-        title="Battery & power (native telemetry)"
+        title="Power draw"
         action={
-          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+          <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={loading}>
             {loading ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <RefreshCw className="size-4" aria-hidden="true" />}
             Refresh
           </Button>
         }
       >
-        {error ? <Notice tone="danger" text={error} /> : null}
-        <p className="flex items-start gap-2 text-sm text-muted-foreground">
-          {battery?.onAc ? <BatteryCharging className="mt-0.5 size-4 shrink-0" aria-hidden="true" /> : <Zap className="mt-0.5 size-4 shrink-0" aria-hidden="true" />}
-          Discharge watts are computed only from real sampled capacity drops stored in power history — never estimated from a model. Each refresh records one sample; leave this view open on battery to build a before/after comparison.
-        </p>
-        {history.length === 0 ? (
-          <EmptyState text="No power samples yet — refresh on battery to start history" />
-        ) : (
+        {loading ? <EmptyState text="Reading the battery…" /> : <PowerChart samples={samples} />}
+        {t && t.energyCrossCheckWatts != null && t.dischargeWatts != null ? (
           <p className="mt-2 text-xs text-muted-foreground">
-{history.length} sample(s) stored. Latest: {history[0]?.percent}% {history[0]?.onAc ? "(AC)" : "(DC)"}.
-            Discharge watts need at least two on-battery samples plus the battery design capacity, which Windows does not expose to this build - so no watt figure is shown rather than estimated.
-            Recent: {history.slice(0, 8).map((s) => `${s.percent}%${s.onAc ? " AC" : " DC"}`).join(" | ")}
+            Cross-check from the change in stored energy: {formatWatts(t.energyCrossCheckWatts)}. The two should agree within a few watts; a large gap means the battery reports its rate coarsely.
           </p>
-        )}
+        ) : null}
+        {t?.notes.length ? (
+          <ul className="mt-2 list-disc space-y-0.5 pl-5 text-xs text-muted-foreground">
+            {t.notes.map((n) => (
+              <li key={n}>{n}</li>
+            ))}
+          </ul>
+        ) : null}
       </Panel>
 
-      <Panel title="Optimization profiles">
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {profiles.map((profile) => (
-            <div key={profile.id} className="rounded-lg border border-border bg-card p-3">
-              <div className="font-medium">{profile.label}</div>
-              <p className="mt-1 text-sm text-muted-foreground">{profile.description}</p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Scheme: {profile.schemeGuid ?? "custom"} · EcoQoS: {profile.ecoQosForBackground ? "on" : "off"}
-                {suggested === profile.id ? " · suggested now" : ""}
-              </p>
-              <Button
-                className="mt-3"
-                size="sm"
-                disabled={busy === profile.id || !profile.schemeGuid}
-                onClick={() => void apply(profile.id, profile.label)}
-              >
-                {busy === profile.id ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
-                Apply (snapshots current scheme)
-              </Button>
-            </div>
-          ))}
-        </div>
+      <Panel
+        title="Power profiles"
+        action={status?.activeSchemeName ? <Badge tone="neutral">Windows plan: {status.activeSchemeName}</Badge> : undefined}
+      >
+        {profiles ? (
+          <ProfileButtons profiles={profiles.profiles} activeId={profiles.active?.profileId ?? null} busyId={busyId} onApply={(p) => void apply(p)} suggestedId={suggested} />
+        ) : (
+          <EmptyState text="Loading profiles…" />
+        )}
+        <p className="mt-3 text-xs text-muted-foreground">
+          Profiles switch the Windows power plan and the background-throttling mode. Every switch is snapshotted and can be rolled back in History &amp; Rollback. Automatic switching and measurements are in Optimization Profiles.
+        </p>
       </Panel>
     </div>
   )

@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 
+import type * as O from "@/lib/optimizer"
+import { describeError } from "@/lib/optimizer"
 import type { RecoverMode } from "@/lib/recover-space"
 
 export type ScanMode = "ntfsUsn" | "recursive"
@@ -337,52 +339,78 @@ export const api = {
   exportDiagnostics: () => invoke<ExportArtifact>("export_diagnostics"),
   appHealth: () => invoke<AppHealth>("app_health"),
   // WinClean 2.0 optimizer (types in src/lib/optimizer.ts)
-  /** Read service configurations and risk classifications from the native optimizer. */
-  optimizerListServices: () =>
-    invoke<import("./optimizer").ServiceInfo[]>("optimizer_list_services"),
-  /** Request a service start-type change with backend protection checks, snapshotting, and auditing. */
-  optimizerSetServiceStartType: (
-    name: string,
-    displayName: string,
-    startType: string
-  ) =>
-    invoke<import("./optimizer").ServiceInfo>(
-      "optimizer_set_service_start_type",
-      { name, displayName, startType }
-    ),
-  /** Read sampled process resource usage and EcoQoS eligibility from the native optimizer. */
-  optimizerListProcesses: () =>
-    invoke<import("./optimizer").ProcessInfo[]>("optimizer_list_processes"),
-  /** Request an audited EcoQoS change for a PID; false releases WinClean’s throttling control. */
+  /** Service list with classification, dependents, trigger flag and real memory. */
+  optimizerListServices: () => invoke<O.ServiceInfo[]>("optimizer_list_services"),
+  /** Deterministic recommendations (never for protected services); nothing is applied. */
+  optimizerServiceRecommendations: () =>
+    invoke<O.ServiceRecommendation[]>("optimizer_service_recommendations"),
+  /** Validate a plan with the backend policy and obtain a single-use approval token. */
+  optimizerPrepareServicePlan: (changes: O.ServiceChange[], origin: "user" | "ai" = "user") =>
+    invoke<O.PreparedPlanView>("optimizer_prepare_service_plan", { changes, origin }),
+  /** Apply exactly the plan the token was issued for (all-or-nothing, verified, snapshotted). */
+  optimizerApplyServicePlan: (token: string) =>
+    invoke<O.ServiceApplyOutcome>("optimizer_apply_service_plan", { token }),
+  /** Single-service change through the same transactional path as a plan of one. */
+  optimizerSetServiceStartType: (name: string, startType: O.StartType) =>
+    invoke<O.ServiceApplyOutcome>("optimizer_set_service_start_type", { name, startType }),
+  optimizerHelperStatus: () => invoke<O.HelperStatus>("optimizer_helper_status"),
+  /** Shows the UAC prompt and starts the administrator helper. */
+  optimizerHelperConnect: (allowUntrustedLocation = false) =>
+    invoke<O.HelperStatus>("optimizer_helper_connect", { allowUntrustedLocation }),
+  optimizerHelperDisconnect: () => invoke<O.HelperStatus>("optimizer_helper_disconnect"),
+  optimizerListProcesses: () => invoke<O.ProcessInfo[]>("optimizer_list_processes"),
+  /** Audited EcoQoS change for a PID; false restores the system-managed default. */
   optimizerSetProcessEcoQos: (pid: number, name: string, enable: boolean) =>
     invoke<void>("optimizer_set_process_ecoqos", { pid, name, enable }),
-  /** Read battery and active power-scheme telemetry, recording a sample when available. */
-  optimizerBatteryStatus: () =>
-    invoke<import("./optimizer").BatteryStatus>("optimizer_battery_status"),
-  /** Read recent battery samples in newest-first order, defaulting to 200 entries. */
+  optimizerWorkload: () => invoke<O.WorkloadSnapshot>("optimizer_workload"),
+  /** AC/DC, percentage and active scheme (legacy status call). */
+  optimizerBatteryStatus: () => invoke<O.BatteryStatus>("optimizer_battery_status"),
+  /** Real battery telemetry: watts, health, cycles, runtime. */
+  optimizerBatteryTelemetry: () => invoke<O.TelemetryView>("optimizer_battery_telemetry"),
+  optimizerTelemetryHistory: (limit = 240) =>
+    invoke<O.TelemetrySample[]>("optimizer_telemetry_history", { limit }),
   optimizerPowerHistory: (limit = 200) =>
-    invoke<import("./optimizer").PowerSample[]>("optimizer_power_history", {
-      limit,
-    }),
-  /** Request a built-in power profile, snapshotting the prior scheme for rollback. */
+    invoke<O.PowerSample[]>("optimizer_power_history", { limit }),
+  /** Keeps fast sampling alive while the Battery view is visible. */
+  optimizerTelemetryLease: (active: boolean) =>
+    invoke<void>("optimizer_telemetry_lease", { active }),
+  optimizerListProfiles: () => invoke<O.ProfilesView>("optimizer_list_profiles"),
   optimizerApplyPowerProfile: (profileId: string) =>
-    invoke<string>("optimizer_apply_power_profile", { profileId }),
-  /** Read CPU, memory, and registry-based adapter and NPU discovery from the native backend. */
-  optimizerHardwareInfo: () =>
-    invoke<import("./optimizer").HardwareInfo>("optimizer_hardware_info"),
-  /** Read Windows ML and MCP discovery results without enabling unverified NPU inference. */
-  optimizerCapabilities: () =>
-    invoke<import("./optimizer").CapabilityReport>("optimizer_capabilities"),
-  /** Read recent optimization audit entries, snapshots, and built-in profile metadata. */
-  optimizerHistory: (limit = 100) =>
-    invoke<import("./optimizer").OptimizerHistory>("optimizer_history", {
-      limit,
-    }),
-  /** Request restoration from an unused service or power-scheme snapshot. */
-  optimizerRollback: (snapshotId: number) =>
-    invoke<string>("optimizer_rollback", { snapshotId }),
+    invoke<O.ProfileOutcome>("optimizer_apply_power_profile", { profileId }),
+  optimizerSaveCustomProfile: (profile: O.PowerProfile) =>
+    invoke<O.ProfilesView>("optimizer_save_custom_profile", { profile }),
+  optimizerDeleteCustomProfile: (profileId: string) =>
+    invoke<O.ProfilesView>("optimizer_delete_custom_profile", { profileId }),
+  optimizerSetAutoSwitch: (config: O.AutoSwitchConfig) =>
+    invoke<O.ProfilesView>("optimizer_set_auto_switch", { config }),
+  optimizerMeasurementStart: (label: string, profileId: string) =>
+    invoke<O.MeasurementView>("optimizer_measurement_start", { label, profileId }),
+  optimizerMeasurementSwitch: (id: number) =>
+    invoke<O.MeasurementView>("optimizer_measurement_switch", { id }),
+  optimizerMeasurementFinish: (id: number) =>
+    invoke<O.MeasurementView>("optimizer_measurement_finish", { id }),
+  optimizerMeasurementList: () => invoke<O.MeasurementView[]>("optimizer_measurement_list"),
+  /** Hardware discovery; never touches a GPU API (see docs/winclean-2.0.md). */
+  optimizerHardwareInfo: (refresh = false) =>
+    invoke<O.HardwareInfo>("optimizer_hardware_info", { refresh }),
+  /** Windows ML execution-provider assessment; `modelPath` is an optional local .onnx file. */
+  optimizerCapabilities: (modelPath?: string) =>
+    invoke<O.CapabilityReport>("optimizer_capabilities", { modelPath: modelPath ?? null }),
+  optimizerMcpDiscover: () => invoke<O.McpDiscovery>("optimizer_mcp_discover"),
+  optimizerMcpProbe: (serverId: string) => invoke<O.McpProbe>("optimizer_mcp_probe", { serverId }),
+  /** The single MCP call WinClean makes: File Explorer metadata for one path. */
+  optimizerMcpFileDetails: (serverId: string, path: string) =>
+    invoke<unknown>("optimizer_mcp_file_details", { serverId, path }),
+  optimizerHistory: (limit = 100) => invoke<O.OptimizerHistory>("optimizer_history", { limit }),
+  optimizerRollback: (snapshotId: number) => invoke<string>("optimizer_rollback", { snapshotId }),
+  optimizerRecoveryReport: () => invoke<O.RecoveryReport>("optimizer_recovery_report"),
+  /** Native window integration info (Mica availability). */
+  nativeInfo: () => invoke<NativeInfo>("native_info"),
 }
 
+export type NativeInfo = { windowsBuild: number | null; mica: boolean }
+
+/** Readable text for a command error: a thrown Error, a `{code, message}` object, or a string. */
 export function formatError(error: unknown) {
-  return error instanceof Error ? error.message : String(error)
+  return describeError(error)
 }

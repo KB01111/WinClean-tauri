@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cleanup::{cleanup_candidate_id, cleanup_reason, is_protected_path, CleanupRisk},
     db::{CleanupFileRecord, Database},
+    storage_policy::{is_document_type, StoragePolicy},
 };
 
 const LARGE_FILE_BYTES: u64 = 100 * 1024 * 1024;
@@ -74,6 +75,10 @@ pub struct RecommendationCandidate {
     pub age_days: Option<u64>,
     pub eligible_for_offload: bool,
     pub modified_at_ms: Option<i64>,
+    /// Short fingerprint shared by files whose contents were proven identical.
+    pub duplicate_group: Option<String>,
+    /// How many identical files exist, this one included.
+    pub duplicate_copies: Option<u32>,
 }
 
 /// Build filtered cleanup, offload, and review recommendations from a scan run.
@@ -88,12 +93,14 @@ pub fn build_recommendations(
     let records = db.recommendation_file_records(scan_run_id, min_size, min_age_days, 20_000)?;
     let truncated = records.len() >= 20_000;
     let duplicate_keys = db.duplicate_name_size_keys(scan_run_id, DUPLICATE_REVIEW_BYTES)?;
+    let confirmed = crate::duplicates::confirmed_entry_ids(db, scan_run_id);
+    let policy = StoragePolicy::load(db, scan_run_id)?;
     let mode = filters.mode.as_deref().map(str::to_ascii_lowercase);
     let only_offload = filters.only_offload_eligible.unwrap_or(false);
 
     let mut candidates = records
         .into_iter()
-        .filter_map(|record| recommendation_candidate(scan_run_id, record, &duplicate_keys))
+        .filter_map(|record| recommendation_candidate(scan_run_id, record, &duplicate_keys, &confirmed, &policy))
         .filter(|candidate| {
             if candidate.size < min_size {
                 return false;
@@ -183,11 +190,35 @@ fn recommendation_candidate(
     scan_run_id: i64,
     record: CleanupFileRecord,
     duplicate_keys: &HashSet<(String, u64)>,
+    confirmed: &HashMap<i64, (String, u32)>,
+    policy: &StoragePolicy,
+) -> Option<RecommendationCandidate> {
+    let duplicate = confirmed.get(&record.id).map(|(sha, copies)| (sha.chars().take(12).collect::<String>(), *copies));
+    let mut found = classify(scan_run_id, record, duplicate_keys, duplicate.as_ref(), policy)?;
+    if let Some((group, copies)) = duplicate {
+        found.duplicate_group = Some(group);
+        found.duplicate_copies = Some(copies);
+    }
+    Some(found)
+}
+
+fn classify(
+    scan_run_id: i64,
+    record: CleanupFileRecord,
+    duplicate_keys: &HashSet<(String, u64)>,
+    confirmed: Option<&(String, u32)>,
+    policy: &StoragePolicy,
 ) -> Option<RecommendationCandidate> {
     if record.is_reparse_point || record.is_placeholder || record.is_system {
         return None;
     }
     if is_protected_path(&record.path) {
+        return None;
+    }
+    // Source-code projects, cloud-synced folders, databases/VM disks/key material and
+    // user-excluded locations are never candidates. Documents are only offered by the
+    // explicit "old file in Downloads" rule below.
+    if policy.check_with(&record.path, record.extension.as_deref(), true).is_some() {
         return None;
     }
 
@@ -206,7 +237,8 @@ fn recommendation_candidate(
         ));
     }
 
-    if let Some(reason) = offload_reason(&record, age_days) {
+    let document = record.extension.as_deref().map(is_document_type).unwrap_or(false);
+    if let Some(reason) = offload_reason(&record, age_days).filter(|r| !document || r == "Old file in Downloads") {
         return Some(candidate(
             scan_run_id,
             record,
@@ -220,6 +252,20 @@ fn recommendation_candidate(
         ));
     }
 
+    if let Some((_, copies)) = confirmed {
+        return Some(candidate(
+            scan_run_id,
+            record,
+            RecommendationKind::Review,
+            RecommendationRisk::Review,
+            RecommendedAction::Review,
+            format!("Confirmed duplicate: identical content (SHA-256) to {} other file(s); keep at least one copy", copies.saturating_sub(1)),
+            0.9,
+            age_days,
+            false,
+        ));
+    }
+
     let duplicate_key = (record.name.to_ascii_lowercase(), record.size);
     if record.size >= DUPLICATE_REVIEW_BYTES && duplicate_keys.contains(&duplicate_key) {
         return Some(candidate(
@@ -228,7 +274,7 @@ fn recommendation_candidate(
             RecommendationKind::Review,
             RecommendationRisk::Review,
             RecommendedAction::Review,
-            "Possible duplicate file with matching name and size".to_string(),
+            "Possible duplicate: same name and size (contents not compared)".to_string(),
             0.5,
             age_days,
             true,
@@ -264,6 +310,8 @@ fn candidate(
         age_days,
         eligible_for_offload,
         modified_at_ms: record.modified_at_ms,
+        duplicate_group: None,
+        duplicate_copies: None,
     }
 }
 

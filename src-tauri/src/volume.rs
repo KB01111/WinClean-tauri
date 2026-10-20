@@ -172,3 +172,18 @@ fn platform_volumes() -> Vec<VolumeInfo> {
         total_space: None,
     }]
 }
+
+/// Free bytes on the volume holding `path`, when Windows can say. Used to
+/// compare disk space before and after a cleanup.
+#[cfg(windows)]
+pub fn free_bytes_for_path(path: &str) -> Option<u64> {
+    use std::path::Path;
+    let root = Path::new(path).ancestors().last()?.to_string_lossy().to_string();
+    let wide = wide_null(&root);
+    disk_space(wide.as_ptr()).0
+}
+
+#[cfg(not(windows))]
+pub fn free_bytes_for_path(_path: &str) -> Option<u64> {
+    None
+}

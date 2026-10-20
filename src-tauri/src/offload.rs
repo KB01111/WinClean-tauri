@@ -371,7 +371,12 @@ pub fn process_offload_job_with_sink(
             emitter.emit_now();
             return Ok(());
         }
-        process_item(db, item, candidate, &folder, drive, recycler, cancel, &emitter)?;
+        if let Err(error) = process_item(db, item, candidate, &folder, drive, recycler, cancel, &emitter) {
+            // An unexpected error must not leave the job "running" forever (it would block every later batch).
+            let _ = db.update_offload_job(job_id, "failed", None, None, Some(unix_millis()), Some(&error.to_string()));
+            emitter.emit_now();
+            return Err(error);
+        }
         if cancel.load(Ordering::Relaxed) {
             db.update_offload_job(job_id, "canceled", None, None, Some(unix_millis()), None)?;
             emitter.emit_now();
@@ -1029,7 +1034,15 @@ fn process_item(
         undo_token: upload.web_url.clone(),
     })?;
 
-    let result = match recycler.recycle_file(Path::new(&candidate.path)) {
+    // The upload may have taken minutes or hours. Re-validate the local file
+    // right before it is recycled: if it was edited or replaced meanwhile, the
+    // Drive copy is stale and the newer local data must stay where it is.
+    let still_valid = validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms);
+    let recycle_outcome = match still_valid {
+        Ok(path) => recycler.recycle_file(&path),
+        Err(error) => Err(anyhow::anyhow!("the local file changed or became ineligible after the upload, so it was left in place ({error})")),
+    };
+    let result = match recycle_outcome {
         Ok(()) => {
             db.record_cleanup_action(CleanupActionInsert {
                 action_type: "recycle_bin".to_string(),

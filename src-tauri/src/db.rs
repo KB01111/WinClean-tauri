@@ -15,6 +15,9 @@ pub const CURRENT_SCHEMA_VERSION: &str = "202605130001_production_foundation";
 #[derive(Clone, Debug)]
 pub struct Database {
     path: PathBuf,
+    /// Opened with SQLite's read-only flag: any write fails inside SQLite itself.
+    /// Used by the read-only MCP server so it cannot change WinClean's data.
+    read_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -203,7 +206,17 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Ok(Self {
             path: path.as_ref().to_path_buf(),
+            read_only: false,
         })
+    }
+
+    /// A handle whose every connection is read-only and never creates the file.
+    pub fn open_read_only(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if !path.is_file() {
+            anyhow::bail!("the WinClean database was not found at {}", path.display());
+        }
+        Ok(Self { path, read_only: true })
     }
 
     pub fn path(&self) -> &Path {
@@ -353,37 +366,10 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_offload_items_job
                 ON offload_items(job_id, status);
-
-            CREATE TABLE IF NOT EXISTS optimizer_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                target TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL,
-                rolled_back_at_ms INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS optimizer_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                target TEXT NOT NULL,
-                action TEXT NOT NULL,
-                status TEXT NOT NULL,
-                detail TEXT,
-                snapshot_id INTEGER,
-                created_at_ms INTEGER NOT NULL,
-                completed_at_ms INTEGER,
-                FOREIGN KEY (snapshot_id) REFERENCES optimizer_snapshots(id) ON DELETE SET NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS power_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                at_ms INTEGER NOT NULL,
-                percent INTEGER NOT NULL,
-                on_ac INTEGER NOT NULL
-            );
             "#,
         )?;
+        conn.execute_batch(crate::db_optimizer::OPTIMIZER_SCHEMA)?;
+        conn.execute_batch(crate::db_storage::STORAGE_SCHEMA)?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",
             params![CURRENT_SCHEMA_VERSION, unix_millis()],
@@ -400,141 +386,6 @@ impl Database {
         )
         .optional()
         .context("read schema version")
-    }
-
-    // --- WinClean 2.0 optimizer persistence ---
-
-    pub fn insert_optimizer_snapshot(&self, kind: &str, target: &str, payload_json: &str) -> anyhow::Result<i64> {
-        let conn = self.connect()?;
-        conn.execute(
-            "INSERT INTO optimizer_snapshots (kind, target, payload_json, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
-            params![kind, target, payload_json, unix_millis()],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    pub fn get_optimizer_snapshot(&self, id: i64) -> anyhow::Result<Option<crate::optimizer::OptimizationSnapshot>> {
-        let conn = self.connect()?;
-        conn.query_row(
-            "SELECT id, kind, target, payload_json, created_at_ms, rolled_back_at_ms FROM optimizer_snapshots WHERE id = ?1",
-            params![id],
-            |row| Ok(crate::optimizer::OptimizationSnapshot {
-                id: row.get(0)?, kind: row.get(1)?, target: row.get(2)?,
-                payload_json: row.get(3)?, created_at_ms: row.get(4)?, rolled_back_at_ms: row.get(5)?,
-            }),
-        ).optional().context("read optimizer snapshot")
-    }
-
-    pub fn mark_snapshot_rolled_back(&self, id: i64) -> anyhow::Result<()> {
-        let conn = self.connect()?;
-        conn.execute("UPDATE optimizer_snapshots SET rolled_back_at_ms = ?2 WHERE id = ?1", params![id, unix_millis()])?;
-        Ok(())
-    }
-
-    /// Replaces a snapshot's payload (used to add the processes a power
-    /// profile touched after the profile has been applied).
-    pub fn update_optimizer_snapshot_payload(&self, id: i64, payload_json: &str) -> anyhow::Result<()> {
-        let conn = self.connect()?;
-        conn.execute("UPDATE optimizer_snapshots SET payload_json = ?2 WHERE id = ?1", params![id, payload_json])?;
-        Ok(())
-    }
-
-    /// Processes WinClean currently owns EcoQoS throttling for: audit
-    /// targets whose latest completed EcoQoS action is `ecoqos:on`. Returns
-    /// `(target, created_at_ms)` so callers can reject a reused PID.
-    pub fn ecoqos_owned_processes(&self) -> anyhow::Result<Vec<(String, i64)>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT a.target, a.created_at_ms
-            FROM optimizer_audit a
-            WHERE a.kind = 'process' AND a.status = 'completed' AND a.action = 'ecoqos:on'
-              AND a.id = (
-                SELECT MAX(b.id) FROM optimizer_audit b
-                WHERE b.kind = 'process' AND b.status = 'completed'
-                  AND b.action IN ('ecoqos:on', 'ecoqos:off')
-                  AND b.target = a.target COLLATE NOCASE
-              )
-            ORDER BY a.id
-            "#,
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("read owned EcoQoS processes")
-    }
-
-    /// Completed per-process EcoQoS changes a power profile made, linked to
-    /// its snapshot (`action` is `ecoqos:on` or `ecoqos:off`). Written as each
-    /// process changes, so rollback does not depend on the single payload
-    /// update that follows the loop.
-    pub fn ecoqos_changes_for_snapshot(&self, snapshot_id: i64, action: &str) -> anyhow::Result<Vec<(String, i64)>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT target, created_at_ms FROM optimizer_audit WHERE kind = 'process' AND status = 'completed' AND action = ?2 AND snapshot_id = ?1 ORDER BY id",
-        )?;
-        let rows = stmt.query_map(params![snapshot_id, action], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("read EcoQoS changes for snapshot")
-    }
-
-    pub fn insert_optimizer_audit(&self, kind: &str, target: &str, action: &str, status: &str, detail: Option<&str>, snapshot_id: Option<i64>) -> anyhow::Result<i64> {
-        let conn = self.connect()?;
-        let done = if status == "pending" { None } else { Some(unix_millis()) };
-        conn.execute(
-            "INSERT INTO optimizer_audit (kind, target, action, status, detail, snapshot_id, created_at_ms, completed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![kind, target, action, status, detail, snapshot_id, unix_millis(), done],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// Finalizes a pending audit row in place (no duplicate terminal row).
-    pub fn complete_optimizer_audit(&self, id: i64, status: &str, detail: Option<&str>) -> anyhow::Result<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            "UPDATE optimizer_audit SET status = ?2, detail = ?3, completed_at_ms = ?4 WHERE id = ?1 AND status = 'pending'",
-            params![id, status, detail, unix_millis()],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_optimizer_audit(&self, limit: u32) -> anyhow::Result<Vec<crate::optimizer::OptimizationAudit>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, kind, target, action, status, detail, snapshot_id, created_at_ms, completed_at_ms FROM optimizer_audit ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |row| Ok(crate::optimizer::OptimizationAudit {
-            id: row.get(0)?, kind: row.get(1)?, target: row.get(2)?, action: row.get(3)?,
-            status: row.get(4)?, detail: row.get(5)?, snapshot_id: row.get(6)?,
-            created_at_ms: row.get(7)?, completed_at_ms: row.get(8)?,
-        }))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("list optimizer audit")
-    }
-
-    pub fn list_optimizer_snapshots(&self, limit: u32) -> anyhow::Result<Vec<crate::optimizer::OptimizationSnapshot>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, kind, target, payload_json, created_at_ms, rolled_back_at_ms FROM optimizer_snapshots ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |row| Ok(crate::optimizer::OptimizationSnapshot {
-            id: row.get(0)?, kind: row.get(1)?, target: row.get(2)?,
-            payload_json: row.get(3)?, created_at_ms: row.get(4)?, rolled_back_at_ms: row.get(5)?,
-        }))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("list optimizer snapshots")
-    }
-
-    pub fn record_power_sample(&self, percent: u8, on_ac: bool) -> anyhow::Result<()> {
-        let conn = self.connect()?;
-        conn.execute("INSERT INTO power_history (at_ms, percent, on_ac) VALUES (?1, ?2, ?3)", params![unix_millis(), percent as i64, on_ac as i64])?;
-        // Keep the table bounded: last 2000 samples.
-        conn.execute("DELETE FROM power_history WHERE id NOT IN (SELECT id FROM power_history ORDER BY id DESC LIMIT 2000)", [])?;
-        Ok(())
-    }
-
-    pub fn power_history(&self, limit: u32) -> anyhow::Result<Vec<crate::optimizer::power::PowerSample>> {
-        let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT at_ms, percent, on_ac FROM power_history ORDER BY id DESC LIMIT ?1")?;
-        let rows = stmt.query_map(params![limit], |row| Ok(crate::optimizer::power::PowerSample {
-            at_ms: row.get(0)?, percent: row.get::<_, i64>(1)? as u8, on_ac: row.get::<_, i64>(2)? != 0,
-        }))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("read power history")
     }
 
     pub fn table_names(&self) -> anyhow::Result<Vec<String>> {
@@ -893,7 +744,7 @@ impl Database {
             params![
                 run_id,
                 extension,
-                min_size as i64,
+                clamp_i64(min_size),
                 query,
                 limit.clamp(1, 1000)
             ],
@@ -1067,14 +918,14 @@ impl Database {
         let mut bindings = vec![run_id];
         if min_size > 0 {
             sql.push_str(&format!(" AND size >= ?{}", bindings.len() + 1));
-            bindings.push(min_size as i64);
+            bindings.push(clamp_i64(min_size));
         }
         if min_age_days > 0 {
             sql.push_str(&format!(
                 " AND (modified_at_ms IS NULL OR modified_at_ms <= ?{})",
                 bindings.len() + 1
             ));
-            bindings.push(unix_millis() - (min_age_days as i64) * 86_400_000);
+            bindings.push(age_cutoff_ms(min_age_days));
         }
         sql.push_str(&format!(
             " ORDER BY size DESC, path ASC LIMIT ?{}",
@@ -1099,6 +950,23 @@ impl Database {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("read recommendation files")
+    }
+
+    /// Folders (from the scan index) that contain a project marker such as
+    /// `.git`, `package.json`, `Cargo.toml` or a `*.sln` — the roots of source-code projects.
+    pub fn project_marker_dirs(&self, run_id: i64) -> anyhow::Result<Vec<String>> {
+        use crate::storage_policy::{PROJECT_MARKER_EXTENSIONS, PROJECT_MARKER_NAMES};
+        let quote = |items: &[&str]| items.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+        // The lists are compile-time constants made of plain file names, never user input.
+        let sql = format!(
+            "SELECT DISTINCT parent_path FROM file_entries WHERE scan_run_id = ?1 AND parent_path IS NOT NULL AND (LOWER(name) IN ({}) OR (is_directory = 0 AND LOWER(COALESCE(extension, '')) IN ({}))) LIMIT 100000",
+            quote(PROJECT_MARKER_NAMES),
+            quote(PROJECT_MARKER_EXTENSIONS)
+        );
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read project marker folders")
     }
 
     pub fn duplicate_name_size_keys(
@@ -1126,7 +994,7 @@ impl Database {
             HAVING COUNT(*) > 1
             "#,
         )?;
-        let rows = stmt.query_map(params![run_id, min_size as i64], |row| {
+        let rows = stmt.query_map(params![run_id, clamp_i64(min_size)], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
         })?;
         rows.collect::<rusqlite::Result<HashSet<_>>>()
@@ -1491,7 +1359,7 @@ impl Database {
         min_age_days: u64,
         limit: u32,
     ) -> anyhow::Result<Vec<FileSearchResult>> {
-        let cutoff_ms = unix_millis() - (min_age_days as i64) * 86_400_000;
+        let cutoff_ms = age_cutoff_ms(min_age_days);
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             r#"
@@ -1508,7 +1376,7 @@ impl Database {
             "#,
         )?;
         let rows = stmt.query_map(
-            params![run_id, min_size as i64, cutoff_ms, limit.clamp(1, 500)],
+            params![run_id, clamp_i64(min_size), cutoff_ms, limit.clamp(1, 500)],
             |row| {
                 Ok(FileSearchResult {
                     id: row.get(0)?,
@@ -1590,7 +1458,17 @@ impl Database {
         Ok(count as u64)
     }
 
-    fn connect(&self) -> anyhow::Result<Connection> {
+    pub(crate) fn connect(&self) -> anyhow::Result<Connection> {
+        if self.read_only {
+            let conn = Connection::open_with_flags(
+                &self.path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .with_context(|| format!("open sqlite database read-only {}", self.path.display()))?;
+            conn.busy_timeout(Duration::from_secs(5))?;
+            conn.pragma_update(None, "query_only", "ON")?;
+            return Ok(conn);
+        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create database directory {}", parent.display()))?;
@@ -1683,9 +1561,20 @@ fn offload_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OffloadIte
     })
 }
 
-fn unix_millis() -> i64 {
+pub(crate) fn unix_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+/// A `u64` for SQLite's signed integers: huge values saturate instead of wrapping negative.
+fn clamp_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Modification-time cutoff for "older than N days"; absurd values mean "nothing is that old", not "everything is".
+fn age_cutoff_ms(days: u64) -> i64 {
+    let span = i64::try_from(days).unwrap_or(i64::MAX).saturating_mul(86_400_000);
+    unix_millis().saturating_sub(span)
 }
