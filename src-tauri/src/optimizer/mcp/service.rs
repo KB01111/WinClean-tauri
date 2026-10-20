@@ -407,7 +407,7 @@ impl McpManager {
     /// each tool's real input schema. No tool is called, so Windows has nothing
     /// to ask the user about. Returns the updated status.
     pub fn verify_connection(&self, windows_build: Option<u32>, copilot_plus: bool, cancel: &Arc<AtomicBool>) -> McpStatus {
-        self.refresh(windows_build, true, cancel);
+        let _ = self.refresh(windows_build, true, cancel);
         match self.open(windows_build, cancel) {
             Ok((mut client, _server, handshake)) => {
                 let tools = client.list_tools();

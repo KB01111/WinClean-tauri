@@ -32,6 +32,11 @@ pub enum BlockReason {
     SyncedFolder,
     ProtectedFileType,
     UserExcluded,
+    /// Cloud placeholder (OneDrive-style): recycling it could delete the online copy.
+    CloudPlaceholder,
+    /// Junction, symlink or other reparse point.
+    ReparsePoint,
+    SystemFile,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -109,6 +114,20 @@ impl StoragePolicy {
     }
 
     /// Why `path` must not be a cleanup candidate, if it must not.
+    /// Like [`check_with`], also honouring the attributes recorded by the scan.
+    pub fn check_entry(&self, entry: &crate::db::FileSearchResult, allow_documents: bool) -> Option<Blocked> {
+        if entry.is_reparse_point {
+            return blocked(BlockReason::ReparsePoint, "A link or junction, not a regular file");
+        }
+        if entry.is_placeholder {
+            return blocked(BlockReason::CloudPlaceholder, "A cloud placeholder; the real content lives online");
+        }
+        if entry.is_system {
+            return blocked(BlockReason::SystemFile, "Marked as a system file");
+        }
+        self.check_with(&entry.path, entry.extension.as_deref(), allow_documents)
+    }
+
     pub fn check(&self, path: &str, extension: Option<&str>) -> Option<Blocked> {
         self.check_with(path, extension, false)
     }

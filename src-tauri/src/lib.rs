@@ -4,11 +4,13 @@ pub mod commands;
 pub mod db;
 pub mod db_optimizer;
 pub mod db_storage;
+pub mod duplicates;
 pub mod offload;
 pub mod pathutil;
 pub mod recommendations;
 pub mod reports;
 pub mod scan;
+pub mod storage_ai;
 pub mod storage_policy;
 pub mod volume;
 

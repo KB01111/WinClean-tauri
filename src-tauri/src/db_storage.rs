@@ -19,6 +19,15 @@ CREATE TABLE IF NOT EXISTS duplicate_hashes (
     PRIMARY KEY (scan_run_id, entry_id),
     FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS duplicate_heads (
+    scan_run_id INTEGER NOT NULL,
+    entry_id INTEGER NOT NULL,
+    head_sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    modified_at_ms INTEGER,
+    PRIMARY KEY (scan_run_id, entry_id),
+    FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+);
 CREATE INDEX IF NOT EXISTS idx_duplicate_hashes_hash ON duplicate_hashes(scan_run_id, sha256, size);
 "#;
 
@@ -93,6 +102,49 @@ impl Database {
             )
             .context("save a duplicate hash")?;
         Ok(())
+    }
+
+    pub fn save_duplicate_head(&self, run_id: i64, entry_id: i64, head_sha256: &str, size: u64, modified_at_ms: Option<i64>) -> anyhow::Result<()> {
+        self.connect()?
+            .execute(
+                "INSERT OR REPLACE INTO duplicate_heads (scan_run_id, entry_id, head_sha256, size, modified_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![run_id, entry_id, head_sha256, clamp(size), modified_at_ms],
+            )
+            .context("save a duplicate prefix hash")?;
+        Ok(())
+    }
+
+    /// Remembered prefix hashes that still describe the indexed file: entry id → SHA-256 of its first bytes.
+    pub fn valid_heads(&self, run_id: i64) -> anyhow::Result<HashMap<i64, String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT h.entry_id, h.head_sha256
+            FROM duplicate_heads h
+            JOIN file_entries e ON e.id = h.entry_id AND e.scan_run_id = h.scan_run_id
+             AND e.size = h.size AND COALESCE(e.modified_at_ms, -1) = COALESCE(h.modified_at_ms, -1)
+            WHERE h.scan_run_id = ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![run_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect())
+    }
+
+    /// Remembered hashes that still describe the indexed file (same size and
+    /// modification time): entry id → SHA-256.
+    pub fn valid_hashes(&self, run_id: i64) -> anyhow::Result<HashMap<i64, String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT h.entry_id, h.sha256
+            FROM duplicate_hashes h
+            JOIN file_entries e ON e.id = h.entry_id AND e.scan_run_id = h.scan_run_id
+             AND e.size = h.size AND COALESCE(e.modified_at_ms, -1) = COALESCE(h.modified_at_ms, -1)
+            WHERE h.scan_run_id = ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![run_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().collect())
     }
 
     /// Entries whose content hash (verified earlier, and still matching the
