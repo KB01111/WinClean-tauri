@@ -591,10 +591,15 @@ fn offload_job_uploads_verifies_then_recycles_with_fake_drive_client() {
         Some("drive-file-1")
     );
     assert_eq!(status.items[0].recycle_status.as_deref(), Some("recycled"));
-    assert_eq!(
-        recycler.recycled.lock().expect("recycler lock").as_slice(),
-        &[file_path.to_string_lossy().to_string()]
-    );
+    // The offload job recycles the canonical path, which on Windows carries a `\\?\` prefix.
+    let recycled = recycler
+        .recycled
+        .lock()
+        .expect("recycler lock")
+        .iter()
+        .map(|path| path.strip_prefix("\\\\?\\").unwrap_or(path).to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(recycled, vec![file_path.to_string_lossy().to_string()]);
 }
 
 #[test]
