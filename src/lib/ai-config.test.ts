@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { aiAvailability, keyProviderFor, modelFor, sendsDataOffDevice, DEFAULT_ENDPOINT, describeEndpoint, loadEndpoint, saveEndpoint, validateEndpoint, validateLocalBaseUrl, LOCAL_PRESETS } from "./ai-config"
+import { aiAvailability, destinationLabel, keyProviderFor, modelFor, sendsDataOffDevice, DEFAULT_ENDPOINT, describeEndpoint, loadEndpoint, saveEndpoint, validateEndpoint, validateLocalBaseUrl, LOCAL_PRESETS } from "./ai-config"
 
 describe("local endpoint validation", () => {
   test("loopback http(s) addresses are accepted and normalised", () => {
@@ -100,5 +100,25 @@ describe("cloud providers", () => {
     const store: Record<string, string> = { "winclean-ai-endpoint": JSON.stringify({ kind: "openrouter", baseUrl: "", localModel: "" }) }
     const storage = { getItem: (k: string) => store[k] ?? null }
     expect(loadEndpoint(storage)).toEqual({ ...DEFAULT_ENDPOINT, kind: "openrouter" })
+  })
+})
+
+describe("review fixes", () => {
+  test("OpenCode is ready for storage analysis but not for the tool-calling system analysis", () => {
+    const ok = { ...DEFAULT_ENDPOINT, kind: "opencode" as const, opencodeModel: "opencode/big-pickle" }
+    expect(aiAvailability(ok, {}, "storage")).toEqual({ ready: true })
+    expect(aiAvailability(ok, {}, "system")).toMatchObject({ ready: false })
+    expect(aiAvailability({ ...DEFAULT_ENDPOINT, kind: "openrouter" }, { openrouter: true }, "system")).toEqual({ ready: true })
+  })
+
+  test("the model that is sent is trimmed like the one that was validated", () => {
+    expect(modelFor({ ...DEFAULT_ENDPOINT, kind: "openrouter", openrouterModel: "  openrouter/free " }, "x")).toBe("openrouter/free")
+    expect(modelFor({ ...DEFAULT_ENDPOINT, kind: "opencode", opencodeModel: " opencode/big-pickle\n" }, "x")).toBe("opencode/big-pickle")
+  })
+
+  test("disclosure names the real destination", () => {
+    expect(destinationLabel(DEFAULT_ENDPOINT)).toBe("OpenAI")
+    expect(destinationLabel({ ...DEFAULT_ENDPOINT, kind: "openrouter" })).toContain("OpenRouter")
+    expect(destinationLabel({ ...DEFAULT_ENDPOINT, kind: "local" })).toBe("your local model")
   })
 })

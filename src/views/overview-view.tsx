@@ -109,7 +109,7 @@ export function OverviewView({
           />
         </div>
 
-        <DiskUsagePanel volumes={volumes} activeRun={activeRun} indexedBytes={indexedBytes} />
+        <DiskUsagePanel volumes={volumes} activeRun={activeRun} />
 
         <ReclaimPanel plan={recommendationPlan} onNavigate={onNavigate} />
 
@@ -320,9 +320,10 @@ function StorageHogBars({
 }
 
 /** Used and free space from Windows, and how much of the used space the scan could see. */
-function DiskUsagePanel({ volumes, activeRun, indexedBytes }: { volumes: VolumeInfo[]; activeRun: ScanRunRecord | null; indexedBytes: number }) {
+function DiskUsagePanel({ volumes, activeRun }: { volumes: VolumeInfo[]; activeRun: ScanRunRecord | null }) {
+  // Both the volume and the scanned total come from the selected run, so they always describe the same disk.
   const volume = volumeForRoot(volumes, activeRun?.rootPath)
-  const usage = diskUsage(volume, indexedBytes)
+  const usage = diskUsage(volume, activeRun?.bytesIndexed ?? 0)
   if (!volume || !usage) return null
   return (
     <Panel title={`Disk ${volume.rootPath}`}>
@@ -347,7 +348,7 @@ const KIND_LABEL = { clean: "Recycle Bin", offload: "Google Drive", review: "You
 /** Where recoverable space comes from, by the rule that found it. */
 function ReclaimPanel({ plan, onNavigate }: { plan: RecommendationPlan | null; onNavigate: (view: View) => void }) {
   const groups = reclaimGroups(plan?.candidates ?? [])
-  const largest = groups[0]?.bytes || 1
+  const largest = Math.max(1, ...groups.map((g) => g.bytes))
   return (
     <Panel
       title="What you can reclaim"

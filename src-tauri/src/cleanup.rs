@@ -68,7 +68,7 @@ pub fn build_cleanup_plan(
     let policy = crate::storage_policy::StoragePolicy::load(db, scan_run_id)?;
     let mut candidates = records
         .into_iter()
-        .filter(|record| policy.check(&record.path, record.extension.as_deref()).is_none())
+        .filter(|record| policy.check_for_cleanup(&record.path, record.extension.as_deref(), false).is_none())
         .filter_map(|record| cleanup_candidate(scan_run_id, record, now_ms))
         .take(limit.clamp(1, 500) as usize)
         .collect::<Vec<_>>();
@@ -122,7 +122,7 @@ pub fn execute_cleanup_plan(
             undo_token: None,
         })?;
 
-        let checked = match policy.check(&candidate.path, None) {
+        let checked = match policy.check_for_cleanup(&candidate.path, None, false) {
             Some(blocked) => Err(anyhow::anyhow!("{}", blocked.detail)),
             None => validate_file_for_action(&candidate.path, candidate.size, candidate.modified_at_ms).and_then(|path| ensure_still_a_cleanup_category(&path).map(|_| path)),
         };
@@ -232,6 +232,7 @@ pub fn validate_cleanup_target(candidate: &CleanupCandidate) -> anyhow::Result<P
         anyhow::bail!("cleanup target is protected: {}", candidate.path);
     }
     validate_cleanup_age(candidate.modified_at_ms, unix_millis())?;
+    validate_scratch_age(&candidate.path, candidate.modified_at_ms, unix_millis())?;
 
     let original = Path::new(&candidate.path);
     let metadata = std::fs::symlink_metadata(original).map_err(|error| {
@@ -324,7 +325,7 @@ fn cleanup_candidate(
         return None;
     }
 
-    if validate_cleanup_age(record.modified_at_ms, now_ms).is_err() {
+    if validate_cleanup_age(record.modified_at_ms, now_ms).is_err() || validate_scratch_age(&record.path, record.modified_at_ms, now_ms).is_err() {
         return None;
     }
 
@@ -420,6 +421,23 @@ fn is_user_scratch_path(normalized: &str) -> bool {
         && rest[3] == "local"
         && matches!(rest[4], "temp" | "crashdumps")
         && !rest[5].is_empty()
+}
+
+/// Files in the user Temp and crash-dump folders are only ever cleaned once they have been
+/// untouched this long (Windows' own Disk Cleanup uses the same week).
+pub const SCRATCH_MIN_AGE_DAYS: u64 = 7;
+
+/// Fails for a file in a user Temp or crash-dump folder that was modified within the last week.
+pub fn validate_scratch_age(path: &str, modified_at_ms: Option<i64>, now_ms: i64) -> anyhow::Result<()> {
+    if !is_user_scratch_path(&normalize_for_rules(path)) {
+        return Ok(());
+    }
+    let week_ms = SCRATCH_MIN_AGE_DAYS as i64 * 86_400_000;
+    match modified_at_ms {
+        Some(modified) if now_ms.saturating_sub(modified) >= week_ms => Ok(()),
+        Some(_) => anyhow::bail!("files in the Temp folder are only cleaned after {SCRATCH_MIN_AGE_DAYS} days without changes"),
+        None => anyhow::bail!("cleanup target modified time is unavailable"),
+    }
 }
 
 /// True for files in a user's Temp folder (the only application-data location cleaned by age).

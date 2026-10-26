@@ -91,6 +91,12 @@ describe("reply parsing", () => {
     expect(parseStorageReply(JSON.stringify({ summary: "s", proposals: [{ title: 5 }] }))).toMatchObject({ ok: false })
   })
 
+  test("a reply without a proposals list is rejected, an explicit empty list is allowed", () => {
+    expect(parseStorageReply("{}")).toMatchObject({ ok: false })
+    expect(parseStorageReply(JSON.stringify({ summary: "nothing" }))).toMatchObject({ ok: false })
+    expect(parseStorageReply(JSON.stringify({ summary: "nothing", proposals: [] }))).toMatchObject({ ok: true })
+  })
+
   test("caps proposals and ids per proposal", () => {
     const many = { summary: "s", proposals: Array.from({ length: 20 }, () => ({ title: "t", action: "clean", candidateIds: Array.from({ length: 900 }, (_, i) => `id${i}`), reason: "r" })) }
     const r = parseStorageReply(JSON.stringify(many))

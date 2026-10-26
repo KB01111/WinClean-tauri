@@ -31,6 +31,7 @@ export function AiInsightsView({
 }) {
   const endpoint = useMemo(() => loadEndpoint(), [])
   const availability = aiAvailability(endpoint, aiKeys)
+  const systemAvailability = aiAvailability(endpoint, aiKeys, "system")
 
   return (
     <div>
@@ -58,14 +59,14 @@ export function AiInsightsView({
           <DuplicatesPanel scanRuns={scanRuns} activeRun={activeRun} />
         </TabsContent>
         <TabsContent value="system">
-          {availability.ready ? (
+          {systemAvailability.ready ? (
             <SystemAnalysisPanel endpoint={endpoint} />
           ) : (
             <Panel title="System analysis">
               <div className="flex flex-col items-center gap-3 py-12 text-center">
                 <Sparkles className="size-8 text-primary" aria-hidden="true" />
                 <p className="max-w-md text-sm text-muted-foreground">The system analysis reads services, processes, battery and hardware state and proposes safe tuning. It needs an AI provider.</p>
-                <p className="max-w-md text-sm">{availability.reason}</p>
+                <p className="max-w-md text-sm">{systemAvailability.ready ? "" : systemAvailability.reason}</p>
                 <Button onClick={onGoToSettings}>
                   Open AI settings
                   <ArrowRight className="size-4" aria-hidden="true" />

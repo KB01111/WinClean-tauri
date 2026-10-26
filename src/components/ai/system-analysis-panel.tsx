@@ -10,7 +10,7 @@ import { useHelper } from "@/hooks/use-helper"
 import { useServicePlan } from "@/hooks/use-service-plan"
 import { analyzeSystemWithAi } from "@/lib/ai-agent"
 import { getStoredAiModel } from "@/lib/ai-models"
-import { PROVIDER_LABELS, keyProviderFor, type AiEndpoint } from "@/lib/ai-config"
+import { PROVIDER_LABELS, destinationLabel, keyProviderFor, type AiEndpoint } from "@/lib/ai-config"
 import { normalizeProposals, type NormalizedProposals, type SystemReport } from "@/lib/ai-proposals"
 import { api, formatError } from "@/lib/api"
 import { startTypeLabel } from "@/lib/optimizer"
@@ -86,7 +86,7 @@ export function SystemAnalysisPanel({ endpoint }: { endpoint: AiEndpoint }) {
           The assistant looks at services, processes, battery, hardware and your profiles with read-only tools and proposes safe improvements, if any are justified. It cannot change anything.{" "}
           {endpoint.kind === "local"
             ? "Your local model runs on this PC; nothing is sent over the internet."
-            : "Service names, process names with CPU/memory, battery state and hardware model names are sent to OpenAI for the analysis; no file contents are."}
+            : `Service names, process names with CPU/memory, battery state and hardware model names are sent to ${destinationLabel(endpoint)} for the analysis; no file contents are.`}
         </p>
         {error ? <Notice tone="danger" text={error} /> : null}
         {busy ? <p className="mt-3 text-xs text-muted-foreground">Reading the system and thinking it through…</p> : null}

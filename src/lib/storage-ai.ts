@@ -122,6 +122,7 @@ export function parseStorageReply(text: string): { ok: true; reply: ParsedReply 
         })
       : undefined,
   }
+  if (!Array.isArray(list)) return { ok: false, error: "The model's answer did not include a list of proposals." }
   const parsed = replySchema.safeParse(normalized)
   if (!parsed.success) return { ok: false, error: "The model's answer did not have the expected shape." }
   return {

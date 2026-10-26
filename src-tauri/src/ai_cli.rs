@@ -212,9 +212,17 @@ pub async fn opencode_run(state: State<'_, AppState>, model: String, instruction
         .map_err(|e| e.to_string())?
 }
 
+/// Ask OpenCode to deny every tool permission for runs started in this folder (its documented
+/// project config). OpenCode still runs with the user's own privileges; this relies on it honouring the setting.
+pub fn write_deny_all_config(scratch: &std::path::Path) -> Result<(), String> {
+    let config = "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"permission\": { \"*\": \"deny\" }\n}\n";
+    std::fs::write(scratch.join("opencode.json"), config).map_err(|e| format!("write OpenCode config: {e}"))
+}
+
 /// One `opencode run` in `scratch` (an empty folder): `data` on stdin, a short fixed instruction as the message.
 pub fn run_model(scratch: &std::path::Path, model: &str, instruction: &str, data: &str, limit: Duration) -> Result<String, String> {
     let (bin, _) = find_binary().ok_or("The `opencode` command was not found. Install OpenCode and sign in with `opencode auth login`.")?;
+    write_deny_all_config(scratch)?;
     let mut cmd = Command::new(bin);
     cmd.current_dir(scratch).args(["run", "--model", model, "--format", "json", instruction]);
     let (out, err, ok) = run_limited(cmd, Some(data.as_bytes()), limit)?;
@@ -292,6 +300,8 @@ esac
             assert!(summary.contains("run --model opencode/big-pickle --format json Reply with JSON only."), "{summary}");
             assert!(summary.contains("stdin={'items':[1,2]}"), "data arrives on stdin, not in the arguments: {summary}");
             assert!(!summary.contains("--auto"), "permissions are never auto-approved");
+            let config = std::fs::read_to_string(scratch.path().join("opencode.json")).unwrap();
+            assert!(config.contains("\"*\": \"deny\""), "the scratch folder carries a deny-all permission config: {config}");
             assert!(summary.contains(&format!("cwd={}", scratch.path().file_name().unwrap().to_string_lossy())), "runs inside the scratch folder: {summary}");
         }
 

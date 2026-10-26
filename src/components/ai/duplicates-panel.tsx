@@ -9,6 +9,7 @@ import { api, formatError, type DuplicateGroup, type DuplicateJobStatus, type Du
 import { formatBytes } from "@/lib/format"
 
 const SHOWN_GROUPS = 12
+const MORE_STEP = 50
 
 function GroupRow({ group }: { group: DuplicateGroup }) {
   return (
@@ -48,6 +49,7 @@ export function DuplicatesPanel({ scanRuns, activeRun }: { scanRuns: ScanRunReco
   const [report, setReport] = useState<DuplicateReport | null>(null)
   const [job, setJob] = useState<DuplicateJobStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [shown, setShown] = useState({ confirmed: SHOWN_GROUPS, possible: SHOWN_GROUPS })
 
   const loadReport = useCallback(async () => {
     if (runId === null) return
@@ -62,7 +64,8 @@ export function DuplicatesPanel({ scanRuns, activeRun }: { scanRuns: ScanRunReco
     setReport(null)
     setError(null)
     void loadReport()
-    api.duplicatesStatus().then(setJob).catch(() => {})
+    // The startup answer must not overwrite a job the user has just started.
+    api.duplicatesStatus().then((initial) => setJob((current) => current ?? initial)).catch(() => {})
   }, [loadReport])
 
   const running = job?.state === "running"
@@ -138,18 +141,28 @@ export function DuplicatesPanel({ scanRuns, activeRun }: { scanRuns: ScanRunReco
               <EmptyState text="No verified duplicates yet — compare file contents to find them" />
             ) : (
               <div className="space-y-2">
-                {report.confirmed.slice(0, SHOWN_GROUPS).map((group, index) => (
+                {report.confirmed.slice(0, shown.confirmed).map((group, index) => (
                   <GroupRow key={`c-${group.fingerprint}-${index}`} group={group} />
                 ))}
+                {report.confirmed.length > shown.confirmed ? (
+                  <Button variant="outline" size="sm" onClick={() => setShown((s) => ({ ...s, confirmed: s.confirmed + MORE_STEP }))}>
+                    Show {Math.min(MORE_STEP, report.confirmed.length - shown.confirmed)} more of {report.confirmed.length - shown.confirmed}
+                  </Button>
+                ) : null}
               </div>
             )}
           </Panel>
           {report.possible.length > 0 ? (
             <Panel title={`Same size, not compared (${report.possible.length})`}>
               <div className="space-y-2">
-                {report.possible.slice(0, SHOWN_GROUPS).map((group, index) => (
+                {report.possible.slice(0, shown.possible).map((group, index) => (
                   <GroupRow key={`p-${index}`} group={group} />
                 ))}
+                {report.possible.length > shown.possible ? (
+                  <Button variant="outline" size="sm" onClick={() => setShown((s) => ({ ...s, possible: s.possible + MORE_STEP }))}>
+                    Show {Math.min(MORE_STEP, report.possible.length - shown.possible)} more of {report.possible.length - shown.possible}
+                  </Button>
+                ) : null}
               </div>
             </Panel>
           ) : null}

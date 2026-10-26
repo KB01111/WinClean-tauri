@@ -49,13 +49,14 @@ export function keyProviderFor(kind: AiEndpointKind): AiKeyProvider | null {
 
 /** Model identifier sent for the selected provider (OpenAI's comes from the model picker). */
 export function modelFor(endpoint: AiEndpoint, openaiModel: string): string {
+  // Validation trims, so the value that is sent must be trimmed too.
   switch (endpoint.kind) {
     case "local":
-      return endpoint.localModel
+      return endpoint.localModel.trim()
     case "openrouter":
-      return endpoint.openrouterModel
+      return endpoint.openrouterModel.trim()
     case "opencode":
-      return endpoint.opencodeModel
+      return endpoint.opencodeModel.trim()
     default:
       return openaiModel
   }
@@ -167,10 +168,30 @@ export function sendsDataOffDevice(endpoint: AiEndpoint): boolean {
   return endpoint.kind !== "local"
 }
 
-/** Whether the assistant can run with the current endpoint; `reason` is shown to the user when not. */
-export function aiAvailability(endpoint: AiEndpoint, keys: Partial<AiKeyMap>): { ready: true } | { ready: false; reason: string } {
+/** Where the assistant's data goes, for disclosure text ("OpenRouter", "OpenAI", "the OpenCode client", …). */
+export function destinationLabel(endpoint: AiEndpoint): string {
+  switch (endpoint.kind) {
+    case "openai":
+      return "OpenAI"
+    case "openrouter":
+      return "OpenRouter (and the model provider behind the model you chose)"
+    case "opencode":
+      return "your OpenCode client (and the model provider it uses)"
+    default:
+      return "your local model"
+  }
+}
+
+/**
+ * Whether the assistant can run with the current endpoint; `reason` is shown to the user when not.
+ * The system analysis needs tool calling, which the OpenCode bridge does not offer.
+ */
+export function aiAvailability(endpoint: AiEndpoint, keys: Partial<AiKeyMap>, feature: "storage" | "system" = "storage"): { ready: true } | { ready: false; reason: string } {
   const problem = validateEndpoint(endpoint)
   if (problem) return { ready: false, reason: problem }
+  if (feature === "system" && endpoint.kind === "opencode") {
+    return { ready: false, reason: "System analysis needs a provider with tool calling. Choose OpenRouter, OpenAI or a local model in Settings." }
+  }
   switch (endpoint.kind) {
     case "openai":
       return keys.openai ? { ready: true } : { ready: false, reason: "Add your OpenAI API key in Settings, or switch to another provider." }

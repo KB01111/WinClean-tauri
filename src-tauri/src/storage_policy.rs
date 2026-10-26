@@ -17,7 +17,7 @@
 
 use serde::Serialize;
 
-use crate::cleanup::is_cleanup_protected_path;
+use crate::cleanup::{is_cleanup_protected_path, is_protected_path};
 use crate::db::Database;
 use crate::pathutil::{is_within, norm_path};
 
@@ -109,12 +109,17 @@ impl StoragePolicy {
         Ok(Self::new(roots, exclusions(db)))
     }
 
+    /// Re-read the user's exclusions (they can change while a long job runs); project roots are kept.
+    pub fn refresh_exclusions(&mut self, db: &Database) {
+        self.exclusions = exclusions(db).iter().map(|e| norm_path(e)).filter(|e| !e.is_empty()).collect();
+    }
+
     pub fn project_root_count(&self) -> usize {
         self.project_roots.len()
     }
 
     /// Why `path` must not be a cleanup candidate, if it must not.
-    /// Like [`check_with`], also honouring the attributes recorded by the scan.
+    /// Like [`check_for_cleanup`], also honouring the attributes recorded by the scan.
     pub fn check_entry(&self, entry: &crate::db::FileSearchResult, allow_documents: bool) -> Option<Blocked> {
         if entry.is_reparse_point {
             return blocked(BlockReason::ReparsePoint, "A link or junction, not a regular file");
@@ -125,16 +130,27 @@ impl StoragePolicy {
         if entry.is_system {
             return blocked(BlockReason::SystemFile, "Marked as a system file");
         }
-        self.check_with(&entry.path, entry.extension.as_deref(), allow_documents)
+        self.check_for_cleanup(&entry.path, entry.extension.as_deref(), allow_documents)
+    }
+
+    /// Cleanup view: a user's Temp and crash-dump folders may be cleaned (their age is checked elsewhere).
+    pub fn check_for_cleanup(&self, path: &str, extension: Option<&str>, allow_documents: bool) -> Option<Blocked> {
+        self.check_inner(path, extension, allow_documents, true)
+    }
+
+    /// Strict view, for anything that would *read* a file (duplicate comparison): every
+    /// application-data location, Temp included, is off limits.
+    pub fn check_with(&self, path: &str, extension: Option<&str>, allow_documents: bool) -> Option<Blocked> {
+        self.check_inner(path, extension, allow_documents, false)
     }
 
     pub fn check(&self, path: &str, extension: Option<&str>) -> Option<Blocked> {
         self.check_with(path, extension, false)
     }
 
-    /// Like [`check`], optionally letting documents through (for the Downloads rule).
-    pub fn check_with(&self, path: &str, extension: Option<&str>, allow_documents: bool) -> Option<Blocked> {
-        if is_cleanup_protected_path(path) {
+    fn check_inner(&self, path: &str, extension: Option<&str>, allow_documents: bool, allow_scratch: bool) -> Option<Blocked> {
+        let protected = if allow_scratch { is_cleanup_protected_path(path) } else { is_protected_path(path) };
+        if protected {
             return blocked(BlockReason::SystemLocation, "System, program, application-data or Recycle Bin location");
         }
         let norm = norm_path(path);
@@ -229,7 +245,8 @@ mod tests {
     fn only_the_user_temp_and_crash_dump_folders_are_opened_up_inside_appdata() {
         let p = StoragePolicy::default();
         for path in ["C:\\Users\\me\\AppData\\Local\\Temp\\a.tmp", "D:\\Users\\me\\AppData\\Local\\Temp\\sub\\b.log", "C:\\Users\\me\\AppData\\Local\\CrashDumps\\x.dmp"] {
-            assert_eq!(p.check(path, None), None, "{path}");
+            assert_eq!(p.check_for_cleanup(path, None, false), None, "{path}");
+            assert_eq!(p.check_with(path, None, true).map(|b| b.reason), Some(BlockReason::SystemLocation), "reading (duplicate comparison) stays off limits: {path}");
         }
         for path in [
             "C:\\Users\\me\\AppData\\Local\\Temp",
@@ -240,8 +257,21 @@ mod tests {
             "C:\\Other\\AppData\\Local\\Temp\\a.tmp",
             "C:\\Users\\me\\AppData\\Local\\Temp\\Windows\\a.tmp",
         ] {
-            assert_eq!(p.check(path, None).map(|b| b.reason), Some(BlockReason::SystemLocation), "{path}");
+            assert_eq!(p.check_for_cleanup(path, None, false).map(|b| b.reason), Some(BlockReason::SystemLocation), "{path}");
         }
+    }
+
+    #[test]
+    fn an_exclusion_added_later_applies_after_a_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("t.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut p = StoragePolicy::default();
+        assert_eq!(p.check_with("D:\\Photos\\a.png", None, true), None);
+        add_exclusion(&db, "D:\\Photos").unwrap();
+        assert_eq!(p.check_with("D:\\Photos\\a.png", None, true), None, "a loaded policy is a snapshot");
+        p.refresh_exclusions(&db);
+        assert_eq!(p.check_with("D:\\Photos\\a.png", None, true).map(|b| b.reason), Some(BlockReason::UserExcluded));
     }
 
     #[test]

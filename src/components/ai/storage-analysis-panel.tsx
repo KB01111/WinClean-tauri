@@ -81,8 +81,13 @@ export function StorageAnalysisPanel({
           const parsed = parseStorageReply(text)
           if (!parsed.ok) throw new Error(parsed.error)
           summary = parsed.reply.summary
-          proposals = parsed.reply.proposals
-          source = "ai"
+          if (parsed.reply.proposals.length === 0 && proposals.length > 0) {
+            // A valid but empty answer must not hide candidates WinClean has already approved.
+            fallbackNote = "The model suggested nothing, although WinClean found candidates. Showing WinClean's own grouping instead."
+          } else {
+            proposals = parsed.reply.proposals
+            source = "ai"
+          }
         } catch (aiError) {
           fallbackNote = `${formatError(aiError)} Showing WinClean's own grouping instead.`
         }

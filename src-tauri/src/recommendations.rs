@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cleanup::{cleanup_candidate_id, cleanup_reason, is_cleanup_protected_path, is_user_temp_file, CleanupRisk},
+    cleanup::{cleanup_candidate_id, cleanup_reason, is_cleanup_protected_path, is_user_temp_file, validate_scratch_age, CleanupRisk},
     db::{CleanupFileRecord, Database},
     storage_policy::{is_document_type, StoragePolicy},
 };
@@ -219,7 +219,12 @@ fn classify(
     // Source-code projects, cloud-synced folders, databases/VM disks/key material and
     // user-excluded locations are never candidates. Documents are only offered by the
     // explicit "old file in Downloads" rule below.
-    if policy.check_with(&record.path, record.extension.as_deref(), true).is_some() {
+    if policy.check_for_cleanup(&record.path, record.extension.as_deref(), true).is_some() {
+        return None;
+    }
+    // Temp and crash-dump folders: nothing is offered until it has been untouched for a week,
+    // whichever rule would otherwise match.
+    if validate_scratch_age(&record.path, record.modified_at_ms, unix_millis()).is_err() {
         return None;
     }
 
@@ -239,7 +244,7 @@ fn classify(
     }
 
     // Windows' own Disk Cleanup removes Temp files that have not been touched for a week.
-    if age_days.unwrap_or(0) >= TEMP_FILE_DAYS && is_user_temp_file(&record.path) {
+    if age_days.unwrap_or(0) >= TEMP_FILE_DAYS && is_user_temp_file(&record.path) && !record.extension.as_deref().map(is_document_type).unwrap_or(false) {
         return Some(candidate(
             scan_run_id,
             record,

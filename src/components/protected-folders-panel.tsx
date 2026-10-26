@@ -11,12 +11,13 @@ import { api, formatError } from "@/lib/api"
  * on top of the built-in protection for system folders, code projects and cloud-synced folders.
  */
 export function ProtectedFoldersPanel() {
-  const [folders, setFolders] = useState<string[]>([])
+  const [folders, setFolders] = useState<string[] | null>(null)
   const [input, setInput] = useState("")
   const [pending, setPending] = useState(false)
 
   useEffect(() => {
-    api.storageExclusions().then(setFolders).catch(() => {})
+    // The startup list must not replace a list the user has already changed.
+    api.storageExclusions().then((initial) => setFolders((current) => current ?? initial)).catch(() => setFolders((current) => current ?? []))
   }, [])
 
   async function add() {
@@ -62,7 +63,7 @@ export function ProtectedFoldersPanel() {
           Protect folder
         </Button>
       </div>
-      {folders.length > 0 ? (
+      {folders && folders.length > 0 ? (
         <ul className="mt-3 space-y-1">
           {folders.map((path) => (
             <li key={path} className="flex items-center justify-between gap-2 rounded-md border border-border px-3 py-1.5 text-sm">

@@ -115,7 +115,7 @@ function OpenRouterSection({ endpoint, setEndpoint, keys, onKeyChanged }: { endp
   return (
     <div className="space-y-3">
       <p className="text-sm text-muted-foreground">
-        OpenRouter offers many models at no cost. Create a free key at openrouter.ai/keys; it is stored in Windows Credential Manager. Free models are limited to about 50 requests per day (1,000 with $10 of credit) — one analysis uses one request. Only file metadata (paths, sizes, dates) is sent, never file contents, and free-model providers may log prompts.
+        OpenRouter offers many models at no cost. Create a free key at openrouter.ai/keys; it is stored in Windows Credential Manager. Free models are limited to about 50 requests per day (1,000 with $10 of credit) — one analysis uses one request. Only file metadata (paths, sizes, dates) is sent, never file contents, and free-model providers may log prompts. The system analysis (Insights → System) also sends service, process, battery and hardware names and needs a model with tool support (marked “tools” in the list).
       </p>
       <KeyEditor provider="openrouter" label="OpenRouter" placeholder="sk-or-..." configured={keys.openrouter} onChanged={onKeyChanged} />
       <Field label="Free model" hint="“Free models router” lets OpenRouter pick whichever free model is available.">

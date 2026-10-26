@@ -48,6 +48,7 @@ export function useStorage({ onNavigate }: { onNavigate: (view: View) => void })
   const [driveStatus, setDriveStatus] = useState<GoogleDriveStatus | null>(null)
   const [health, setHealth] = useState<AppHealth | null>(null)
   const [aiKeys, setAiKeys] = useState<AiKeyMap>({ openai: false, openrouter: false })
+  const touchedAiKeys = useRef(new Set<AiKeyProvider>())
   const [message, setMessage] = useState<string | null>(null)
   const [loadingVolumes, setLoadingVolumes] = useState(true)
   const [loadingData, setLoadingData] = useState(false)
@@ -164,7 +165,16 @@ export function useStorage({ onNavigate }: { onNavigate: (view: View) => void })
     void refreshDashboard()
     api
       .aiKeyStatuses()
-      .then((statuses) => setAiKeys((current) => ({ ...current, ...statuses })))
+      .then((statuses) =>
+        // A key saved or removed in Settings while this was loading is newer than this answer.
+        setAiKeys((current) => {
+          const next = { ...current }
+          for (const provider of Object.keys(statuses) as AiKeyProvider[]) {
+            if (!touchedAiKeys.current.has(provider)) next[provider] = statuses[provider]
+          }
+          return next
+        })
+      )
       .catch(() => {})
   }, [refreshDashboard, refreshVolumes])
 
@@ -401,7 +411,10 @@ export function useStorage({ onNavigate }: { onNavigate: (view: View) => void })
     driveStatus,
     health,
     aiKeys,
-    setAiKey: (provider: AiKeyProvider, configured: boolean) => setAiKeys((current) => ({ ...current, [provider]: configured })),
+    setAiKey: (provider: AiKeyProvider, configured: boolean) => {
+      touchedAiKeys.current.add(provider)
+      setAiKeys((current) => ({ ...current, [provider]: configured }))
+    },
     message,
     isScanning,
     loadingVolumes,
