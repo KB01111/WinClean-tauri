@@ -75,7 +75,7 @@ fn on_battery() -> bool {
 
 /// WinClean's verified view of a scan: what may be cleaned or offloaded, what needs
 /// judgment, what is protected, and optionally a selection that meets a goal.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn storage_evaluate(state: State<'_, AppState>, run_id: Option<i64>, query: Option<StorageQuery>) -> Result<Option<StorageEvaluation>, String> {
     let Some(run_id) = run_or_latest(&state, run_id)? else {
         return Ok(None);
@@ -85,7 +85,7 @@ pub fn storage_evaluate(state: State<'_, AppState>, run_id: Option<i64>, query: 
 
 /// Resolve model proposals against WinClean's own candidates. A model only supplies
 /// candidate ids; sizes, actions and files are recomputed and re-checked on disk here.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn storage_validate_proposals(state: State<'_, AppState>, run_id: i64, proposals: Vec<ProposalInput>) -> Result<Vec<ValidatedProposal>, String> {
     let db = state.db.clone();
     let check = move |item: &storage_ai::EvaluatedItem| {
@@ -95,7 +95,7 @@ pub fn storage_validate_proposals(state: State<'_, AppState>, run_id: i64, propo
     storage_ai::validate_proposals(&state.db, run_id, &proposals, &check).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn duplicate_report_for(state: State<'_, AppState>, run_id: Option<i64>, min_size: Option<u64>) -> Result<Option<DuplicateReport>, String> {
     let Some(run_id) = run_or_latest(&state, run_id)? else {
         return Ok(None);

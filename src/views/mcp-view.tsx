@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Copy, Loader2, RefreshCw } from "lucide-react"
 import { toast } from "sonner"
 
@@ -33,18 +33,34 @@ export function McpView() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
+  // A slow load must not overwrite newer results, such as a verification the panel just applied.
+  const requestSeq = useRef(0)
+
   const load = useCallback(async (refresh = false) => {
+    const seq = ++requestSeq.current
     setLoading(true)
     try {
       const [next, authorised] = await Promise.all([api.optimizerMcpStatus(refresh), api.optimizerMcpSearchRoots()])
+      if (seq !== requestSeq.current) return
       setStatus(next)
       setRoots(authorised)
       setError(null)
     } catch (e) {
-      setError(formatError(e))
+      if (seq === requestSeq.current) setError(formatError(e))
     } finally {
-      setLoading(false)
+      if (seq === requestSeq.current) setLoading(false)
     }
+  }, [])
+
+  const applyStatus = useCallback((next: McpStatus) => {
+    requestSeq.current += 1
+    setLoading(false)
+    setStatus(next)
+  }, [])
+  const applyRoots = useCallback((next: string[]) => {
+    requestSeq.current += 1
+    setLoading(false)
+    setRoots(next)
   }, [])
 
   useEffect(() => {
@@ -92,7 +108,7 @@ export function McpView() {
         ) : null}
       </Panel>
 
-      {status ? <FileExplorerMcpPanel status={status} roots={roots} onStatus={setStatus} onRoots={setRoots} /> : null}
+      {status ? <FileExplorerMcpPanel status={status} roots={roots} onStatus={applyStatus} onRoots={applyRoots} /> : null}
 
       <Panel title="Use WinClean from another agent (for example Lumen)">
         <p className="mb-3 text-sm text-muted-foreground">

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Copy, FolderOpen, Loader2, Square } from "lucide-react"
 import { toast } from "sonner"
 
@@ -51,12 +51,19 @@ export function DuplicatesPanel({ scanRuns, activeRun }: { scanRuns: ScanRunReco
   const [error, setError] = useState<string | null>(null)
   const [shown, setShown] = useState({ confirmed: SHOWN_GROUPS, possible: SHOWN_GROUPS })
 
+  const currentRun = useRef<number | null>(runId)
+  useEffect(() => {
+    currentRun.current = runId
+  }, [runId])
+
   const loadReport = useCallback(async () => {
     if (runId === null) return
     try {
-      setReport(await api.duplicateReport(runId))
+      const next = await api.duplicateReport(runId)
+      // The answer for a run the user has since left must not replace the new run's report.
+      if (currentRun.current === runId) setReport(next)
     } catch (e) {
-      setError(formatError(e))
+      if (currentRun.current === runId) setError(formatError(e))
     }
   }, [runId])
 
