@@ -486,36 +486,100 @@ export type CapabilityReport = {
 
 export type ToolPolicy =
   | "metadataOnly"
+  | "consentedSearch"
   | "contentRead"
   | "destructive"
   | "unknown"
 
-export type McpTool = {
+export type McpToolView = {
   name: string
   description: string | null
   policy: ToolPolicy
+  policyNote: string
+  arguments: string[]
+  required: string[]
 }
 
-export type McpServer = {
+export type McpServerIdentity = "microsoftFileExplorer" | "microsoftPublished" | "thirdParty" | "unverified"
+export type McpConnectionMethod = "odrProxy" | "manifestCommandOnly" | "unavailable"
+
+export type McpRegisteredServer = {
   id: string
   name: string
   description: string | null
-  tools: McpTool[]
-  isFileExplorer: boolean
-  raw: unknown
+  version: string | null
+  identifier: string | null
+  packageFamilyName: string | null
+  identity: McpServerIdentity
+  impersonationWarning: boolean
+  connection: McpConnectionMethod
+  declaredTools: { name: string; description: string | null; policy: ToolPolicy }[]
 }
 
-export type McpDiscovery = {
-  odrAvailable: boolean
+export type McpOdrStatus = {
+  found: boolean
+  path: string | null
+  trustedLocation: string | null
   windowsBuild: number | null
   buildSupported: boolean | null
-  servers: McpServer[]
-  fileExplorerFound: boolean
-  notes: string[]
-  rawExcerpt: string | null
+  registryFormat: string | null
+  attempts: { command: string; outcome: string }[]
+  error: string | null
 }
 
-export type McpProbe = { serverInfo: unknown; tools: McpTool[] }
+export type McpFileExplorerStatus = {
+  serverId: string
+  name: string
+  identity: McpServerIdentity
+  connectionMethod: McpConnectionMethod
+  connection: "notAttempted" | "connected" | "agentUserNeeded" | "failed"
+  connectionDetail: string | null
+  protocolVersion: string | null
+  declaredTools: McpToolView[]
+  liveTools: McpToolView[] | null
+  toolsMatchDeclaration: boolean | null
+  search: {
+    available: boolean
+    source: string
+    arguments: string[]
+    fileTypes: boolean
+    startDate: boolean
+    endDate: boolean
+    semantic: "notAdvertised" | "advertisedNeedsCopilotPlus" | "available"
+    fallback: string
+  }
+  permission: "unknown" | "granted" | "denied"
+  permissionDetail: string | null
+  verifiedExecution: boolean
+  lastVerifiedMs: number | null
+}
+
+export type McpStatus = {
+  odr: McpOdrStatus
+  servers: McpRegisteredServer[]
+  fileExplorer: McpFileExplorerStatus | null
+  notes: string[]
+  fallback: string
+}
+
+export type McpSearchArgs = {
+  startingDir: string
+  patterns: string
+  fileTypes?: string[]
+  includeSnippets?: boolean
+  semantic?: boolean
+  limit?: number
+}
+
+export type McpSearchHit = { name: string; path: string; dateCreated: string | null; snippet: string | null }
+
+export type McpSearchOutcome = {
+  hits: McpSearchHit[]
+  rejected: number
+  truncated: boolean
+  plan: { usedArguments: string[]; unsupportedFilters: string[]; semantic: boolean }
+  notes: string[]
+}
 
 // ---------------------------------------------------------------------------
 // History

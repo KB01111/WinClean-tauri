@@ -460,7 +460,8 @@ pub fn open_url(url: String) -> Result<(), String> {
 }
 
 const AI_CREDENTIAL_SERVICE: &str = "WinClean AI";
-const AI_API_KEY_USER: &str = "openai_api_key";
+/// Cloud providers whose API key can be stored (OpenCode signs in through its own CLI). `openai` keeps its original credential name.
+pub const AI_PROVIDERS: [&str; 2] = ["openai", "openrouter"];
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -468,45 +469,61 @@ pub struct AiKeyStatus {
     pub configured: bool,
 }
 
-fn ai_credential_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(AI_CREDENTIAL_SERVICE, AI_API_KEY_USER)
+fn ai_credential_user(provider: Option<&str>) -> Result<String, String> {
+    let provider = provider.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("openai");
+    if !AI_PROVIDERS.contains(&provider) {
+        return Err(format!("Unknown AI provider \"{provider}\"."));
+    }
+    Ok(format!("{provider}_api_key"))
+}
+
+fn ai_credential_entry(provider: Option<&str>) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(AI_CREDENTIAL_SERVICE, &ai_credential_user(provider)?)
         .map_err(|error| format!("open Windows Credential Manager entry: {error}"))
 }
 
-#[tauri::command]
-pub fn ai_key_status() -> Result<AiKeyStatus, String> {
-    let configured = ai_credential_entry()
-        .ok()
-        .and_then(|entry| entry.get_password().ok())
-        .is_some();
-    Ok(AiKeyStatus { configured })
+fn key_is_configured(provider: &str) -> bool {
+    ai_credential_entry(Some(provider)).ok().and_then(|entry| entry.get_password().ok()).is_some()
 }
 
 #[tauri::command]
-pub fn set_ai_api_key(api_key: String) -> Result<AiKeyStatus, String> {
+pub fn ai_key_status(provider: Option<String>) -> Result<AiKeyStatus, String> {
+    ai_credential_user(provider.as_deref())?;
+    Ok(AiKeyStatus { configured: key_is_configured(provider.as_deref().map(str::trim).filter(|p| !p.is_empty()).unwrap_or("openai")) })
+}
+
+/// Which providers have a key stored, without returning any key.
+#[tauri::command]
+pub fn ai_key_statuses() -> HashMap<String, bool> {
+    AI_PROVIDERS.iter().map(|p| (p.to_string(), key_is_configured(p))).collect()
+}
+
+#[tauri::command]
+pub fn set_ai_api_key(api_key: String, provider: Option<String>) -> Result<AiKeyStatus, String> {
     let trimmed = api_key.trim();
     if trimmed.is_empty() {
         return Err("API key cannot be empty.".to_string());
     }
-    ai_credential_entry()?
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("An API key cannot contain spaces or line breaks.".to_string());
+    }
+    ai_credential_entry(provider.as_deref())?
         .set_password(trimmed)
         .map_err(|error| format!("store AI API key: {error}"))?;
-    ai_key_status()
+    ai_key_status(provider)
 }
 
 #[tauri::command]
-pub fn clear_ai_api_key() -> Result<AiKeyStatus, String> {
-    if let Ok(entry) = ai_credential_entry() {
+pub fn clear_ai_api_key(provider: Option<String>) -> Result<AiKeyStatus, String> {
+    if let Ok(entry) = ai_credential_entry(provider.as_deref()) {
         let _ = entry.delete_credential();
     }
-    ai_key_status()
+    ai_key_status(provider)
 }
 
 #[tauri::command]
-pub fn get_ai_api_key() -> Result<Option<String>, String> {
-    Ok(ai_credential_entry()
-        .ok()
-        .and_then(|entry| entry.get_password().ok()))
+pub fn get_ai_api_key(provider: Option<String>) -> Result<Option<String>, String> {
+    Ok(ai_credential_entry(provider.as_deref())?.get_password().ok())
 }
 
 #[tauri::command]

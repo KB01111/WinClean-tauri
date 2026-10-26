@@ -1,114 +1,66 @@
-import { useState } from "react"
-import { Loader2 } from "lucide-react"
+import { AlertTriangle } from "lucide-react"
 
-import { Notice, TextInput } from "@/components/common"
 import { Badge, type BadgeTone } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { api, formatError } from "@/lib/api"
-import type { McpServer, McpTool, ToolPolicy } from "@/lib/optimizer"
+import type { McpRegisteredServer, McpServerIdentity, ToolPolicy } from "@/lib/optimizer"
 
-const POLICY: Record<ToolPolicy, { label: string; tone: BadgeTone; why: string }> = {
-  metadataOnly: { label: "Allowed", tone: "good", why: "Returns metadata such as names, sizes and dates. WinClean may call it." },
-  contentRead: { label: "Blocked", tone: "warn", why: "Would read file contents. WinClean never reads file contents through MCP." },
-  destructive: { label: "Blocked", tone: "bad", why: "Could change or delete data. WinClean never calls it." },
-  unknown: { label: "Blocked", tone: "warn", why: "WinClean does not recognise this tool, so it is blocked until classified." },
+const POLICY: Record<ToolPolicy, { label: string; tone: BadgeTone }> = {
+  metadataOnly: { label: "Metadata only", tone: "good" },
+  consentedSearch: { label: "Search, with consent", tone: "info" },
+  contentRead: { label: "Blocked: reads content", tone: "warn" },
+  destructive: { label: "Blocked: can change data", tone: "bad" },
+  unknown: { label: "Blocked: unclassified", tone: "warn" },
 }
 
-function ToolList({ tools }: { tools: McpTool[] }) {
-  return (
-    <ul className="grid gap-1.5">
-      {tools.map((tool) => {
-        const p = POLICY[tool.policy]
-        return (
-          <li key={tool.name} className="flex flex-wrap items-start justify-between gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm">
-            <span className="min-w-0">
-              <code className="font-medium">{tool.name}</code>
-              {tool.description ? <span className="block text-xs text-muted-foreground">{tool.description}</span> : null}
-              <span className="block text-xs text-muted-foreground">{p.why}</span>
-            </span>
-            <Badge tone={p.tone}>{p.label}</Badge>
-          </li>
-        )
-      })}
-    </ul>
-  )
+const IDENTITY: Record<McpServerIdentity, { label: string; tone: BadgeTone }> = {
+  microsoftFileExplorer: { label: "Microsoft File Explorer", tone: "good" },
+  microsoftPublished: { label: "Microsoft", tone: "info" },
+  thirdParty: { label: "Third party", tone: "warn" },
+  unverified: { label: "Publisher unverified", tone: "warn" },
 }
 
 /**
- * One Windows MCP server from the on-device registry. Inspecting it only lists
- * its tools; WinClean's single call is File Explorer metadata for one path,
- * and only through the permission-aware policy in the backend.
+ * One server from the Windows on-device MCP registry. This is discovery only:
+ * WinClean never starts a server because it appears here, and every tool it
+ * declares is classified by WinClean's own policy.
  */
-export function McpServerCard({ server }: { server: McpServer }) {
-  const [tools, setTools] = useState<McpTool[] | null>(server.tools.length ? server.tools : null)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [path, setPath] = useState("")
-  const [details, setDetails] = useState<unknown>(null)
-
-  async function inspect() {
-    setBusy(true)
-    setError(null)
-    try {
-      setTools((await api.optimizerMcpProbe(server.id)).tools)
-    } catch (e) {
-      setError(formatError(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function lookup() {
-    if (!path.trim()) return
-    setBusy(true)
-    setError(null)
-    try {
-      setDetails(await api.optimizerMcpFileDetails(server.id, path.trim().replace(/^"(.*)"$/, "$1")))
-    } catch (e) {
-      setError(formatError(e))
-      setDetails(null)
-    } finally {
-      setBusy(false)
-    }
-  }
-
+export function McpServerCard({ server }: { server: McpRegisteredServer }) {
+  const identity = IDENTITY[server.identity]
   return (
     <section className="rounded-lg border border-border bg-card p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
-          <h4 className="font-medium">{server.name}</h4>
+          <h4 className="font-medium">
+            {server.name}
+            {server.version ? <span className="ml-2 text-xs font-normal text-muted-foreground">{server.version}</span> : null}
+          </h4>
           {server.description ? <p className="text-xs text-muted-foreground">{server.description}</p> : null}
         </div>
-        <div className="flex items-center gap-2">
-          {server.isFileExplorer ? <Badge tone="info">File Explorer</Badge> : null}
-          <Button size="sm" variant="outline" onClick={() => void inspect()} disabled={busy}>
-            {busy ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
-            {tools ? "Re-inspect tools" : "Inspect tools"}
-          </Button>
-        </div>
+        <Badge tone={identity.tone}>{identity.label}</Badge>
       </div>
-      {error ? (
-        <div className="mt-3">
-          <Notice tone="warning" text={error} />
-        </div>
+      {server.impersonationWarning ? (
+        <p className="mt-2 flex items-start gap-1.5 text-xs text-destructive">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          Named like File Explorer but not proven to be Microsoft&apos;s connector, so WinClean will not use it.
+        </p>
       ) : null}
-      {tools ? (
-        <div className="mt-3">
-          <ToolList tools={tools} />
-        </div>
-      ) : null}
-      {server.isFileExplorer && tools ? (
-        <div className="mt-4 space-y-2">
-          <h5 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">File details (metadata only)</h5>
-          <div className="flex flex-wrap gap-2">
-            <TextInput value={path} onChange={(e) => setPath(e.target.value)} onKeyDown={(e) => e.key === "Enter" && void lookup()} placeholder={String.raw`C:\Users\you\Downloads\file.zip`} aria-label="Path to look up" className="max-w-md flex-1" />
-            <Button onClick={() => void lookup()} disabled={busy || !path.trim()}>
-              Get details
-            </Button>
-          </div>
-          {details != null ? <pre className="max-h-64 overflow-auto rounded-md bg-muted p-3 text-xs">{JSON.stringify(details, null, 2)}</pre> : null}
-        </div>
-      ) : null}
+      {server.declaredTools.length > 0 ? (
+        <ul className="mt-3 grid gap-1">
+          {server.declaredTools.map((tool) => {
+            const p = POLICY[tool.policy]
+            return (
+              <li key={tool.name} className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <span className="min-w-0">
+                  <code className="font-medium">{tool.name}</code>
+                  {tool.description ? <span className="ml-2 text-xs text-muted-foreground">{tool.description}</span> : null}
+                </span>
+                <Badge tone={p.tone}>{p.label}</Badge>
+              </li>
+            )
+          })}
+        </ul>
+      ) : (
+        <p className="mt-2 text-xs text-muted-foreground">This server declares no tools in the registry.</p>
+      )}
     </section>
   )
 }

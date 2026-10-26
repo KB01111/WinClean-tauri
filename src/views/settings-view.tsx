@@ -14,10 +14,11 @@ import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
 import { AiSettingsPanel } from "@/components/ai/ai-settings-panel"
+import { ProtectedFoldersPanel } from "@/components/protected-folders-panel"
 import { ElevationBanner } from "@/components/optimizer/elevation-banner"
 import { Panel, Posture, SummaryList } from "@/components/common"
 import { useTheme } from "@/components/theme-provider"
-import { api, formatError, type AppHealth, type GoogleDriveStatus } from "@/lib/api"
+import { api, formatError, type AiKeyMap, type AiKeyProvider, type AppHealth, type GoogleDriveStatus } from "@/lib/api"
 import { formatNumber } from "@/lib/format"
 import { useHelper } from "@/hooks/use-helper"
 import { cn } from "@/lib/utils"
@@ -50,7 +51,7 @@ export function SettingsView({
   onDisconnectDrive,
   onExportDiagnostics,
   diagnosticsPending,
-  aiKeyConfigured,
+  aiKeys,
   onAiKeyChanged,
 }: {
   health: AppHealth | null
@@ -59,8 +60,8 @@ export function SettingsView({
   onDisconnectDrive: () => void
   onExportDiagnostics: () => void
   diagnosticsPending: boolean
-  aiKeyConfigured: boolean
-  onAiKeyChanged: (configured: boolean) => void
+  aiKeys: AiKeyMap
+  onAiKeyChanged: (provider: AiKeyProvider, configured: boolean) => void
 }) {
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
@@ -101,9 +102,11 @@ export function SettingsView({
         </Panel>
 
         <AiSettingsPanel
-          configured={aiKeyConfigured}
+          keys={aiKeys}
           onChanged={onAiKeyChanged}
         />
+
+        <ProtectedFoldersPanel />
 
         <HelperPanel />
 

@@ -8,6 +8,8 @@ import {
   api,
   emptyScanProgress,
   formatError,
+  type AiKeyMap,
+  type AiKeyProvider,
   type AppHealth,
   type CleanupActionRecord,
   type GoogleDriveStatus,
@@ -45,7 +47,8 @@ export function useStorage({ onNavigate }: { onNavigate: (view: View) => void })
   const [offloadJobs, setOffloadJobs] = useState<OffloadJobStatus[]>([])
   const [driveStatus, setDriveStatus] = useState<GoogleDriveStatus | null>(null)
   const [health, setHealth] = useState<AppHealth | null>(null)
-  const [aiKeyConfigured, setAiKeyConfigured] = useState(false)
+  const [aiKeys, setAiKeys] = useState<AiKeyMap>({ openai: false, openrouter: false })
+  const touchedAiKeys = useRef(new Set<AiKeyProvider>())
   const [message, setMessage] = useState<string | null>(null)
   const [loadingVolumes, setLoadingVolumes] = useState(true)
   const [loadingData, setLoadingData] = useState(false)
@@ -161,8 +164,17 @@ export function useStorage({ onNavigate }: { onNavigate: (view: View) => void })
     void refreshVolumes()
     void refreshDashboard()
     api
-      .aiKeyStatus()
-      .then((status) => setAiKeyConfigured(status.configured))
+      .aiKeyStatuses()
+      .then((statuses) =>
+        // A key saved or removed in Settings while this was loading is newer than this answer.
+        setAiKeys((current) => {
+          const next = { ...current }
+          for (const provider of Object.keys(statuses) as AiKeyProvider[]) {
+            if (!touchedAiKeys.current.has(provider)) next[provider] = statuses[provider]
+          }
+          return next
+        })
+      )
       .catch(() => {})
   }, [refreshDashboard, refreshVolumes])
 
@@ -398,8 +410,11 @@ export function useStorage({ onNavigate }: { onNavigate: (view: View) => void })
     offloadJobs,
     driveStatus,
     health,
-    aiKeyConfigured,
-    setAiKeyConfigured,
+    aiKeys,
+    setAiKey: (provider: AiKeyProvider, configured: boolean) => {
+      touchedAiKeys.current.add(provider)
+      setAiKeys((current) => ({ ...current, [provider]: configured }))
+    },
     message,
     isScanning,
     loadingVolumes,

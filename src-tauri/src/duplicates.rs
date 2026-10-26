@@ -156,7 +156,7 @@ pub fn verify_duplicates(
     progress: &Progress,
 ) -> anyhow::Result<VerifySummary> {
     let options = options.clone().clamped();
-    let policy = StoragePolicy::load(db, run_id)?;
+    let mut policy = StoragePolicy::load(db, run_id)?;
     let known = db.valid_hashes(run_id)?;
     let heads = db.valid_heads(run_id)?;
     let groups = db.duplicate_size_groups(run_id, options.min_size, MAX_GROUPS_EXAMINED)?;
@@ -173,7 +173,9 @@ pub fn verify_duplicates(
             break;
         }
 
-        // Skip what policy protects or the user excluded: those are never read.
+        // Skip what policy protects or the user excluded: those are never read. A folder excluded
+        // while this job runs applies from the next group on.
+        policy.refresh_exclusions(db);
         let mut eligible = Vec::new();
         for file in group.files {
             if policy.check_with(&file.path, file.extension.as_deref(), true).is_some() {

@@ -207,7 +207,8 @@ pub fn select_for_goal(items: &[EvaluatedItem], goal_bytes: u64) -> GoalSelectio
     let mut selected = Vec::new();
     let mut total = 0u64;
     for item in ordered {
-        if total >= goal_bytes {
+        // A single proposal can hold at most MAX_IDS_PER_PROPOSAL files, so a goal is built from the biggest ones.
+        if total >= goal_bytes || selected.len() >= MAX_IDS_PER_PROPOSAL {
             break;
         }
         total += item.size;
@@ -217,7 +218,11 @@ pub fn select_for_goal(items: &[EvaluatedItem], goal_bytes: u64) -> GoalSelectio
     let note = if shortfall == 0 {
         format!("{} item(s), {} — enough for the goal of {}", selected.len(), mb(total), mb(goal_bytes))
     } else {
-        format!("All safe candidates together give {}, {} short of {}", mb(total), mb(shortfall), mb(goal_bytes))
+        if selected.len() >= MAX_IDS_PER_PROPOSAL {
+            format!("The {} biggest safe candidates give {}, {} short of {} — clean them, then analyze again", selected.len(), mb(total), mb(shortfall), mb(goal_bytes))
+        } else {
+            format!("All safe candidates together give {}, {} short of {}", mb(total), mb(shortfall), mb(goal_bytes))
+        }
     };
     GoalSelection { goal_bytes, selected_ids: selected, selected_bytes: total, shortfall_bytes: shortfall, note }
 }
@@ -252,7 +257,16 @@ pub fn evaluate(db: &Database, run_id: i64, query: &StorageQuery) -> anyhow::Res
         }
     }
     let goal = query.goal_bytes.filter(|g| *g > 0).map(|g| select_for_goal(&verified, g));
+    // The listing is capped, but every item a goal selected must stay in it.
+    let kept_for_goal: Vec<EvaluatedItem> = match &goal {
+        Some(g) => {
+            let wanted: HashSet<&str> = g.selected_ids.iter().map(String::as_str).collect();
+            verified.iter().skip(limit).filter(|i| wanted.contains(i.id.as_str())).cloned().collect()
+        }
+        None => Vec::new(),
+    };
     verified.truncate(limit);
+    verified.extend(kept_for_goal);
     manual.truncate(limit);
 
     let (blocked, blocked_total) = blocked_matches(db, run_id, query, &plan.candidates)?;
@@ -651,7 +665,7 @@ mod tests {
             dir("C:\\Users\\me\\AppData\\Local\\Temp"),
             file("C:\\Users\\me\\AppData\\Local\\Temp\\old.tmp", 30 * MIB, 40),
             file("C:\\Users\\me\\Downloads\\setup.msi", 120 * MIB, 90),
-            file("C:\\Users\\me\\Downloads\\notes.docx", 2 * MIB, 90),
+            file("C:\\Users\\me\\Downloads\\notes.docx", 2 * MIB, 10),
             file("C:\\Users\\me\\Videos\\holiday.mp4", 400 * MIB, 200),
             file("C:\\Users\\me\\code\\app\\package.json", 1000, 1),
             file("C:\\Users\\me\\code\\app\\data\\dump.bin", 500 * MIB, 300),
@@ -708,6 +722,66 @@ mod tests {
         assert_eq!(q(&|q| q.folder = Some("C:\\Users\\me\\Downloads".into())), vec!["setup.msi"]);
         assert_eq!(q(&|q| q.name_contains = Some("HOLIDAY".into())), vec!["holiday.mp4"]);
         assert!(q(&|q| q.min_age_days = Some(150)).iter().all(|n| n == "holiday.mp4"));
+    }
+
+    #[test]
+    fn old_files_in_the_user_temp_folder_are_clean_candidates_and_recent_ones_are_not() {
+        let (_d, db, run) = seeded(vec![
+            dir("C:\\Users\\me\\AppData\\Local\\Temp"),
+            file("C:\\Users\\me\\AppData\\Local\\Temp\\installer-cache.dat", 50 * MIB, 20),
+            file("C:\\Users\\me\\AppData\\Local\\Temp\\in-use.dat", 60 * MIB, 2),
+            file("C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\big.dat", 70 * MIB, 200),
+        ]);
+        let ev = evaluate(&db, run, &StorageQuery::default()).unwrap();
+        let names: Vec<_> = ev.verified.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["installer-cache.dat"]);
+        assert_eq!(ev.verified[0].reason, "Old file in your Temp folder");
+        assert_eq!(ev.verified[0].action, RecommendedAction::RecycleBin);
+    }
+
+    #[test]
+    fn nothing_in_temp_is_offered_before_a_week_whatever_rule_matches_and_documents_are_left_alone() {
+        let (_d, db, run) = seeded(vec![
+            dir("C:\\Users\\me\\AppData\\Local\\Temp"),
+            file("C:\\Users\\me\\AppData\\Local\\Temp\\fresh.tmp", 50 * MIB, 2),
+            file("C:\\Users\\me\\AppData\\Local\\Temp\\fresh.log", 50 * MIB, 6),
+            file("C:\\Users\\me\\AppData\\Local\\Temp\\week-old.tmp", 50 * MIB, 8),
+            file("C:\\Users\\me\\AppData\\Local\\Temp\\report.docx", 50 * MIB, 30),
+            file("C:\\Users\\me\\AppData\\Local\\CrashDumps\\fresh.dmp", 50 * MIB, 1),
+        ]);
+        let ev = evaluate(&db, run, &StorageQuery::default()).unwrap();
+        let names: Vec<_> = ev.verified.iter().chain(ev.manual_review.iter()).map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["week-old.tmp"], "{names:?}");
+        // The execution-time check refuses the same files even if a stale id were replayed.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let two_days_ago = now - 2 * 86_400_000;
+        assert!(crate::cleanup::validate_scratch_age("C:\\Users\\me\\AppData\\Local\\Temp\\a.tmp", Some(two_days_ago), now).is_err());
+        assert!(crate::cleanup::validate_scratch_age("C:\\Users\\me\\AppData\\Local\\Temp\\a.tmp", Some(now - 8 * 86_400_000), now).is_ok());
+        assert!(crate::cleanup::validate_scratch_age("C:\\Users\\me\\Downloads\\a.tmp", Some(two_days_ago), now).is_ok(), "other folders keep the generic 24-hour rule");
+    }
+
+    #[test]
+    fn a_goal_keeps_every_selected_item_even_beyond_the_listing_limit() {
+        let mut entries = vec![dir("C:\\Users\\me\\Downloads")];
+        for i in 0..40 {
+            entries.push(file(&format!("C:\\Users\\me\\Downloads\\inst{i:02}.msi"), (100 + i) * MIB, 90));
+        }
+        let (_d, db, run) = seeded(entries);
+        let ev = evaluate(&db, run, &StorageQuery { goal_bytes: Some(3000 * MIB), limit: Some(5), ..Default::default() }).unwrap();
+        let goal = ev.goal.unwrap();
+        assert!(goal.selected_ids.len() > 5, "the goal needs more files than the listing limit");
+        let listed: std::collections::HashSet<_> = ev.verified.iter().map(|i| i.id.clone()).collect();
+        assert!(goal.selected_ids.iter().all(|id| listed.contains(id)), "every selected id is in the verified list");
+    }
+
+    #[test]
+    fn a_goal_never_selects_more_files_than_one_proposal_can_hold() {
+        let items: Vec<EvaluatedItem> = (0..700)
+            .map(|i| EvaluatedItem { id: format!("scan-1:entry-{i}"), path: format!("C:\\x\\{i}.tmp"), name: format!("{i}.tmp"), size: MIB, age_days: Some(40), kind: RecommendationKind::Clean, action: RecommendedAction::RecycleBin, risk: RecommendationRisk::Low, reason: "t".into(), evidence: vec![], duplicate_group: None, duplicate_copies: None })
+            .collect();
+        let g = select_for_goal(&items, 10_000 * MIB);
+        assert_eq!(g.selected_ids.len(), MAX_IDS_PER_PROPOSAL);
+        assert!(g.shortfall_bytes > 0 && g.note.contains("analyze again"), "{}", g.note);
     }
 
     #[test]

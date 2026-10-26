@@ -1,7 +1,8 @@
-import { Download, Flame, Loader2 } from "lucide-react"
+import { Download, Flame, ListChecks, Loader2, Sparkles } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import {
+  CapacityBar,
   DataTable,
   DistributionBar,
   EmptyState,
@@ -11,6 +12,8 @@ import {
   SummaryList,
 } from "@/components/common"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
+import { diskUsage, reclaimGroups, volumeForRoot } from "@/lib/reclaim"
+import type { View } from "@/lib/views"
 import type {
   CategorySummary,
   ExtensionSummary,
@@ -19,6 +22,7 @@ import type {
   ScanProgress,
   ScanRunRecord,
   TopDirectory,
+  VolumeInfo,
 } from "@/lib/api"
 
 /** Display scan totals, large files and directories, scan history, and file-type distributions. */
@@ -32,6 +36,8 @@ export function OverviewView({
   categories,
   extensions,
   recommendationPlan,
+  volumes,
+  onNavigate,
   onSelectRun,
   onOpenDirectory,
   onExportReport,
@@ -46,6 +52,8 @@ export function OverviewView({
   categories: CategorySummary[]
   extensions: ExtensionSummary[]
   recommendationPlan: RecommendationPlan | null
+  volumes: VolumeInfo[]
+  onNavigate: (view: View) => void
   onSelectRun: (run: ScanRunRecord) => void
   onOpenDirectory: (path: string) => void
   onExportReport: () => void
@@ -100,6 +108,10 @@ export function OverviewView({
             hint="access denied paths"
           />
         </div>
+
+        <DiskUsagePanel volumes={volumes} activeRun={activeRun} />
+
+        <ReclaimPanel plan={recommendationPlan} onNavigate={onNavigate} />
 
         <Panel
           title="Storage hogs"
@@ -304,5 +316,77 @@ function StorageHogBars({
         </button>
       ))}
     </div>
+  )
+}
+
+/** Used and free space from Windows, and how much of the used space the scan could see. */
+function DiskUsagePanel({ volumes, activeRun }: { volumes: VolumeInfo[]; activeRun: ScanRunRecord | null }) {
+  // Both the volume and the scanned total come from the selected run, so they always describe the same disk.
+  const volume = volumeForRoot(volumes, activeRun?.rootPath)
+  const usage = diskUsage(volume, activeRun?.bytesIndexed ?? 0)
+  if (!volume || !usage) return null
+  return (
+    <Panel title={`Disk ${volume.rootPath}`}>
+      <CapacityBar used={usage.used} total={usage.total} label={`Space used on ${volume.rootPath}`} />
+      <div className="mt-2 flex flex-wrap justify-between gap-x-4 text-sm">
+        <span>
+          {formatBytes(usage.used)} used of {formatBytes(usage.total)}
+        </span>
+        <span className="text-muted-foreground">{formatBytes(usage.free)} free</span>
+      </div>
+      {usage.unaccounted > usage.total * 0.02 ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          The scan accounts for {formatBytes(usage.scanned)}. About {formatBytes(usage.unaccounted)} is used by files WinClean cannot list — system files (pagefile, hibernation, Windows Update store), snapshots, or folders that denied access.
+        </p>
+      ) : null}
+    </Panel>
+  )
+}
+
+const KIND_LABEL = { clean: "Recycle Bin", offload: "Google Drive", review: "Your judgment" } as const
+
+/** Where recoverable space comes from, by the rule that found it. */
+function ReclaimPanel({ plan, onNavigate }: { plan: RecommendationPlan | null; onNavigate: (view: View) => void }) {
+  const groups = reclaimGroups(plan?.candidates ?? [])
+  const largest = Math.max(1, ...groups.map((g) => g.bytes))
+  return (
+    <Panel
+      title="What you can reclaim"
+      action={
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={() => onNavigate("cleanup")}>
+            <ListChecks className="size-4" aria-hidden="true" />
+            Recover space
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => onNavigate("insights")}>
+            <Sparkles className="size-4" aria-hidden="true" />
+            Ask AI
+          </Button>
+        </div>
+      }
+    >
+      {groups.length === 0 ? (
+        <EmptyState text={plan ? "Nothing worth cleaning was found" : "Run a scan to see what can be reclaimed"} />
+      ) : (
+        <div className="space-y-2">
+          {groups.map((group) => (
+            <div key={`${group.kind}-${group.reason}`}>
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <span className="flex min-w-0 items-center gap-2">
+                  <span className="truncate font-medium">{group.reason}</span>
+                  <StatusBadge status={group.kind} />
+                </span>
+                <span className="shrink-0 tabular-nums">
+                  {formatBytes(group.bytes)} <span className="text-xs text-muted-foreground">· {formatNumber(group.count)} · {KIND_LABEL[group.kind]}</span>
+                </span>
+              </div>
+              <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
+                <div className={group.kind === "clean" ? "h-full rounded-full bg-chart-2" : group.kind === "offload" ? "h-full rounded-full bg-chart-1" : "h-full rounded-full bg-muted-foreground/50"} style={{ width: `${Math.max(2, Math.round((group.bytes / largest) * 100))}%` }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
   )
 }

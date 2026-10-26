@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cleanup::{cleanup_candidate_id, cleanup_reason, is_protected_path, CleanupRisk},
+    cleanup::{cleanup_candidate_id, cleanup_reason, is_cleanup_protected_path, is_user_temp_file, validate_scratch_age, CleanupRisk},
     db::{CleanupFileRecord, Database},
     storage_policy::{is_document_type, StoragePolicy},
 };
@@ -13,6 +13,7 @@ const LARGE_INSTALLER_OR_ARCHIVE_BYTES: u64 = 50 * 1024 * 1024;
 const DUPLICATE_REVIEW_BYTES: u64 = 10 * 1024 * 1024;
 const OLD_DOWNLOAD_DAYS: u64 = 30;
 const STALE_FILE_DAYS: u64 = 180;
+const TEMP_FILE_DAYS: u64 = 7;
 const STALE_LARGE_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -212,13 +213,18 @@ fn classify(
     if record.is_reparse_point || record.is_placeholder || record.is_system {
         return None;
     }
-    if is_protected_path(&record.path) {
+    if is_cleanup_protected_path(&record.path) {
         return None;
     }
     // Source-code projects, cloud-synced folders, databases/VM disks/key material and
     // user-excluded locations are never candidates. Documents are only offered by the
     // explicit "old file in Downloads" rule below.
-    if policy.check_with(&record.path, record.extension.as_deref(), true).is_some() {
+    if policy.check_for_cleanup(&record.path, record.extension.as_deref(), true).is_some() {
+        return None;
+    }
+    // Temp and crash-dump folders: nothing is offered until it has been untouched for a week,
+    // whichever rule would otherwise match.
+    if validate_scratch_age(&record.path, record.modified_at_ms, unix_millis()).is_err() {
         return None;
     }
 
@@ -232,6 +238,21 @@ fn classify(
             RecommendedAction::RecycleBin,
             reason,
             0.95,
+            age_days,
+            false,
+        ));
+    }
+
+    // Windows' own Disk Cleanup removes Temp files that have not been touched for a week.
+    if age_days.unwrap_or(0) >= TEMP_FILE_DAYS && is_user_temp_file(&record.path) && !record.extension.as_deref().map(is_document_type).unwrap_or(false) {
+        return Some(candidate(
+            scan_run_id,
+            record,
+            RecommendationKind::Clean,
+            RecommendationRisk::Low,
+            RecommendedAction::RecycleBin,
+            "Old file in your Temp folder".to_string(),
+            0.9,
             age_days,
             false,
         ));
