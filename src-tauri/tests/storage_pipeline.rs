@@ -88,3 +88,38 @@ fn scan_to_validated_proposal_on_real_files() {
     let gone = validate_proposals(&db, summary.run_id, &[proposal(&[id])], &check).unwrap();
     assert!(gone[0].items.is_empty());
 }
+
+/// Windows only: the same pipeline, then the real Recycle Bin. Runs in CI on a Windows runner.
+#[cfg(windows)]
+#[test]
+fn an_old_unprotected_file_is_really_moved_to_the_recycle_bin() {
+    use winclean_lib::cleanup::execute_cleanup_plan;
+
+    let temp = tempfile::Builder::new().prefix("winclean-recycle-").tempdir_in(fixture_base()).unwrap();
+    let root = temp.path().join("disk");
+    let old = root.join("Documents").join("old-session.tmp");
+    let protected = root.join("code").join("app").join("cache").join("build.tmp");
+    write_aged(&old, 4096, 40);
+    write_aged(&root.join("code").join("app").join("package.json"), 20, 40);
+    write_aged(&protected, 4096, 40);
+
+    let db = Database::open(temp.path().join("index.sqlite3")).unwrap();
+    db.migrate().unwrap();
+    let summary = run_recursive_scan(&db, &root, None).expect("scan");
+    let evaluation = evaluate(&db, summary.run_id, &StorageQuery { min_size: Some(1), ..Default::default() }).unwrap();
+    assert_eq!(evaluation.verified.len(), 1);
+
+    let result = execute_cleanup_plan(&db, summary.run_id, &[evaluation.verified[0].id.clone()]).expect("cleanup");
+    assert_eq!(result.recycled_count, 1, "{result:?}");
+    assert!(!old.exists(), "the file left its folder (it is in the Recycle Bin)");
+    assert!(protected.exists(), "the file inside a code project was never touched");
+}
+
+/// Windows only: drive listing returns real capacity figures for the system drive.
+#[cfg(windows)]
+#[test]
+fn the_system_drive_is_listed_with_real_capacity() {
+    let volumes = winclean_lib::volume::list_volumes();
+    let c = volumes.iter().find(|v| v.root_path.to_ascii_uppercase().starts_with("C:")).expect("C: is listed");
+    assert!(c.total_space.unwrap_or(0) > 0 && c.available_space.is_some(), "{c:?}");
+}
