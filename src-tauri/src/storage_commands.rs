@@ -62,11 +62,16 @@ impl StorageJobs {
     }
 }
 
-fn run_or_latest(state: &AppState, run_id: Option<i64>) -> Result<Option<i64>, String> {
+fn run_or_latest(db: &crate::db::Database, run_id: Option<i64>) -> Result<Option<i64>, String> {
     match run_id {
         Some(id) => Ok(Some(id)),
-        None => state.db.latest_completed_run_id().map_err(|e| e.to_string()),
+        None => db.latest_completed_run_id().map_err(|e| e.to_string()),
     }
+}
+
+/// Database, disk and report work is blocking; keep it off the async runtime's workers.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work).await.map_err(|e| e.to_string())?
 }
 
 fn on_battery() -> bool {
@@ -75,32 +80,44 @@ fn on_battery() -> bool {
 
 /// WinClean's verified view of a scan: what may be cleaned or offloaded, what needs
 /// judgment, what is protected, and optionally a selection that meets a goal.
-#[tauri::command(async)]
-pub fn storage_evaluate(state: State<'_, AppState>, run_id: Option<i64>, query: Option<StorageQuery>) -> Result<Option<StorageEvaluation>, String> {
-    let Some(run_id) = run_or_latest(&state, run_id)? else {
-        return Ok(None);
-    };
-    storage_ai::evaluate(&state.db, run_id, &query.unwrap_or_default()).map(Some).map_err(|e| e.to_string())
+#[tauri::command]
+pub async fn storage_evaluate(state: State<'_, AppState>, run_id: Option<i64>, query: Option<StorageQuery>) -> Result<Option<StorageEvaluation>, String> {
+    let db = state.db.clone();
+    blocking(move || {
+        let Some(run_id) = run_or_latest(&db, run_id)? else {
+            return Ok(None);
+        };
+        storage_ai::evaluate(&db, run_id, &query.unwrap_or_default()).map(Some).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Resolve model proposals against WinClean's own candidates. A model only supplies
 /// candidate ids; sizes, actions and files are recomputed and re-checked on disk here.
-#[tauri::command(async)]
-pub fn storage_validate_proposals(state: State<'_, AppState>, run_id: i64, proposals: Vec<ProposalInput>) -> Result<Vec<ValidatedProposal>, String> {
+#[tauri::command]
+pub async fn storage_validate_proposals(state: State<'_, AppState>, run_id: i64, proposals: Vec<ProposalInput>) -> Result<Vec<ValidatedProposal>, String> {
     let db = state.db.clone();
-    let check = move |item: &storage_ai::EvaluatedItem| {
-        let modified = db.file_entry_by_path(run_id, &item.path).ok().flatten().and_then(|e| e.modified_at_ms);
-        storage_ai::disk_check(item, modified)
-    };
-    storage_ai::validate_proposals(&state.db, run_id, &proposals, &check).map_err(|e| e.to_string())
+    blocking(move || {
+        let check_db = db.clone();
+        let check = move |item: &storage_ai::EvaluatedItem| {
+            let modified = check_db.file_entry_by_path(run_id, &item.path).ok().flatten().and_then(|e| e.modified_at_ms);
+            storage_ai::disk_check(item, modified)
+        };
+        storage_ai::validate_proposals(&db, run_id, &proposals, &check).map_err(|e| e.to_string())
+    })
+    .await
 }
 
-#[tauri::command(async)]
-pub fn duplicate_report_for(state: State<'_, AppState>, run_id: Option<i64>, min_size: Option<u64>) -> Result<Option<DuplicateReport>, String> {
-    let Some(run_id) = run_or_latest(&state, run_id)? else {
-        return Ok(None);
-    };
-    duplicate_report(&state.db, run_id, min_size.unwrap_or(DEFAULT_MIN_SIZE)).map(Some).map_err(|e| e.to_string())
+#[tauri::command]
+pub async fn duplicate_report_for(state: State<'_, AppState>, run_id: Option<i64>, min_size: Option<u64>) -> Result<Option<DuplicateReport>, String> {
+    let db = state.db.clone();
+    blocking(move || {
+        let Some(run_id) = run_or_latest(&db, run_id)? else {
+            return Ok(None);
+        };
+        duplicate_report(&db, run_id, min_size.unwrap_or(DEFAULT_MIN_SIZE)).map(Some).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -125,7 +142,7 @@ pub fn duplicates_start(
     max_bytes: Option<u64>,
     max_files: Option<usize>,
 ) -> Result<DuplicateJobStatus, String> {
-    let Some(run_id) = run_or_latest(&state, run_id)? else {
+    let Some(run_id) = run_or_latest(&state.db, run_id)? else {
         return Err("Run a scan first.".to_string());
     };
     {

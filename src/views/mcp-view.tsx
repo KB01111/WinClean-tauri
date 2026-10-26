@@ -33,34 +33,36 @@ export function McpView() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  // A slow load must not overwrite newer results, such as a verification the panel just applied.
-  const requestSeq = useRef(0)
+  // A slow load must not overwrite newer results. Status and roots are tracked apart, so a root
+  // edit made while Rediscover is running still lets the fresh status through (and vice versa).
+  const seq = useRef({ load: 0, status: 0, roots: 0 })
 
   const load = useCallback(async (refresh = false) => {
-    const seq = ++requestSeq.current
+    const mine = ++seq.current.load
+    const { status: statusAt, roots: rootsAt } = seq.current
     setLoading(true)
     try {
       const [next, authorised] = await Promise.all([api.optimizerMcpStatus(refresh), api.optimizerMcpSearchRoots()])
-      if (seq !== requestSeq.current) return
-      setStatus(next)
-      setRoots(authorised)
+      if (mine !== seq.current.load) return
+      if (statusAt === seq.current.status) setStatus(next)
+      if (rootsAt === seq.current.roots) setRoots(authorised)
       setError(null)
     } catch (e) {
-      if (seq === requestSeq.current) setError(formatError(e))
+      if (mine === seq.current.load) setError(formatError(e))
     } finally {
-      if (seq === requestSeq.current) setLoading(false)
+      if (mine === seq.current.load) setLoading(false)
     }
   }, [])
 
   const applyStatus = useCallback((next: McpStatus) => {
-    requestSeq.current += 1
-    setLoading(false)
+    seq.current.status += 1
     setStatus(next)
+    setError(null)
   }, [])
   const applyRoots = useCallback((next: string[]) => {
-    requestSeq.current += 1
-    setLoading(false)
+    seq.current.roots += 1
     setRoots(next)
+    setError(null)
   }, [])
 
   useEffect(() => {
