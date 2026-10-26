@@ -1,10 +1,8 @@
-import { useEffect, useState } from "react"
 import {
   Cloud,
   Database,
   Download,
   FolderOpen,
-  KeyRound,
   Loader2,
   Monitor,
   Moon,
@@ -15,11 +13,13 @@ import {
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
-import { Panel, Posture, SummaryList, TextInput } from "@/components/common"
+import { AiSettingsPanel } from "@/components/ai/ai-settings-panel"
+import { ElevationBanner } from "@/components/optimizer/elevation-banner"
+import { Panel, Posture, SummaryList } from "@/components/common"
 import { useTheme } from "@/components/theme-provider"
 import { api, formatError, type AppHealth, type GoogleDriveStatus } from "@/lib/api"
 import { formatNumber } from "@/lib/format"
-import { AI_MODELS, getStoredAiModel, setStoredAiModel } from "@/lib/ai-agent"
+import { useHelper } from "@/hooks/use-helper"
 import { cn } from "@/lib/utils"
 
 const SCAN_STATE_LABELS: Record<string, string> = {
@@ -104,6 +104,8 @@ export function SettingsView({
           configured={aiKeyConfigured}
           onChanged={onAiKeyChanged}
         />
+
+        <HelperPanel />
 
         <Panel
           title="Production posture"
@@ -246,107 +248,17 @@ function ThemeToggle() {
   )
 }
 
-function AiSettingsPanel({
-  configured,
-  onChanged,
-}: {
-  configured: boolean
-  onChanged: (configured: boolean) => void
-}) {
-  const [keyInput, setKeyInput] = useState("")
-  const [pending, setPending] = useState(false)
-  const [model, setModel] = useState(getStoredAiModel)
-
-  useEffect(() => {
-    setStoredAiModel(model)
-  }, [model])
-
-  async function saveKey() {
-    if (!keyInput.trim() || pending) {
-      return
-    }
-    setPending(true)
-    try {
-      const status = await api.setAiApiKey(keyInput.trim())
-      onChanged(status.configured)
-      setKeyInput("")
-      toast.success("AI API key saved to Windows Credential Manager.")
-    } catch (error) {
-      toast.error(formatError(error))
-    } finally {
-      setPending(false)
-    }
-  }
-
-  async function clearKey() {
-    if (pending) {
-      return
-    }
-    setPending(true)
-    try {
-      const status = await api.clearAiApiKey()
-      onChanged(status.configured)
-      toast.success("AI API key removed.")
-    } catch (error) {
-      toast.error(formatError(error))
-    } finally {
-      setPending(false)
-    }
-  }
-
+/** Administrator helper: WinClean stays unprivileged and elevates one narrow process on demand. */
+function HelperPanel() {
+  const helper = useHelper()
   return (
-    <Panel title="AI assistant">
-      <div className="space-y-3">
-        <div className="flex items-start gap-2 text-sm text-muted-foreground">
-          <KeyRound className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          <p>
-            Add an OpenAI API key to let the AI assistant analyze scan results.
-            The key is stored in Windows Credential Manager and only file
-            metadata (paths, sizes, dates) is sent to OpenAI — never file
-            contents.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <TextInput
-            type="password"
-            value={keyInput}
-            onChange={(event) => setKeyInput(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && keyInput.trim() && !pending) {
-                void saveKey()
-              }
-            }}
-            placeholder={configured ? "Key configured — enter to replace" : "sk-..."}
-            className="max-w-80 flex-1"
-            autoComplete="off"
-          />
-          <Button onClick={saveKey} disabled={!keyInput.trim() || pending}>
-            {pending ? (
-              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-            ) : null}
-            Save key
-          </Button>
-          {configured ? (
-            <Button variant="outline" onClick={clearKey} disabled={pending}>
-              Remove key
-            </Button>
-          ) : null}
-        </div>
-        <label className="flex items-center gap-2 text-sm">
-          <span className="text-muted-foreground">Model</span>
-          <select
-            value={model}
-            onChange={(event) => setModel(event.target.value)}
-            className="h-9 rounded-md border border-input bg-card px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
-          >
-            {AI_MODELS.map((value) => (
-              <option key={value} value={value}>
-                {value}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
+    <Panel title="Administrator helper">
+      <ElevationBanner helper={helper} />
+      <ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">
+        <li>The app itself never runs as administrator. One UAC prompt starts a separate helper from the same signed executable.</li>
+        <li>The helper accepts a single kind of request — change the start type of a service — and checks every request against the protected-service rules again before acting.</li>
+        <li>It talks to WinClean over a private pipe that only your account can open, rejects any other client, and exits when WinClean closes or after 10 idle minutes.</li>
+      </ul>
     </Panel>
   )
 }

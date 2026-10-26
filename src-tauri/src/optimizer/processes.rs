@@ -8,21 +8,56 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::policy::EcoQosDecision;
+use super::policy::{EcoQosDecision, EcoQosMode};
 #[cfg(windows)]
-use super::policy::classify_process_for_ecoqos;
+use super::policy::classify_process_for_ecoqos_mode;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessInfo {
     pub pid: u32,
+    #[serde(default)]
+    pub parent_pid: u32,
     pub name: String,
     pub working_set_mb: f64,
     /// -1.0 means "no CPU sample available" (never treated as idle).
     pub cpu_percent_recent: f32,
     pub is_foreground: bool,
+    /// Descendant of the process that owns the foreground window (its
+    /// helpers, renderers, extension hosts): treated like the foreground app.
+    #[serde(default)]
+    pub in_foreground_tree: bool,
     pub eco_decision: EcoQosDecision,
     pub eco_qos_applied: bool,
+}
+
+/// A cheap process row (no CPU sampling) used by workload detection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LightProcess {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub name: String,
+}
+
+/// PIDs of `root` and every descendant, from `(pid, parent_pid)` pairs.
+/// Cycle-safe (parent PIDs can be reused).
+pub fn descendants_of(root: u32, pairs: &[(u32, u32)]) -> std::collections::HashSet<u32> {
+    let mut family = std::collections::HashSet::new();
+    if root == 0 {
+        return family;
+    }
+    family.insert(root);
+    loop {
+        let before = family.len();
+        for (pid, parent) in pairs {
+            if *pid != 0 && family.contains(parent) && *pid != *parent {
+                family.insert(*pid);
+            }
+        }
+        if family.len() == before {
+            return family;
+        }
+    }
 }
 
 /// Rows returned to the Processes view (largest working sets first).
@@ -197,8 +232,72 @@ mod win {
         }
     }
 
+    /// `(pid, parent_pid)` for every process, from one ToolHelp snapshot.
+    pub fn parent_pairs() -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let s = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if s.is_null() || s == INVALID_HANDLE_VALUE { return out; }
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, cntUsage: 0, th32ProcessID: 0, th32DefaultHeapID: 0, th32ModuleID: 0, cntThreads: 0, th32ParentProcessID: 0, pcPriClassBase: 0, dwFlags: 0, szExeFile: [0; 260] };
+        if unsafe { Process32FirstW(s, &mut e) } != 0 {
+            loop {
+                out.push((e.th32ProcessID, e.th32ParentProcessID));
+                if unsafe { Process32NextW(s, &mut e) } == 0 { break; }
+            }
+        }
+        unsafe { CloseHandle(s); }
+        out
+    }
+
+    /// Process names and parents without any CPU sampling (a few ms).
+    pub fn light_snapshot() -> Vec<LightProcess> {
+        let mut out = Vec::new();
+        let s = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if s.is_null() || s == INVALID_HANDLE_VALUE { return out; }
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, cntUsage: 0, th32ProcessID: 0, th32DefaultHeapID: 0, th32ModuleID: 0, cntThreads: 0, th32ParentProcessID: 0, pcPriClassBase: 0, dwFlags: 0, szExeFile: [0; 260] };
+        if unsafe { Process32FirstW(s, &mut e) } != 0 {
+            loop {
+                let name = String::from_utf16_lossy(&e.szExeFile);
+                out.push(LightProcess { pid: e.th32ProcessID, parent_pid: e.th32ParentProcessID, name: name.trim_end_matches('\0').to_string() });
+                if unsafe { Process32NextW(s, &mut e) } == 0 { break; }
+            }
+        }
+        unsafe { CloseHandle(s); }
+        out
+    }
+
+    /// Kernel+user CPU time (100 ns ticks) for a PID; `None` if it cannot be opened.
+    pub fn cpu_ticks_for_pid(pid: u32) -> Option<u64> {
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() { return None; }
+        let t = cpu_ticks(h);
+        unsafe { CloseHandle(h); }
+        t
+    }
+
+    /// Working set of a process in MB (`None` when it cannot be queried).
+    pub fn working_set_mb_impl(pid: u32) -> Option<f64> {
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        if h.is_null() { return None; }
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = unsafe { K32GetProcessMemoryInfo(h, &mut counters, counters.cb) } != 0;
+        unsafe { CloseHandle(h); }
+        ok.then(|| ((counters.WorkingSetSize as f64 / (1024.0 * 1024.0)) * 10.0).round() / 10.0)
+    }
+
+    /// Image name of a PID.
+    pub fn name_of_pid(pid: u32) -> Option<String> {
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() { return None; }
+        let n = image_name(h);
+        unsafe { CloseHandle(h); }
+        n
+    }
+
     pub fn list_processes_impl(limit: Option<usize>) -> Result<Vec<ProcessInfo>, String> {
         let fg = foreground_pid();
+        let pairs = parent_pairs();
+        let family = descendants_of(fg, &pairs);
         let first = sample_times();
         let started = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -240,11 +339,13 @@ mod win {
                     unsafe { CloseHandle(h); }
                 }
                 let is_fg = pid != 0 && pid == fg;
+                let in_tree = !is_fg && family.contains(&pid);
                 out.push(ProcessInfo {
-                    eco_decision: classify_process_for_ecoqos(&name, is_fg, cpu),
-                    pid, name, working_set_mb: (ws_mb * 10.0).round() / 10.0,
+                    // Descendants of the foreground app are protected like the app itself.
+                    eco_decision: classify_process_for_ecoqos_mode(&name, is_fg || in_tree, cpu, EcoQosMode::Conservative),
+                    pid, parent_pid: entry.th32ParentProcessID, name, working_set_mb: (ws_mb * 10.0).round() / 10.0,
                     cpu_percent_recent: (cpu * 10.0).round() / 10.0,
-                    is_foreground: is_fg, eco_qos_applied: applied,
+                    is_foreground: is_fg, in_foreground_tree: in_tree, eco_qos_applied: applied,
                 });
                 if unsafe { Process32NextW(snap, &mut entry) } == 0 { break; }
             }
@@ -256,7 +357,7 @@ mod win {
     }
 
     /// Returns the process's real current image name after applying.
-    pub fn set_ecoqos_impl(pid: u32, expected_name: &str, not_started_after_ms: Option<i64>, enable: bool) -> Result<String, String> {
+    pub fn set_ecoqos_impl(pid: u32, expected_name: &str, not_started_after_ms: Option<i64>, enable: bool, mode: EcoQosMode) -> Result<String, String> {
         let access: PROCESS_ACCESS_RIGHTS = PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION;
         let h: HANDLE = unsafe { OpenProcess(access, 0, pid) };
         if h.is_null() {
@@ -279,7 +380,8 @@ mod win {
                 }
             }
             if enable {
-                let is_fg = pid == foreground_pid();
+                // The foreground app and everything it spawned count as foreground.
+                let is_fg = descendants_of(foreground_pid(), &parent_pairs()).contains(&pid);
                 // Another actor (or an earlier run) already throttled it:
                 // WinClean must not claim ownership of state it did not set.
                 match eco_qos_state(h) {
@@ -292,7 +394,7 @@ mod win {
                 // a sample the setter refuses rather than assuming idle.
                 let cpu = sample_cpu_percent(h)
                     .ok_or_else(|| format!("could not sample CPU for '{real}' (pid {pid}); refusing to throttle without a measurement"))?;
-                let decision = classify_process_for_ecoqos(&real, is_fg, cpu);
+                let decision = classify_process_for_ecoqos_mode(&real, is_fg, cpu, mode);
                 if decision != EcoQosDecision::Eligible {
                     return Err(format!("'{real}' is {decision:?} and will not be throttled. Only clearly eligible, currently idle background work (updaters, indexers, telemetry) can be enabled."));
                 }
@@ -333,13 +435,41 @@ pub fn list_all_processes() -> Result<Vec<ProcessInfo>, String> { list_processes
 /// Applies or restores EcoQoS after revalidating the PID's real identity.
 /// Returns the verified image name.
 #[cfg(windows)]
-pub fn set_process_ecoqos(pid: u32, expected_name: &str, not_started_after_ms: Option<i64>, enable: bool) -> Result<String, String> {
-    win::set_ecoqos_impl(pid, expected_name, not_started_after_ms, enable)
+pub fn set_process_ecoqos(pid: u32, expected_name: &str, not_started_after_ms: Option<i64>, enable: bool, mode: EcoQosMode) -> Result<String, String> {
+    win::set_ecoqos_impl(pid, expected_name, not_started_after_ms, enable, mode)
 }
 #[cfg(not(windows))]
-pub fn set_process_ecoqos(_pid: u32, _expected_name: &str, _not_started_after_ms: Option<i64>, _enable: bool) -> Result<String, String> {
+pub fn set_process_ecoqos(_pid: u32, _expected_name: &str, _not_started_after_ms: Option<i64>, _enable: bool, _mode: EcoQosMode) -> Result<String, String> {
     Err("EcoQoS is only available on Windows.".into())
 }
+
+/// Working set of a process in MB.
+#[cfg(windows)]
+pub fn working_set_mb(pid: u32) -> Option<f64> { win::working_set_mb_impl(pid) }
+#[cfg(not(windows))]
+pub fn working_set_mb(_pid: u32) -> Option<f64> { None }
+
+/// Process names/parents with no CPU sampling (cheap enough for event-driven checks).
+#[cfg(windows)]
+pub fn light_snapshot() -> Vec<LightProcess> { win::light_snapshot() }
+#[cfg(not(windows))]
+pub fn light_snapshot() -> Vec<LightProcess> { Vec::new() }
+
+/// Total CPU time (100 ns ticks) of a PID, for delta-based CPU estimates.
+#[cfg(windows)]
+pub fn cpu_ticks_for_pid(pid: u32) -> Option<u64> { win::cpu_ticks_for_pid(pid) }
+#[cfg(not(windows))]
+pub fn cpu_ticks_for_pid(_pid: u32) -> Option<u64> { None }
+
+/// PID and image name of the process that owns the foreground window.
+#[cfg(windows)]
+pub fn foreground_process() -> Option<(u32, String)> {
+    let pid = win::foreground_pid();
+    if pid == 0 { return None; }
+    win::name_of_pid(pid).map(|n| (pid, n))
+}
+#[cfg(not(windows))]
+pub fn foreground_process() -> Option<(u32, String)> { None }
 
 /// Reports whether a PID is still the process WinClean may have throttled.
 #[cfg(windows)]
@@ -357,6 +487,17 @@ pub fn process_ecoqos_state(_pid: u32) -> Option<bool> { None }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_tree_includes_descendants_and_survives_cycles() {
+        // 1 -> 2 -> 3, 1 -> 4; 9 is unrelated; 5 <-> 6 is a reused-PID cycle.
+        let pairs = [(2, 1), (3, 2), (4, 1), (9, 8), (5, 6), (6, 5), (1, 0)];
+        let fam = descendants_of(1, &pairs);
+        assert_eq!(fam, [1, 2, 3, 4].into_iter().collect());
+        assert!(descendants_of(0, &pairs).is_empty());
+        let cyc = descendants_of(5, &pairs);
+        assert_eq!(cyc, [5, 6].into_iter().collect());
+    }
 
     #[test]
     fn process_target_round_trips() {

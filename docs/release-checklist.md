@@ -27,3 +27,18 @@ This verifies TypeScript, ESLint, Bun tests, frontend build, Rust tests, and a T
 - Offload a large disposable file to Google Drive, cancel one batch before upload, and confirm canceled files remain local.
 - Export diagnostics and confirm the bundle contains local health data only.
 - Confirm `git status --short` contains only intentional source changes before tagging.
+
+## WinClean 2.0 Hardware Acceptance (ASUS ROG Zephyrus G16)
+
+These checks need the physical machine; the Linux/CI gates cannot cover them. Record results in the release notes.
+
+- **Elevation**: enable the administrator helper (one UAC prompt). Confirm it refuses to start from a user-writable folder without the explicit confirmation, and exits when WinClean closes and after 10 idle minutes.
+- **Services**: apply a recommended batch, confirm the read-back verification, then roll it back from History & Rollback. Confirm protected services (Defender, Windows Update, Windows Search, ASUS/AMD/NVIDIA) are not editable.
+- **EcoQoS**: throttle a background process, confirm it moves to efficiency cores in Task Manager, restore it, and confirm VS Code/Cursor/cargo/the foreground window are never throttled while coding.
+- **Battery**: compare reported watts with a wall-power meter and health with `powercfg /batteryreport`. Run one measurement (baseline → switch → finish) and confirm the verdict wording.
+- **dGPU**: open Hardware & NPU repeatedly and confirm the RTX 4070 stays powered down (HWiNFO D3cold / Device Manager power data) while WinClean runs for 30 minutes.
+- **NPU / Windows ML**: confirm XDNA 2 enumeration with the current ASUS/AMD driver and that no capability is shown as verified.
+- **Mica and themes**: confirm Mica on Windows 11 ≥ 22621, the opaque fallback otherwise, and light/dark/system switching including the title bar.
+- **G-Helper**: with G-Helper running, confirm automatic switching pauses and no ASUS setting is changed.
+- **MCP**: on Windows build ≥ 26220 confirm `odr.exe mcp list`, the File Explorer metadata lookup, and that content/destructive tools stay blocked.
+- **Idle cost**: record `winclean.exe` and `msedgewebview2.exe` CPU, memory and disk over 30 minutes idle on battery with the window minimised.

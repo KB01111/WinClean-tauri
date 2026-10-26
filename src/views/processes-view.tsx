@@ -1,27 +1,49 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { Leaf, Loader2, RefreshCw } from "lucide-react"
 import { toast } from "sonner"
 
+import { EmptyState, Metric, Notice, Panel, TextInput } from "@/components/common"
+import { Badge, type BadgeTone } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { EmptyState, Notice, Panel } from "@/components/common"
+import { useOptimizerEvents } from "@/hooks/use-optimizer-events"
+import { usePolling } from "@/hooks/use-polling"
 import { api, formatError } from "@/lib/api"
-import type { ProcessInfo } from "@/lib/optimizer"
+import {
+  WORKLOAD_LABELS,
+  ecoQosModeLabel,
+  type EcoDecision,
+  type ProcessInfo,
+  type ProfilesView,
+  type WorkloadSnapshot,
+} from "@/lib/optimizer"
 
+const DECISION: Record<EcoDecision, { label: string; tone: BadgeTone; why: string }> = {
+  protected: { label: "Protected", tone: "info", why: "Developer tools, compilers, games, AI inference and system processes are never throttled." },
+  foreground: { label: "In use", tone: "good", why: "Part of the window you are working in." },
+  eligible: { label: "Eligible", tone: "neutral", why: "Background process that can run on efficiency cores." },
+  unknown: { label: "Unknown", tone: "warn", why: "Could not be inspected (access denied or exited)." },
+}
+
+/**
+ * Processes & EcoQoS. EcoQoS asks Windows to run a process on efficient
+ * cores at low frequency; it is applied per process, audited, and always
+ * restores the system-managed default. The foreground window's whole process
+ * tree and developer/gaming/AI processes are never throttled.
+ */
 export function ProcessesView() {
   const [processes, setProcesses] = useState<ProcessInfo[]>([])
+  const [workload, setWorkload] = useState<WorkloadSnapshot | null>(null)
+  const [profiles, setProfiles] = useState<ProfilesView | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const [busy, setBusy] = useState<number | null>(null)
-  const [batchRunning, setBatchRunning] = useState(false)
+  const [busy, setBusy] = useState<number | "batch" | null>(null)
+  const [query, setQuery] = useState("")
 
-  // EcoQoS state comes from the backend on every listing
-  // (GetProcessInformation), so it survives view navigation and the
-  // Restore action is always available for throttled processes —
-  // including ones that have since become foreground.
   const load = useCallback(async () => {
-    setLoading(true)
     try {
-      setProcesses(await api.optimizerListProcesses())
+      const [list, current] = await Promise.all([api.optimizerListProcesses(), api.optimizerWorkload()])
+      setProcesses(list)
+      setWorkload(current)
       setError(null)
     } catch (e) {
       setError(formatError(e))
@@ -30,7 +52,25 @@ export function ProcessesView() {
     }
   }, [])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => {
+    void load()
+    api.optimizerListProfiles().then(setProfiles).catch(() => {})
+  }, [load])
+
+  // The process table is only worth refreshing while someone is looking at it.
+  usePolling(load, 10_000)
+  useOptimizerEvents((event) => {
+    if (event.kind === "workload") setWorkload(event.data)
+    if (event.kind === "profileChanged") void api.optimizerListProfiles().then(setProfiles).catch(() => {})
+  })
+
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return processes.filter((p) => !q || p.name.toLowerCase().includes(q) || String(p.pid) === q)
+  }, [processes, query])
+  const eligible = processes.filter((p) => p.ecoDecision === "eligible" && !p.ecoQosApplied)
+  const throttled = processes.filter((p) => p.ecoQosApplied)
+  const activeProfile = profiles?.profiles.find((p) => p.id === profiles.active?.profileId)
 
   async function toggle(proc: ProcessInfo) {
     const enable = !proc.ecoQosApplied
@@ -46,79 +86,122 @@ export function ProcessesView() {
     }
   }
 
-  async function applyEligible() {
-    if (batchRunning) return
-    const eligible = processes.filter((p) => p.ecoDecision === "eligible" && !p.ecoQosApplied)
-    if (eligible.length === 0) {
-      toast.info("No eligible background processes to throttle right now.")
+  async function batch(enable: boolean) {
+    const targets = enable ? eligible : throttled
+    if (targets.length === 0) {
+      toast.info(enable ? "No eligible background processes right now." : "Nothing is throttled.")
       return
     }
-    setBatchRunning(true)
+    setBusy("batch")
     let failed = 0
-    try {
-      for (const proc of eligible) {
-        try {
-          await api.optimizerSetProcessEcoQos(proc.pid, proc.name, true)
-        } catch {
-          failed += 1 // per-process failures are audited in the backend
-        }
+    for (const proc of targets) {
+      try {
+        await api.optimizerSetProcessEcoQos(proc.pid, proc.name, enable)
+      } catch {
+        failed += 1 // a process may have exited meanwhile; the rest still proceed
       }
-      const done = eligible.length - failed
-      const summary = `EcoQoS applied to ${done}/${eligible.length} eligible background processes. Editors, compilers, games and inference were excluded.`
-      if (failed === 0) toast.success(summary)
-      else if (done === 0) toast.error(`EcoQoS was not applied to any eligible process (${failed} refused or failed). See Optimization History.`)
-      else toast.warning(`${summary} ${failed} refused or failed; see Optimization History.`)
-    } finally {
-      setBatchRunning(false)
-      await load()
     }
+    setBusy(null)
+    toast[failed ? "warning" : "success"](
+      `${enable ? "Throttled" : "Restored"} ${targets.length - failed} of ${targets.length} process(es).`
+    )
+    await load()
   }
 
   return (
-    <Panel
-      title="Processes & EcoQoS (SetProcessInformation)"
-      action={
-        <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={() => void applyEligible()} disabled={loading || batchRunning}>
-            {batchRunning ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Leaf className="size-4" aria-hidden="true" />} Apply to eligible
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading || batchRunning}>
-            {loading ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <RefreshCw className="size-4" aria-hidden="true" />}
-            Refresh
-          </Button>
-        </div>
-      }
-    >
-      <p className="mb-3 text-sm text-muted-foreground">
-        WinClean never terminates processes. EcoQoS only lowers efficiency-mode priority for clearly eligible background work (updaters, indexers, telemetry). VS Code, Cursor, Codex, Claude Code, OpenCode, compilers, games and AI inference are protected, as is the foreground app. The backend revalidates each PID's real process before enabling, and reports live EcoQoS state on every refresh.
-      </p>
-      {error ? <Notice tone="danger" text={error} /> : null}
-      {loading ? (
-        <EmptyState text="Sampling processes (two samples over ~250 ms)…" />
-      ) : (
-        <div className="max-h-[60vh] overflow-auto">
-          {processes.map((proc) => (
-            <div key={proc.pid} className="flex items-center justify-between gap-3 border-b border-border/60 py-2 text-sm">
-              <div className="min-w-0">
-                <span className="font-medium">{proc.name}</span>{" "}
-                <span className="text-xs text-muted-foreground">
-                  PID {proc.pid} · {proc.workingSetMb.toFixed(1)} MB · CPU {proc.cpuPercentRecent < 0 ? "n/a" : `${proc.cpuPercentRecent.toFixed(1)}%`}
-                  {proc.isForeground ? " · foreground" : ""} · {proc.ecoDecision}
-                  {proc.ecoQosApplied ? " · EcoQoS on" : ""}
-                </span>
-              </div>
-              <Button
-                size="sm"
-                variant={proc.ecoQosApplied ? "default" : "outline"}
-                disabled={(!proc.ecoQosApplied && (proc.ecoDecision === "protected" || proc.ecoDecision === "foreground")) || busy === proc.pid || batchRunning}
-                onClick={() => void toggle(proc)}
-              >
-                {proc.ecoQosApplied ? "Restore" : "EcoQoS"}
-              </Button>
-            </div>
-          ))}
-        </div>
-      )}
-    </Panel>
+    <div className="space-y-4">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <Metric label="Workload" value={workload ? WORKLOAD_LABELS[workload.kind] : "—"} hint={workload?.foreground ?? "foreground unknown"} />
+        <Metric label="Active profile" value={activeProfile?.label ?? "None"} hint={activeProfile ? `EcoQoS: ${ecoQosModeLabel(activeProfile.ecoQosMode)}` : undefined} />
+        <Metric label="Eligible now" value={String(eligible.length)} hint="background processes" />
+        <Metric label="Throttled" value={String(throttled.length)} hint="EcoQoS applied" />
+      </div>
+
+      {workload && workload.evidence.length > 0 ? (
+        <Panel title="Why WinClean thinks that">
+          <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+            {workload.evidence.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </Panel>
+      ) : null}
+
+      <Panel
+        title="Processes"
+        action={
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading || busy !== null}>
+              <RefreshCw className="size-4" aria-hidden="true" />
+              Refresh
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => void batch(false)} disabled={busy !== null || throttled.length === 0}>
+              Restore all ({throttled.length})
+            </Button>
+            <Button size="sm" onClick={() => void batch(true)} disabled={busy !== null || eligible.length === 0}>
+              {busy === "batch" ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Leaf className="size-4" aria-hidden="true" />}
+              Throttle eligible ({eligible.length})
+            </Button>
+          </div>
+        }
+      >
+        {error ? <Notice tone="danger" text={error} /> : null}
+        <TextInput value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Filter by name or PID…" aria-label="Filter processes" className="mb-3 max-w-xs" />
+        {loading ? (
+          <EmptyState text="Reading processes…" />
+        ) : visible.length === 0 ? (
+          <EmptyState text="No processes match" />
+        ) : (
+          <div className="max-h-[55vh] overflow-auto">
+            <table className="w-full border-collapse text-sm">
+              <thead className="sticky top-0 bg-card">
+                <tr className="border-b border-border text-left text-xs text-muted-foreground uppercase">
+                  <th className="py-2 font-semibold">Process</th>
+                  <th className="py-2 text-right font-semibold">Memory</th>
+                  <th className="py-2 text-right font-semibold">CPU</th>
+                  <th className="py-2 pl-3 font-semibold">Status</th>
+                  <th className="py-2 text-right font-semibold">EcoQoS</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visible.map((p) => {
+                  const d = DECISION[p.ecoDecision]
+                  const canToggle = p.ecoQosApplied || p.ecoDecision === "eligible"
+                  return (
+                    <tr key={p.pid} className="border-b border-border/60">
+                      <td className="max-w-56 truncate py-2 pr-3 font-medium" title={`${p.name} (PID ${p.pid})`}>
+                        {p.name} <span className="text-xs font-normal text-muted-foreground">{p.pid}</span>
+                      </td>
+                      <td className="py-2 text-right tabular-nums">{p.workingSetMb.toFixed(0)} MB</td>
+                      <td className="py-2 text-right tabular-nums">{p.cpuPercentRecent.toFixed(1)}%</td>
+                      <td className="py-2 pl-3">
+                        <Badge tone={p.ecoQosApplied ? "good" : d.tone} title={d.why}>
+                          {p.ecoQosApplied ? "Throttled" : d.label}
+                        </Badge>
+                      </td>
+                      <td className="py-2 text-right">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={!canToggle || busy !== null}
+                          title={canToggle ? undefined : d.why}
+                          onClick={() => void toggle(p)}
+                        >
+                          {busy === p.pid ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : null}
+                          {p.ecoQosApplied ? "Restore" : "Throttle"}
+                        </Button>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p className="mt-3 text-xs text-muted-foreground">
+          Throttling is per process and reversible: Restore returns control to Windows. PIDs that were reused by another program are never touched. Automatic throttling follows the active profile&apos;s EcoQoS mode (Optimization Profiles).
+        </p>
+      </Panel>
+    </div>
   )
 }
