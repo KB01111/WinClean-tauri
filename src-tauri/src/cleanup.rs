@@ -585,7 +585,8 @@ fn unix_millis_from_system_time(time: std::time::SystemTime) -> i64 {
         .unwrap_or_default()
 }
 
-fn validate_cleanup_age(modified_at_ms: Option<i64>, now_ms: i64) -> anyhow::Result<()> {
+/// Nothing modified within the last 24 hours (or with an unknown modification time) is ever cleaned or offloaded.
+pub fn validate_cleanup_age(modified_at_ms: Option<i64>, now_ms: i64) -> anyhow::Result<()> {
     let Some(modified_at_ms) = modified_at_ms else {
         anyhow::bail!("cleanup target modified time is unavailable");
     };

@@ -63,7 +63,7 @@ rustup target add x86_64-pc-windows-gnu   # plus mingw-w64 (e.g. apt install gcc
 cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-gnu --lib --tests
 ```
 
-One integration test (`cleanup_execution_reports_missing_and_changed_candidates_as_skipped`) uses `C:\tmp` and only passes on Windows.
+The Rust suite runs on Linux and Windows; cleanup fixtures use `C:\tmp` on Windows (outside the protected AppData temp folder) and the OS temp directory elsewhere.
 
 Use the full local release gate before packaging:
 

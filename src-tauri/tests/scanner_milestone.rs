@@ -465,6 +465,10 @@ fn recommendations_split_safe_cleanup_from_review_and_offload_candidates() {
     write_sparse_file(&root.join("movie.mp4"), 120 * 1024 * 1024);
     write_sparse_file(&duplicates_a.join("same.bin"), 15 * 1024 * 1024);
     write_sparse_file(&duplicates_b.join("same.bin"), 15 * 1024 * 1024);
+    // Anything changed in the last 24 hours is never suggested (cleanup would refuse it), so age the
+    // files that are expected to be candidates.
+    set_modified_time(&root.join("cache.tmp"), current_test_millis() - hours_ms(25));
+    set_modified_time(&downloads.join("setup.msi"), current_test_millis() - hours_ms(24 * 40));
 
     let db_path = temp.path().join("index.sqlite3");
     let db = Database::open(&db_path).expect("open db");
@@ -1061,9 +1065,18 @@ fn cleanup_plan_skips_recent_and_unknown_age_candidates() {
 
 #[test]
 fn cleanup_execution_reports_missing_and_changed_candidates_as_skipped() {
+    // On Windows the fixture must live outside %TEMP% (inside AppData, which cleanup protects),
+    // so it uses C:\tmp; elsewhere the ordinary temp directory has no such protection.
+    let base = if cfg!(windows) {
+        let base = std::path::PathBuf::from("C:\\tmp");
+        fs::create_dir_all(&base).expect("C:\\tmp");
+        base
+    } else {
+        std::env::temp_dir()
+    };
     let temp = tempfile::Builder::new()
         .prefix("winclean-cleanup-")
-        .tempdir_in("C:\\tmp")
+        .tempdir_in(base)
         .expect("temp dir");
     let root = temp.path().join("fixture");
     fs::create_dir_all(&root).expect("fixture dir");

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cleanup::{cleanup_candidate_id, cleanup_reason, is_cleanup_protected_path, is_user_temp_file, validate_scratch_age, CleanupRisk},
+    cleanup::{cleanup_candidate_id, cleanup_reason, is_cleanup_protected_path, is_user_temp_file, validate_cleanup_age, validate_scratch_age, CleanupRisk},
     db::{CleanupFileRecord, Database},
     storage_policy::{is_document_type, StoragePolicy},
 };
@@ -229,7 +229,10 @@ fn classify(
     }
 
     let age_days = age_days(record.modified_at_ms);
-    if let Some((reason, risk)) = cleanup_reason(&record) {
+    // Execution refuses anything changed in the last 24 hours, so it is never suggested as a
+    // clean or offload candidate (and never counted as recoverable space).
+    let too_recent = validate_cleanup_age(record.modified_at_ms, unix_millis()).is_err();
+    if let Some((reason, risk)) = cleanup_reason(&record).filter(|_| !too_recent) {
         return Some(candidate(
             scan_run_id,
             record,
@@ -244,7 +247,7 @@ fn classify(
     }
 
     // Windows' own Disk Cleanup removes Temp files that have not been touched for a week.
-    if age_days.unwrap_or(0) >= TEMP_FILE_DAYS && is_user_temp_file(&record.path) && !record.extension.as_deref().map(is_document_type).unwrap_or(false) {
+    if !too_recent && age_days.unwrap_or(0) >= TEMP_FILE_DAYS && is_user_temp_file(&record.path) && !record.extension.as_deref().map(is_document_type).unwrap_or(false) {
         return Some(candidate(
             scan_run_id,
             record,
@@ -259,7 +262,7 @@ fn classify(
     }
 
     let document = record.extension.as_deref().map(is_document_type).unwrap_or(false);
-    if let Some(reason) = offload_reason(&record, age_days).filter(|r| !document || r == "Old file in Downloads") {
+    if let Some(reason) = offload_reason(&record, age_days).filter(|r| !too_recent && (!document || r == "Old file in Downloads")) {
         return Some(candidate(
             scan_run_id,
             record,

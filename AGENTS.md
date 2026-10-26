@@ -39,7 +39,7 @@ This app is **Windows-first**. On Linux cloud VMs:
 
 - The UI and most Rust unit/integration tests run normally.
 - Volume enumeration, Recycle Bin cleanup, and Windows Credential Manager features use stubs or limited behavior.
-- One integration test (`cleanup_execution_reports_missing_and_changed_candidates_as_skipped`) may fail because it uses Windows temp paths (`C:\tmp\...`). This is expected off Windows.
+- The full Rust suite, including the real-file scan → suggestion → validation test in `src-tauri/tests/storage_pipeline.rs`, passes on Linux. Fixtures use `C:	mp` on Windows and the OS temp dir elsewhere.
 
 Full Windows behavior (volumes, scan, Recycle Bin, Google Drive offload) requires a Windows dev machine plus `WINCLEAN_GOOGLE_CLIENT_ID` for Drive features.
 
