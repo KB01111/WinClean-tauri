@@ -497,6 +497,23 @@ pub fn validate_file_for_action(
     Ok(canonical)
 }
 
+/// The legacy shell file APIs stop at MAX_PATH (260) characters, terminator included.
+const WINDOWS_MAX_PATH: usize = 260;
+
+/// `\\?\C:\dir\file` → `C:\dir\file`. Other forms (plain paths, `\\?\UNC\…`) are returned unchanged.
+pub fn strip_verbatim_prefix(wide: &[u16]) -> &[u16] {
+    let prefix: Vec<u16> = "\\\\?\\".encode_utf16().collect();
+    let drive_form = wide.len() >= prefix.len() + 2
+        && wide.starts_with(&prefix)
+        && char::from_u32(u32::from(wide[prefix.len()])).is_some_and(|c| c.is_ascii_alphabetic())
+        && wide[prefix.len() + 1] == u16::from(b':');
+    if drive_form {
+        &wide[prefix.len()..]
+    } else {
+        wide
+    }
+}
+
 pub fn recycle_file(path: &Path) -> anyhow::Result<()> {
     move_to_recycle_bin(path)
 }
@@ -521,9 +538,19 @@ fn move_to_recycle_bin(path: &Path) -> anyhow::Result<()> {
     // SHFileOperation would delete permanently without a prompt, so refuse.
     ensure_fixed_drive(&canonical)?;
 
-    let mut from = canonical
-        .as_os_str()
-        .encode_wide()
+    // SHFileOperationW rejects the `\\?\` form that canonicalize returns (error 124), and it
+    // only understands paths shorter than MAX_PATH.
+    let wide = canonical.as_os_str().encode_wide().collect::<Vec<u16>>();
+    let plain = strip_verbatim_prefix(&wide);
+    if plain.len() >= WINDOWS_MAX_PATH {
+        anyhow::bail!(
+            "the path is longer than the Windows Recycle Bin API accepts, so it was not recycled: {}",
+            path.display()
+        );
+    }
+    let mut from = plain
+        .iter()
+        .copied()
         .chain(std::iter::once(0))
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
@@ -611,6 +638,17 @@ fn file_attributes(_metadata: &std::fs::Metadata) -> u32 {
 #[cfg(test)]
 mod scratch_tests {
     use super::*;
+
+    #[test]
+    fn the_extended_length_prefix_is_removed_for_the_recycle_bin_api_only_on_drive_paths() {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let strip = |s: &str| String::from_utf16(strip_verbatim_prefix(&w(s))).unwrap();
+        assert_eq!(strip("\\\\?\\C:\\tmp\\a.tmp"), "C:\\tmp\\a.tmp");
+        assert_eq!(strip("C:\\tmp\\a.tmp"), "C:\\tmp\\a.tmp");
+        assert_eq!(strip("\\\\?\\UNC\\server\\share\\a.tmp"), "\\\\?\\UNC\\server\\share\\a.tmp");
+        assert_eq!(strip("\\\\?\\"), "\\\\?\\");
+        assert_eq!(strip(""), "");
+    }
 
     #[test]
     fn user_temp_is_cleanable_but_still_protected_for_access_checks() {

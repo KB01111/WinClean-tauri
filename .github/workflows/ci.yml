@@ -27,7 +27,7 @@ jobs:
         with:
           workspaces: src-tauri
       - name: Rust tests (Windows)
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast
 
   rust-linux:
     runs-on: ubuntu-latest
@@ -43,4 +43,4 @@ jobs:
         with:
           workspaces: src-tauri
       - name: Rust tests (Linux)
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-fail-fast
