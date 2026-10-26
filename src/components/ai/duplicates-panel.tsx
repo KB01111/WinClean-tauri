@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Copy, FolderOpen, Loader2, Square } from "lucide-react"
 import { toast } from "sonner"
 
@@ -51,16 +51,23 @@ export function DuplicatesPanel({ scanRuns, activeRun }: { scanRuns: ScanRunReco
   const [error, setError] = useState<string | null>(null)
   const [shown, setShown] = useState({ confirmed: SHOWN_GROUPS, possible: SHOWN_GROUPS })
 
+  // Only the newest report request may update the panel: switching run, or reloading after a job,
+  // must not be overwritten by an older answer that arrives last.
+  const reportSeq = useRef(0)
+
   const loadReport = useCallback(async () => {
     if (runId === null) return
+    const mine = ++reportSeq.current
     try {
-      setReport(await api.duplicateReport(runId))
+      const next = await api.duplicateReport(runId)
+      if (mine === reportSeq.current) setReport(next)
     } catch (e) {
-      setError(formatError(e))
+      if (mine === reportSeq.current) setError(formatError(e))
     }
   }, [runId])
 
   useEffect(() => {
+    reportSeq.current += 1
     setReport(null)
     setError(null)
     void loadReport()

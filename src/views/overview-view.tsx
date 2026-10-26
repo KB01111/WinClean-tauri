@@ -336,7 +336,7 @@ function DiskUsagePanel({ volumes, activeRun }: { volumes: VolumeInfo[]; activeR
       </div>
       {usage.unaccounted > usage.total * 0.02 ? (
         <p className="mt-2 text-xs text-muted-foreground">
-          The scan accounts for {formatBytes(usage.scanned)}. About {formatBytes(usage.unaccounted)} is used by files WinClean cannot list — system files (pagefile, hibernation, Windows Update store), snapshots, or folders that denied access.
+          The scan accounts for {formatBytes(usage.scanned)}. About {formatBytes(usage.unaccounted)} is not in this scan: files outside the folder you scanned, system files (pagefile, hibernation, Windows Update store), snapshots, or folders that denied access.
         </p>
       ) : null}
     </Panel>

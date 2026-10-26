@@ -35,10 +35,14 @@ export function ProtectedFoldersPanel() {
   }
 
   async function remove(path: string) {
+    if (pending) return
+    setPending(true)
     try {
       setFolders(await api.storageRemoveExclusion(path))
     } catch (error) {
       toast.error(formatError(error))
+    } finally {
+      setPending(false)
     }
   }
 
@@ -70,7 +74,7 @@ export function ProtectedFoldersPanel() {
               <span className="min-w-0 truncate" title={path}>
                 {path}
               </span>
-              <Button variant="ghost" size="sm" onClick={() => void remove(path)} aria-label={`Stop protecting ${path}`}>
+              <Button variant="ghost" size="sm" onClick={() => void remove(path)} aria-label={`Stop protecting ${path}`} disabled={pending}>
                 <X className="size-4" aria-hidden="true" />
               </Button>
             </li>

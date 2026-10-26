@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Copy, Loader2, RefreshCw } from "lucide-react"
 import { toast } from "sonner"
 
@@ -33,18 +33,36 @@ export function McpView() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
+  // A slow load must not overwrite newer results. Status and roots are tracked apart, so a root
+  // edit made while Rediscover is running still lets the fresh status through (and vice versa).
+  const seq = useRef({ load: 0, status: 0, roots: 0 })
+
   const load = useCallback(async (refresh = false) => {
+    const mine = ++seq.current.load
+    const { status: statusAt, roots: rootsAt } = seq.current
     setLoading(true)
     try {
       const [next, authorised] = await Promise.all([api.optimizerMcpStatus(refresh), api.optimizerMcpSearchRoots()])
-      setStatus(next)
-      setRoots(authorised)
+      if (mine !== seq.current.load) return
+      if (statusAt === seq.current.status) setStatus(next)
+      if (rootsAt === seq.current.roots) setRoots(authorised)
       setError(null)
     } catch (e) {
-      setError(formatError(e))
+      if (mine === seq.current.load) setError(formatError(e))
     } finally {
-      setLoading(false)
+      if (mine === seq.current.load) setLoading(false)
     }
+  }, [])
+
+  const applyStatus = useCallback((next: McpStatus) => {
+    seq.current.status += 1
+    setStatus(next)
+    setError(null)
+  }, [])
+  const applyRoots = useCallback((next: string[]) => {
+    seq.current.roots += 1
+    setRoots(next)
+    setError(null)
   }, [])
 
   useEffect(() => {
@@ -92,7 +110,7 @@ export function McpView() {
         ) : null}
       </Panel>
 
-      {status ? <FileExplorerMcpPanel status={status} roots={roots} onStatus={setStatus} onRoots={setRoots} /> : null}
+      {status ? <FileExplorerMcpPanel status={status} roots={roots} onStatus={applyStatus} onRoots={applyRoots} /> : null}
 
       <Panel title="Use WinClean from another agent (for example Lumen)">
         <p className="mb-3 text-sm text-muted-foreground">

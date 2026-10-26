@@ -61,7 +61,8 @@ export function FileExplorerMcpPanel({ status, roots, onStatus, onRoots }: { sta
 
   const connection = CONNECTION[fe.connection]
   const permission = PERMISSION[fe.permission]
-  const effectiveDir = dir || roots[0] || ""
+  // A removed folder must not stay selected: the box and the request both follow the current list.
+  const effectiveDir = roots.includes(dir) ? dir : (roots[0] ?? "")
   const tools = fe.liveTools ?? fe.declaredTools
 
   return (
@@ -120,7 +121,7 @@ export function FileExplorerMcpPanel({ status, roots, onStatus, onRoots }: { sta
                   <ShieldCheck className="size-4" aria-hidden="true" />
                   Check access
                 </Button>
-                <Button size="sm" variant="ghost" aria-label={`Remove ${root}`} onClick={() => void guarded("remove", async () => onRoots(await api.optimizerMcpRemoveSearchRoot(root)))}>
+                <Button size="sm" variant="ghost" aria-label={`Remove ${root}`} disabled={busy !== null} onClick={() => void guarded("remove", async () => onRoots(await api.optimizerMcpRemoveSearchRoot(root)))}>
                   <X className="size-4" aria-hidden="true" />
                 </Button>
               </span>
