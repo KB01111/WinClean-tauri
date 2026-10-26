@@ -138,6 +138,12 @@ export function parseStorageReply(text: string): { ok: true; reply: ParsedReply 
   }
 }
 
+const RULE_EXPLANATION: Record<string, string> = {
+  clean: "Low risk: moved to the Recycle Bin, so you can restore it until you empty it.",
+  offload: "Large and not used recently: uploaded to Google Drive and verified before the local copy is recycled.",
+  review: "Needs your judgment: WinClean offers no automatic action for these.",
+}
+
 /** Suggestions with no model at all: verified items grouped by the rule that picked them. */
 export function groupedProposals(evaluation: StorageEvaluation, max = MAX_PROPOSALS): ProposalInput[] {
   const buckets = new Map<string, { kind: string; reason: string; ids: string[]; bytes: number }>()
@@ -153,7 +159,7 @@ export function groupedProposals(evaluation: StorageEvaluation, max = MAX_PROPOS
   return [...buckets.values()]
     .sort((a, b) => rank[a.kind] - rank[b.kind] || b.bytes - a.bytes)
     .slice(0, max)
-    .map((b) => ({ title: b.reason, action: b.kind, candidateIds: b.ids.slice(0, 500), reason: b.reason }))
+    .map((b) => ({ title: b.reason, action: b.kind, candidateIds: b.ids.slice(0, 500), reason: RULE_EXPLANATION[b.kind] ?? b.reason }))
 }
 
 /** A proposal for the deterministic "free up about N" selection, split by kind so each action stays pure. */
