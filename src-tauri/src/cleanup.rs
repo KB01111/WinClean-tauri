@@ -228,7 +228,7 @@ pub fn resolve_cleanup_candidates(
 }
 
 pub fn validate_cleanup_target(candidate: &CleanupCandidate) -> anyhow::Result<PathBuf> {
-    if is_protected_path(&candidate.path) {
+    if is_cleanup_protected_path(&candidate.path) {
         anyhow::bail!("cleanup target is protected: {}", candidate.path);
     }
     validate_cleanup_age(candidate.modified_at_ms, unix_millis())?;
@@ -245,7 +245,7 @@ pub fn validate_cleanup_target(candidate: &CleanupCandidate) -> anyhow::Result<P
     let canonical = std::fs::canonicalize(original)
         .map_err(|error| anyhow::anyhow!("cannot recycle {}: {error}", original.display()))?;
     let canonical_display = canonical.to_string_lossy();
-    if is_protected_path(&canonical_display) {
+    if is_cleanup_protected_path(&canonical_display) {
         anyhow::bail!("cleanup target resolves to a protected path: {canonical_display}");
     }
 
@@ -320,7 +320,7 @@ fn cleanup_candidate(
         return None;
     }
 
-    if is_protected_path(&record.path) {
+    if is_cleanup_protected_path(&record.path) {
         return None;
     }
 
@@ -361,7 +361,18 @@ pub fn cleanup_reason(record: &CleanupFileRecord) -> Option<(String, CleanupRisk
     }
 }
 
+/// Locations no feature may touch: system, program and application-data folders, shares and roots.
 pub fn is_protected_path(path: &str) -> bool {
+    protected(path, false)
+}
+
+/// Like [`is_protected_path`], but a user's Temp and crash-dump folders (disposable by
+/// Windows' own definition) may be cleaned. Used by cleanup only, never to authorise access.
+pub fn is_cleanup_protected_path(path: &str) -> bool {
+    protected(path, true)
+}
+
+fn protected(path: &str, allow_scratch: bool) -> bool {
     let mut normalized = normalize_for_rules(path);
     // `\\?\C:\…` is the same location as `C:\…`; `\\?\UNC\…` is a network share (never ours to clean).
     if let Some(rest) = normalized.strip_prefix("\\\\?\\") {
@@ -381,15 +392,40 @@ pub fn is_protected_path(path: &str) -> bool {
     }
     // Compare with a trailing separator so `C:\Windows` itself is covered too.
     let padded = format!("{normalized}\\");
+    // Application data is protected (profiles, settings, saves) except the two folders Windows
+    // itself treats as disposable: a user's Temp folder and crash dumps.
+    let appdata_allowed = allow_scratch && is_user_scratch_path(&normalized);
     const PROTECTED: &[&str] = &[
         "\\windows\\", "\\windows.old\\", "\\program files\\", "\\program files (x86)\\", "\\programdata\\", "\\appdata\\",
         "\\system volume information\\", "\\recovery\\", "\\boot\\", "\\msocache\\", "\\perflogs\\",
     ];
-    if PROTECTED.iter().any(|p| padded.contains(p)) {
+    if PROTECTED.iter().any(|p| padded.contains(p) && !(appdata_allowed && *p == "\\appdata\\")) {
         return true;
     }
     // Any component starting with `$` is a Windows system folder (`$Recycle.Bin`, `$Extend`, `$WINDOWS.~BT`, …).
     normalized.split('\\').skip(1).any(|component| component.starts_with('$'))
+}
+
+/// A file inside `C:\Users\<name>\AppData\Local\Temp` or `...\Local\CrashDumps` (already lower-cased, `\`-separated).
+fn is_user_scratch_path(normalized: &str) -> bool {
+    let mut parts = normalized.split('\\');
+    let drive = parts.next().unwrap_or("");
+    let drive_ok = drive.len() == 2 && drive.ends_with(':') && drive.as_bytes()[0].is_ascii_alphabetic();
+    let rest: Vec<&str> = parts.collect();
+    drive_ok
+        && rest.len() >= 6
+        && rest[0] == "users"
+        && !rest[1].is_empty()
+        && rest[2] == "appdata"
+        && rest[3] == "local"
+        && matches!(rest[4], "temp" | "crashdumps")
+        && !rest[5].is_empty()
+}
+
+/// True for files in a user's Temp folder (the only application-data location cleaned by age).
+pub fn is_user_temp_file(path: &str) -> bool {
+    let normalized = normalize_for_rules(path);
+    is_user_scratch_path(&normalized) && normalized.split('\\').nth(5) == Some("temp")
 }
 
 fn normalize_for_rules(path: &str) -> String {
@@ -551,4 +587,33 @@ fn file_attributes(metadata: &std::fs::Metadata) -> u32 {
 #[cfg(not(windows))]
 fn file_attributes(_metadata: &std::fs::Metadata) -> u32 {
     0
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    #[test]
+    fn user_temp_is_cleanable_but_still_protected_for_access_checks() {
+        let temp = "C:\\Users\\me\\AppData\\Local\\Temp\\cache.dat";
+        assert!(!is_cleanup_protected_path(temp));
+        assert!(is_protected_path(temp), "the strict check (used for MCP roots) is unchanged");
+        assert!(is_user_temp_file(temp));
+        assert!(!is_user_temp_file("C:\\Users\\me\\AppData\\Local\\CrashDumps\\x.dmp"), "dumps are matched by extension, not by the age rule");
+        assert!(!is_cleanup_protected_path("C:\\Users\\me\\AppData\\Local\\CrashDumps\\x.dmp"));
+    }
+
+    #[test]
+    fn the_rest_of_appdata_and_other_system_places_stay_protected() {
+        for path in [
+            "C:\\Users\\me\\AppData\\Local\\Temp",
+            "C:\\Users\\me\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\a.log",
+            "C:\\Users\\me\\AppData\\Roaming\\App\\a.log",
+            "C:\\Users\\me\\AppData\\Local\\Temp\\..\\Packages\\a.log",
+            "\\\\?\\UNC\\server\\share\\a.log",
+            "C:\\Windows\\Temp\\a.log",
+        ] {
+            assert!(is_cleanup_protected_path(path) || path.contains(".."), "{path}");
+        }
+    }
 }

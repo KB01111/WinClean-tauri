@@ -1,3 +1,4 @@
+pub mod ai_cli;
 pub mod cleanup;
 pub mod optimizer;
 pub mod commands;
@@ -11,6 +12,7 @@ pub mod recommendations;
 pub mod reports;
 pub mod scan;
 pub mod storage_ai;
+pub mod storage_commands;
 pub mod storage_policy;
 pub mod volume;
 
@@ -50,6 +52,7 @@ pub fn run() {
             app.manage(optimizer_state);
             app.manage(telemetry);
             app.manage(recovery);
+            app.manage(storage_commands::StorageJobs::default());
             app.manage(commands::AppState::new(database, app_data_dir));
             Ok(())
         })
@@ -90,6 +93,19 @@ pub fn run() {
             commands::app_health,
             commands::cancel_scan,
             commands::reveal_in_explorer,
+            commands::ai_key_statuses,
+            ai_cli::opencode_status,
+            ai_cli::opencode_models,
+            ai_cli::opencode_run,
+            storage_commands::storage_evaluate,
+            storage_commands::storage_validate_proposals,
+            storage_commands::duplicate_report_for,
+            storage_commands::duplicates_start,
+            storage_commands::duplicates_status,
+            storage_commands::duplicates_cancel,
+            storage_commands::storage_exclusions,
+            storage_commands::storage_add_exclusion,
+            storage_commands::storage_remove_exclusion,
             optimizer::commands::optimizer_list_services,
             optimizer::commands::optimizer_service_recommendations,
             optimizer::commands::optimizer_prepare_service_plan,

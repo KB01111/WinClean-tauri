@@ -19,7 +19,7 @@ WinClean is local-first. Scan data, file indexes, cleanup history, reports, and 
 ## Credentials
 
 - The Google Drive refresh token and connected account email are stored in Windows Credential Manager, never in the SQLite database or on disk in plain text.
-- The optional OpenAI API key is also stored in Windows Credential Manager and can be removed at any time from Settings.
+- Optional OpenAI and OpenRouter API keys are also stored in Windows Credential Manager (one entry per provider) and can be removed at any time from Settings. OpenCode signs in through its own command-line client; WinClean never sees or stores that credential.
 
 ## System optimizer (2.0)
 
@@ -31,16 +31,24 @@ WinClean is local-first. Scan data, file indexes, cleanup history, reports, and 
 
 ## AI Insights (optional)
 
-The AI assistant is disabled until the user adds their own OpenAI API key or configures a local model. When a *scan* analysis is requested, WinClean sends **file metadata only** — file paths, names, sizes, timestamps, category/extension summaries, and WinClean's own recommendation reasons — to OpenAI using the user's key. File contents are never read or transmitted. The assistant can only suggest candidates that WinClean's local rules already consider actionable, and nothing is cleaned or offloaded without an explicit user click.
+The AI assistant is disabled until the user picks a provider: OpenRouter (including its free models) or OpenAI with their own API key, the OpenCode command-line client installed on this PC, or a local model. Storage suggestions and duplicate detection also work with no AI at all ("Quick suggestions (no AI)").
+
+When a *storage* analysis is requested, WinClean sends **file metadata only** — file paths, names, sizes, ages, WinClean's own recommendation reasons and totals, capped to roughly 16,000 characters in a single request — to the chosen provider. File contents are never read or transmitted. Control and direction-override characters are stripped from paths before they are sent. The assistant can only group candidates that WinClean's local rules already consider actionable; every suggestion is resolved against the scan by candidate id, re-sized and re-checked on disk by the backend (a model never supplies a path), and nothing is cleaned or offloaded without an explicit user click in Recover space.
+
+- **OpenRouter** — requests go to `openrouter.ai` using the user's key. Free models are limited by OpenRouter (about 50 requests per day, 1,000 with credit) and the provider behind a free model may log prompts; do not analyse data you consider confidential with a free model.
+- **OpenCode** — OpenCode's free models are offered to the OpenCode client only, so WinClean does not call them over HTTP. It runs the user's installed `opencode run` command in an empty scratch folder inside the app data directory (no files of the user's are visible to it, permissions are not auto-approved) and passes the storage summary on standard input. What OpenCode then sends where is governed by OpenCode and the chosen model's terms (OpenCode marks some free models as trial-only: no personal or confidential data).
+- **OpenAI** — requests go to `api.openai.com` using the user's key.
 
 A *system* analysis additionally sends, through read-only tools: service names, display names, start types and states; process names with CPU and memory figures; battery state (percentage, AC/DC, watts, health); CPU, GPU and NPU model names and driver versions; the available power profiles and WinClean's recent change history. Hardware discovery can include local agent-registry folder paths, which may contain the Windows profile name. File contents and file paths from your disks are not part of a system analysis.
 
-**Local model option.** If you choose a local OpenAI-compatible server (Ollama, LM Studio, AMD Lemonade, Foundry Local), requests go only to a loopback address on this PC (`127.0.0.1`, `localhost` or `::1`); the app's content-security policy blocks any other host except `api.openai.com`. No API key is needed and nothing leaves the device.
+**Local model option.** If you choose a local OpenAI-compatible server (Ollama, LM Studio, AMD Lemonade, Foundry Local), requests go only to a loopback address on this PC (`127.0.0.1`, `localhost` or `::1`); the app's content-security policy blocks any other host except `api.openai.com` and `openrouter.ai`. No API key is needed and nothing leaves the device.
 
 The assistant can only *propose* changes. WinClean's deterministic rules re-validate every proposal and nothing is applied without an explicit click on the review dialog.
 
 ## Cleanup Safety
 
-WinClean's V1 cleanup flow only proposes conservative candidates and sends selected files to the Windows Recycle Bin. Permanent deletion is intentionally not exposed.
+WinClean's cleanup flow only proposes conservative candidates and sends selected files to the Windows Recycle Bin. Permanent deletion is intentionally not exposed.
+
+System folders, program folders and application data are never candidates. The only application-data locations WinClean cleans are a user's `AppData\Local\Temp` folder (files untouched for 7+ days, or `.tmp`/`.log`-style files) and `AppData\Local\CrashDumps`. Source-code projects, cloud-synced folders (OneDrive, Google Drive, Dropbox…), databases, virtual disks, mail stores, key material, documents and any folder the user adds under Settings → Protected folders are never touched. The duplicate finder only reads files when the user clicks "Compare file contents", within a 4 GB budget, at background priority, and stops when the PC goes onto battery; it never deletes anything.
 
 Google Drive offload verifies upload completion before moving the local original to the Windows Recycle Bin. If upload fails or is canceled, the local original is left in place.

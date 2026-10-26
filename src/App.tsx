@@ -62,6 +62,8 @@ function App() {
               categories={runData.categories}
               extensions={runData.extensions}
               recommendationPlan={runData.recommendationPlan}
+              volumes={storage.volumes}
+              onNavigate={setView}
               onSelectRun={storage.selectRun}
               onOpenDirectory={storage.openDirectory}
               onExportReport={storage.exportReport}
@@ -121,7 +123,7 @@ function App() {
               <AiInsightsView
                 scanRuns={storage.scanRuns}
                 activeRun={storage.activeRun}
-                aiKeyConfigured={storage.aiKeyConfigured}
+                aiKeys={storage.aiKeys}
                 onApplySuggestion={storage.applyAiSuggestion}
                 onGoToSettings={() => setView("settings")}
               />
@@ -150,8 +152,8 @@ function App() {
               onDisconnectDrive={storage.disconnectGoogleDrive}
               onExportDiagnostics={storage.exportDiagnostics}
               diagnosticsPending={storage.diagnosticsPending}
-              aiKeyConfigured={storage.aiKeyConfigured}
-              onAiKeyChanged={storage.setAiKeyConfigured}
+              aiKeys={storage.aiKeys}
+              onAiKeyChanged={storage.setAiKey}
             />
           )}
         </section>

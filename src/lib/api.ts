@@ -244,6 +244,152 @@ export type AiKeyStatus = {
   configured: boolean
 }
 
+/** API-key providers whose key is stored in Windows Credential Manager. */
+export type AiKeyProvider = "openai" | "openrouter"
+export type AiKeyMap = Record<AiKeyProvider, boolean>
+
+export type OpenCodeStatus = {
+  installed: boolean
+  version: string | null
+  detail: string
+}
+
+export type StorageQuery = {
+  mode?: "clean" | "offload" | "review"
+  minSize?: number
+  minAgeDays?: number
+  nameContains?: string
+  folder?: string
+  extension?: string
+  goalBytes?: number
+  limit?: number
+}
+
+export type EvaluatedItem = {
+  id: string
+  path: string
+  name: string
+  size: number
+  ageDays: number | null
+  kind: "clean" | "offload" | "review"
+  action: "recycleBin" | "googleDriveOffload" | "review"
+  risk: "low" | "review"
+  reason: string
+  evidence: string[]
+  duplicateGroup: string | null
+  duplicateCopies: number | null
+}
+
+export type BlockedItem = {
+  path: string
+  name: string
+  size: number
+  reason: string
+  detail: string
+}
+
+export type GoalSelection = {
+  goalBytes: number
+  selectedIds: string[]
+  selectedBytes: number
+  shortfallBytes: number
+  note: string
+}
+
+export type StorageEvaluation = {
+  scanRunId: number
+  scanRoot: string
+  scanAgeDays: number | null
+  scanStale: boolean
+  verified: EvaluatedItem[]
+  manualReview: EvaluatedItem[]
+  blocked: BlockedItem[]
+  blockedTotal: number
+  cleanBytes: number
+  offloadBytes: number
+  reviewBytes: number
+  goal: GoalSelection | null
+  warnings: string[]
+}
+
+export type ProposalInput = {
+  title: string
+  action: string
+  candidateIds: string[]
+  reason: string
+  estimatedBytes?: number | null
+}
+
+export type ActionPreview = {
+  summary: string
+  fileCount: number
+  totalBytes: number
+  destination: string
+  permanentDelete: boolean
+  reversible: boolean
+  requiresGoogleDrive: boolean
+  steps: string[]
+  notes: string[]
+}
+
+export type ValidatedProposal = {
+  title: string
+  reason: string
+  action: "clean" | "offload" | "review" | null
+  items: EvaluatedItem[]
+  rejected: { candidateId: string; reason: string }[]
+  verifiedBytes: number
+  claimedBytes: number | null
+  claimMatches: boolean
+  preview: ActionPreview
+}
+
+export type DuplicateFile = {
+  entryId: number
+  candidateId: string
+  path: string
+  name: string
+  size: number
+  modifiedAtMs: number | null
+}
+
+export type DuplicateGroup = {
+  status: "confirmed" | "possible"
+  size: number
+  fingerprint: string | null
+  files: DuplicateFile[]
+  reclaimableBytes: number
+}
+
+export type DuplicateReport = {
+  scanRunId: number
+  confirmed: DuplicateGroup[]
+  possible: DuplicateGroup[]
+  confirmedReclaimableBytes: number
+  possibleReclaimableBytes: number
+  protectedFiles: number
+  notes: string[]
+}
+
+export type VerifySummary = {
+  groupsExamined: number
+  filesHashed: number
+  bytesRead: number
+  filesSkipped: number
+  budgetExhausted: boolean
+  cancelled: boolean
+  stopped: string | null
+}
+
+export type DuplicateJobStatus = {
+  state: "idle" | "running" | "completed" | "failed"
+  runId: number | null
+  filesHashed: number
+  bytesRead: number
+  summary: VerifySummary | null
+  error: string | null
+}
+
 export const emptyScanProgress: ScanProgress = {
   state: "idle",
   filesIndexed: 0,
@@ -330,10 +476,34 @@ export const api = {
       limit: params.limit ?? 25,
     }),
   openUrl: (url: string) => invoke("open_url", { url }),
-  aiKeyStatus: () => invoke<AiKeyStatus>("ai_key_status"),
-  setAiApiKey: (apiKey: string) => invoke<AiKeyStatus>("set_ai_api_key", { apiKey }),
-  clearAiApiKey: () => invoke<AiKeyStatus>("clear_ai_api_key"),
-  getAiApiKey: () => invoke<string | null>("get_ai_api_key"),
+  aiKeyStatus: (provider: AiKeyProvider = "openai") => invoke<AiKeyStatus>("ai_key_status", { provider }),
+  aiKeyStatuses: () => invoke<AiKeyMap>("ai_key_statuses"),
+  setAiApiKey: (apiKey: string, provider: AiKeyProvider = "openai") =>
+    invoke<AiKeyStatus>("set_ai_api_key", { apiKey, provider }),
+  clearAiApiKey: (provider: AiKeyProvider = "openai") => invoke<AiKeyStatus>("clear_ai_api_key", { provider }),
+  getAiApiKey: (provider: AiKeyProvider = "openai") => invoke<string | null>("get_ai_api_key", { provider }),
+  opencodeStatus: () => invoke<OpenCodeStatus>("opencode_status"),
+  opencodeModels: () => invoke<string[]>("opencode_models"),
+  opencodeRun: (model: string, instruction: string, data: string) =>
+    invoke<string>("opencode_run", { model, instruction, data }),
+  storageEvaluate: (runId: number | null, query?: StorageQuery) =>
+    invoke<StorageEvaluation | null>("storage_evaluate", { runId, query: query ?? null }),
+  storageValidateProposals: (runId: number, proposals: ProposalInput[]) =>
+    invoke<ValidatedProposal[]>("storage_validate_proposals", { runId, proposals }),
+  duplicateReport: (runId: number | null, minSize?: number) =>
+    invoke<DuplicateReport | null>("duplicate_report_for", { runId, minSize: minSize ?? null }),
+  duplicatesStart: (runId: number | null, options?: { minSize?: number; maxBytes?: number; maxFiles?: number }) =>
+    invoke<DuplicateJobStatus>("duplicates_start", {
+      runId,
+      minSize: options?.minSize ?? null,
+      maxBytes: options?.maxBytes ?? null,
+      maxFiles: options?.maxFiles ?? null,
+    }),
+  duplicatesStatus: () => invoke<DuplicateJobStatus>("duplicates_status"),
+  duplicatesCancel: () => invoke<DuplicateJobStatus>("duplicates_cancel"),
+  storageExclusions: () => invoke<string[]>("storage_exclusions"),
+  storageAddExclusion: (path: string) => invoke<string[]>("storage_add_exclusion", { path }),
+  storageRemoveExclusion: (path: string) => invoke<string[]>("storage_remove_exclusion", { path }),
   exportReport: (runId: number | null) =>
     invoke<ExportArtifact | null>("export_report", { runId }),
   exportDiagnostics: () => invoke<ExportArtifact>("export_diagnostics"),

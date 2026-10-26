@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost https://api.openai.com http://127.0.0.1:* http://localhost:* http://[::1]:*"
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src ipc: http://ipc.localhost https://api.openai.com https://openrouter.ai http://127.0.0.1:* http://localhost:* http://[::1]:*"
     }
   },
   "bundle": {

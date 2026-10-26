@@ -8,6 +8,8 @@ import {
   api,
   emptyScanProgress,
   formatError,
+  type AiKeyMap,
+  type AiKeyProvider,
   type AppHealth,
   type CleanupActionRecord,
   type GoogleDriveStatus,
@@ -45,7 +47,7 @@ export function useStorage({ onNavigate }: { onNavigate: (view: View) => void })
   const [offloadJobs, setOffloadJobs] = useState<OffloadJobStatus[]>([])
   const [driveStatus, setDriveStatus] = useState<GoogleDriveStatus | null>(null)
   const [health, setHealth] = useState<AppHealth | null>(null)
-  const [aiKeyConfigured, setAiKeyConfigured] = useState(false)
+  const [aiKeys, setAiKeys] = useState<AiKeyMap>({ openai: false, openrouter: false })
   const [message, setMessage] = useState<string | null>(null)
   const [loadingVolumes, setLoadingVolumes] = useState(true)
   const [loadingData, setLoadingData] = useState(false)
@@ -161,8 +163,8 @@ export function useStorage({ onNavigate }: { onNavigate: (view: View) => void })
     void refreshVolumes()
     void refreshDashboard()
     api
-      .aiKeyStatus()
-      .then((status) => setAiKeyConfigured(status.configured))
+      .aiKeyStatuses()
+      .then((statuses) => setAiKeys((current) => ({ ...current, ...statuses })))
       .catch(() => {})
   }, [refreshDashboard, refreshVolumes])
 
@@ -398,8 +400,8 @@ export function useStorage({ onNavigate }: { onNavigate: (view: View) => void })
     offloadJobs,
     driveStatus,
     health,
-    aiKeyConfigured,
-    setAiKeyConfigured,
+    aiKeys,
+    setAiKey: (provider: AiKeyProvider, configured: boolean) => setAiKeys((current) => ({ ...current, [provider]: configured })),
     message,
     isScanning,
     loadingVolumes,

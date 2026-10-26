@@ -651,7 +651,7 @@ mod tests {
             dir("C:\\Users\\me\\AppData\\Local\\Temp"),
             file("C:\\Users\\me\\AppData\\Local\\Temp\\old.tmp", 30 * MIB, 40),
             file("C:\\Users\\me\\Downloads\\setup.msi", 120 * MIB, 90),
-            file("C:\\Users\\me\\Downloads\\notes.docx", 2 * MIB, 90),
+            file("C:\\Users\\me\\Downloads\\notes.docx", 2 * MIB, 10),
             file("C:\\Users\\me\\Videos\\holiday.mp4", 400 * MIB, 200),
             file("C:\\Users\\me\\code\\app\\package.json", 1000, 1),
             file("C:\\Users\\me\\code\\app\\data\\dump.bin", 500 * MIB, 300),
@@ -708,6 +708,21 @@ mod tests {
         assert_eq!(q(&|q| q.folder = Some("C:\\Users\\me\\Downloads".into())), vec!["setup.msi"]);
         assert_eq!(q(&|q| q.name_contains = Some("HOLIDAY".into())), vec!["holiday.mp4"]);
         assert!(q(&|q| q.min_age_days = Some(150)).iter().all(|n| n == "holiday.mp4"));
+    }
+
+    #[test]
+    fn old_files_in_the_user_temp_folder_are_clean_candidates_and_recent_ones_are_not() {
+        let (_d, db, run) = seeded(vec![
+            dir("C:\\Users\\me\\AppData\\Local\\Temp"),
+            file("C:\\Users\\me\\AppData\\Local\\Temp\\installer-cache.dat", 50 * MIB, 20),
+            file("C:\\Users\\me\\AppData\\Local\\Temp\\in-use.dat", 60 * MIB, 2),
+            file("C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\big.dat", 70 * MIB, 200),
+        ]);
+        let ev = evaluate(&db, run, &StorageQuery::default()).unwrap();
+        let names: Vec<_> = ev.verified.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["installer-cache.dat"]);
+        assert_eq!(ev.verified[0].reason, "Old file in your Temp folder");
+        assert_eq!(ev.verified[0].action, RecommendedAction::RecycleBin);
     }
 
     #[test]

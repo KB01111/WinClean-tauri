@@ -17,7 +17,7 @@
 
 use serde::Serialize;
 
-use crate::cleanup::is_protected_path;
+use crate::cleanup::is_cleanup_protected_path;
 use crate::db::Database;
 use crate::pathutil::{is_within, norm_path};
 
@@ -134,7 +134,7 @@ impl StoragePolicy {
 
     /// Like [`check`], optionally letting documents through (for the Downloads rule).
     pub fn check_with(&self, path: &str, extension: Option<&str>, allow_documents: bool) -> Option<Blocked> {
-        if is_protected_path(path) {
+        if is_cleanup_protected_path(path) {
             return blocked(BlockReason::SystemLocation, "System, program, application-data or Recycle Bin location");
         }
         let norm = norm_path(path);
@@ -219,7 +219,26 @@ mod tests {
         let p = StoragePolicy::default();
         for path in [
             "C:\\Windows\\Temp\\a.log", "C:\\$Recycle.Bin\\S-1-5-21-1\\$R1234.log", "C:\\Windows.old\\Users\\me\\a.tmp", "C:\\System Volume Information\\x.dat", "C:\\Program Files\\App\\a.log",
-            "C:\\ProgramData\\x\\a.tmp", "C:\\Users\\me\\AppData\\Local\\Temp\\a.tmp", "\\\\?\\C:\\Windows\\a.log", "C:\\$WINDOWS.~BT\\Sources\\a.log", "C:\\Recovery\\a.wim", "D:\\$Extend\\x", "C:\\a.log",
+            "C:\\ProgramData\\x\\a.tmp", "C:\\Users\\me\\AppData\\Roaming\\x\\a.tmp", "\\\\?\\C:\\Windows\\a.log", "C:\\$WINDOWS.~BT\\Sources\\a.log", "C:\\Recovery\\a.wim", "D:\\$Extend\\x", "C:\\a.log",
+        ] {
+            assert_eq!(p.check(path, None).map(|b| b.reason), Some(BlockReason::SystemLocation), "{path}");
+        }
+    }
+
+    #[test]
+    fn only_the_user_temp_and_crash_dump_folders_are_opened_up_inside_appdata() {
+        let p = StoragePolicy::default();
+        for path in ["C:\\Users\\me\\AppData\\Local\\Temp\\a.tmp", "D:\\Users\\me\\AppData\\Local\\Temp\\sub\\b.log", "C:\\Users\\me\\AppData\\Local\\CrashDumps\\x.dmp"] {
+            assert_eq!(p.check(path, None), None, "{path}");
+        }
+        for path in [
+            "C:\\Users\\me\\AppData\\Local\\Temp",
+            "C:\\Users\\me\\AppData\\Local\\Temporary\\a.tmp",
+            "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\a.tmp",
+            "C:\\Users\\me\\AppData\\Local\\Packages\\x\\a.tmp",
+            "C:\\Users\\me\\AppData\\Roaming\\Temp\\a.tmp",
+            "C:\\Other\\AppData\\Local\\Temp\\a.tmp",
+            "C:\\Users\\me\\AppData\\Local\\Temp\\Windows\\a.tmp",
         ] {
             assert_eq!(p.check(path, None).map(|b| b.reason), Some(BlockReason::SystemLocation), "{path}");
         }
