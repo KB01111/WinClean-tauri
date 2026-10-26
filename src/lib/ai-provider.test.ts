@@ -9,12 +9,15 @@ describe("OpenRouter free model list", () => {
       { id: "paid/model", name: "Paid", context_length: 200000, pricing: { prompt: "0.000003", completion: "0.000015" } },
       { id: "google/gemma:free", name: "Gemma", context_length: 8192, pricing: { prompt: "0", completion: "0" }, supported_parameters: [] },
       { id: "image/only:free", name: "Img", context_length: 1000, pricing: { prompt: "0", completion: "0" }, architecture: { output_modalities: ["image"] } },
+      { id: "music/gen", name: "Music", context_length: 9000, pricing: { prompt: "0", completion: "0" }, architecture: { input_modalities: ["text"], output_modalities: ["text", "audio"] } },
+      { id: "nvidia/x-content-safety:free", pricing: { prompt: "0", completion: "0" }, architecture: { input_modalities: ["text"], output_modalities: ["text"] } },
+      { id: "openrouter/free", pricing: { prompt: "0", completion: "0" } },
       { id: "bad id; rm", pricing: { prompt: "0", completion: "0" } },
       { id: "no-pricing" },
     ],
   }
 
-  test("keeps only text models priced at zero, largest context first", () => {
+  test("keeps only text-in/text-out chat models priced at zero, largest context first", () => {
     const models = parseOpenRouterFreeModels(payload)
     expect(models.map((m) => m.id)).toEqual(["meta-llama/llama-3.3-70b-instruct:free", "google/gemma:free"])
     expect(models[0].supportsTools).toBe(true)

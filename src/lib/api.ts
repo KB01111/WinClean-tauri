@@ -566,11 +566,15 @@ export const api = {
   /** Windows ML execution-provider assessment; `modelPath` is an optional local .onnx file. */
   optimizerCapabilities: (modelPath?: string) =>
     invoke<O.CapabilityReport>("optimizer_capabilities", { modelPath: modelPath ?? null }),
-  optimizerMcpDiscover: () => invoke<O.McpDiscovery>("optimizer_mcp_discover"),
-  optimizerMcpProbe: (serverId: string) => invoke<O.McpProbe>("optimizer_mcp_probe", { serverId }),
-  /** The single MCP call WinClean makes: File Explorer metadata for one path. */
-  optimizerMcpFileDetails: (serverId: string, path: string) =>
-    invoke<unknown>("optimizer_mcp_file_details", { serverId, path }),
+  optimizerMcpStatus: (refresh = false) => invoke<O.McpStatus>("optimizer_mcp_status", { refresh }),
+  optimizerMcpVerify: () => invoke<O.McpStatus>("optimizer_mcp_verify"),
+  optimizerMcpCancel: () => invoke<void>("optimizer_mcp_cancel"),
+  optimizerMcpSearchRoots: () => invoke<string[]>("optimizer_mcp_search_roots"),
+  optimizerMcpAddSearchRoot: (path: string) => invoke<string[]>("optimizer_mcp_add_search_root", { path }),
+  optimizerMcpRemoveSearchRoot: (path: string) => invoke<string[]>("optimizer_mcp_remove_search_root", { path }),
+  optimizerMcpVerifyPermission: (folder: string) => invoke<O.McpStatus>("optimizer_mcp_verify_permission", { folder }),
+  optimizerMcpSearch: (args: O.McpSearchArgs) => invoke<O.McpSearchOutcome>("optimizer_mcp_search", { args }),
+  optimizerMcpFileDetails: (path: string) => invoke<unknown>("optimizer_mcp_file_details", { path }),
   optimizerHistory: (limit = 100) => invoke<O.OptimizerHistory>("optimizer_history", { limit }),
   optimizerRollback: (snapshotId: number) => invoke<string>("optimizer_rollback", { snapshotId }),
   optimizerRecoveryReport: () => invoke<O.RecoveryReport>("optimizer_recovery_report"),

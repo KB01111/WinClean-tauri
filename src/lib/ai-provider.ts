@@ -5,6 +5,7 @@
 import {
   OPENAI_BASE_URL,
   OPENROUTER_BASE_URL,
+  OPENROUTER_FREE_ROUTER,
   keyProviderFor,
   modelFor,
   validateEndpoint,
@@ -34,13 +35,16 @@ export function parseOpenRouterFreeModels(json: unknown): OpenRouterModel[] {
       context_length?: unknown
       pricing?: { prompt?: unknown; completion?: unknown }
       supported_parameters?: unknown
-      architecture?: { output_modalities?: unknown }
+      architecture?: { input_modalities?: unknown; output_modalities?: unknown }
     }
     if (typeof m.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/.test(m.id)) continue
     const free = Number(m.pricing?.prompt) === 0 && Number(m.pricing?.completion) === 0 && m.pricing?.prompt !== undefined
     if (!free) continue
-    const outputs = m.architecture?.output_modalities
-    if (Array.isArray(outputs) && !outputs.includes("text")) continue
+    // Chat models only: text in, text out (free music/image generators and safety classifiers are not).
+    const { input_modalities: inputs, output_modalities: outputs } = m.architecture ?? {}
+    if (Array.isArray(inputs) && !inputs.includes("text")) continue
+    if (Array.isArray(outputs) && !(outputs.length === 1 && outputs[0] === "text")) continue
+    if (/content-safety|guard/i.test(m.id) || m.id === OPENROUTER_FREE_ROUTER) continue
     models.push({
       id: m.id,
       name: typeof m.name === "string" ? m.name.slice(0, 120) : m.id,
