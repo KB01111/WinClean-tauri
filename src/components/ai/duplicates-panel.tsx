@@ -51,23 +51,23 @@ export function DuplicatesPanel({ scanRuns, activeRun }: { scanRuns: ScanRunReco
   const [error, setError] = useState<string | null>(null)
   const [shown, setShown] = useState({ confirmed: SHOWN_GROUPS, possible: SHOWN_GROUPS })
 
-  const currentRun = useRef<number | null>(runId)
-  useEffect(() => {
-    currentRun.current = runId
-  }, [runId])
+  // Only the newest report request may update the panel: switching run, or reloading after a job,
+  // must not be overwritten by an older answer that arrives last.
+  const reportSeq = useRef(0)
 
   const loadReport = useCallback(async () => {
     if (runId === null) return
+    const mine = ++reportSeq.current
     try {
       const next = await api.duplicateReport(runId)
-      // The answer for a run the user has since left must not replace the new run's report.
-      if (currentRun.current === runId) setReport(next)
+      if (mine === reportSeq.current) setReport(next)
     } catch (e) {
-      if (currentRun.current === runId) setError(formatError(e))
+      if (mine === reportSeq.current) setError(formatError(e))
     }
   }, [runId])
 
   useEffect(() => {
+    reportSeq.current += 1
     setReport(null)
     setError(null)
     void loadReport()
